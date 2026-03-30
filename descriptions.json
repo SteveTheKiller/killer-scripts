@@ -40,8 +40,8 @@
     "description": "Printer management utility with network scanner, driver matching, and UNC path support."
   },
   "PRUNE.ps1": {
-    "name": "PRUNE",
-    "description": "Disk cleanup and temp file removal."
+  "name": "Profile Removal Utility for Neglected Entries",
+  "description": "Interactive editor for managing Windows user profiles."
   },
   "STARE.ps1": {
     "name": "Scheduled Task Administration & Routine Executor",
