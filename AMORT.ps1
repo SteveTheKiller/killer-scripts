@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.2
-    Developed for The 20 MSP by Steve Riley | Updated: 2026-03-30
+    Developed by Steve the Killer | Updated: 2026-03-30
 .DESCRIPTION
     Automated Windows 10/11 tune-up for MSP field and remote deployment.
     Hardens AI, privacy, and browser settings; strips OEM and consumer
