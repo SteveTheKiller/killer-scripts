@@ -650,6 +650,9 @@ if (Test-Path "C:\Windows.old") {
         Set-ItemProperty -Path $CleanupKey -Name "StateFlags1337" -Value 2 -Type DWord -ErrorAction SilentlyContinue
         $CleanupJob = Start-Process "cleanmgr.exe" -ArgumentList "/sagerun:1337" -WindowStyle Hidden -PassThru
         $CleanupJob | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+        if (-not $CleanupJob.HasExited) {
+            $CleanupJob | Stop-Process -Force -ErrorAction SilentlyContinue
+        }
     }
     if (Test-Path "C:\Windows.old") {
         Write-StepUpdate "`n      [!] Cleanmgr timed out. Forcing Windows.old removal..."
