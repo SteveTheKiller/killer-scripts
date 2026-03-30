@@ -1,0 +1,66 @@
+{
+  "AMORT.ps1": {
+    "name": "Advanced Maintenance, Optimization, and Repair Tool",
+    "description": "Automated Windows 10/11 tune-up for MSP field and remote deployment."
+  },
+  "BERET.ps1": {
+    "name": "BitLocker Encryption, Recovery, & Escrow Tool",
+    "description": "Interactive BitLocker lifecycle manager with TPM enforcement and AD/Entra ID key escrow."
+  },
+  "DEBLOAT.ps1": {
+    "name": "Deployment Environment Bloatware Liquidator & Optimized Automated Toolkit",
+    "description": "Standardizes Windows 11 by removing OEM bloat and enforcing privacy and UI hardening."
+  },
+  "DEFEND.ps1": {
+    "name": "Definition Enforcement & Full Endpoint Network Defense",
+    "description": "Audits kernel-level security including TPM, Secure Boot, HVCI, and Defender."
+  },
+  "DEPOT.ps1": {
+    "name": "Deployment & Endpoint Provisioning Operations Tool",
+    "description": "Full new-machine provisioning with silent app deployment and self-delete on completion."
+  },
+  "FACTS.ps1": {
+    "name": "Foxit Audit and Control Task Script",
+    "description": "Audits Foxit PDF installations and permanently blocks auto-updates via registry hardening."
+  },
+  "MACE.ps1": {
+    "name": "Microsoft Application Cleanse & Eradication",
+    "description": "Completely removes OneDrive, New Outlook, Office/M365, and Teams from a Windows endpoint."
+  },
+  "ODD.ps1": {
+    "name": "Output Device Diagnostic",
+    "description": "Inventories all physical, USB, and Bluetooth audio devices with health status and driver info."
+  },
+  "ORCA.ps1": {
+    "name": "Outlook Reset & Configuration Assistant",
+    "description": "Resets broken Outlook installations for one or all user profiles, classic or new."
+  },
+  "PRINT.ps1": {
+    "name": "Printer Response & Interface Network Tool",
+    "description": "Printer management utility with network scanner, driver matching, and UNC path support."
+  },
+  "PRUNE.ps1": {
+    "name": "PRUNE",
+    "description": "Disk cleanup and temp file removal."
+  },
+  "STARE.ps1": {
+    "name": "Scheduled Task Administration & Routine Executor",
+    "description": "Interactive terminal wizard for fast and reliable Windows Scheduled Task management."
+  },
+  "TICK.ps1": {
+    "name": "Trigger Immediate Clock Kickstart",
+    "description": "Resets and re-syncs Windows Time service against a chosen NTP peer with before/after reporting."
+  },
+  "URT.ps1": {
+    "name": "Universal Rename Tool",
+    "description": "Renames local or domain-joined computers from an admin shell with no GUI popups."
+  },
+  "VITALS.ps1": {
+    "name": "Visual Interface for Technical Asset & Logistics Summary",
+    "description": "Collects and displays a full hardware and network snapshot including BitLocker, TPM, and domain info."
+  },
+  "WURSA.ps1": {
+    "name": "Windows Update, Repair, & System Alignment",
+    "description": "Enforces OS patches, OEM driver updates, and third-party app upgrades via Chocolatey."
+  }
+}
