@@ -9,7 +9,7 @@
     database; runs DISM and SFC repair; and performs SSD TRIM while
     reporting disk space recovered at each stage.
 #>
-$_fver   = "| v15.1"
+$_fver   = "| v15.2"
 #region Pre-Flight Checks
 # ============================================================================
 # Force UTF-8 output so box-drawing characters render correctly
@@ -360,7 +360,11 @@ if (Test-Path $C2RPath) {
     $RegKeys = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "Microsoft 365*" -and $_.DisplayName -notmatch "en-us" }
     foreach ($Key in $RegKeys) {
         if ($Key.DisplayName -match " - ([a-z]{2}-[a-z]{2})") {
-            Start-Process $C2RPath -ArgumentList "scenario=install scenariosubtype=ARP sourcetype=None productstoremove=O365ProPlusRetail.16_$($Matches[1])_x-none culture=$($Matches[1]) version.16=16.0 DisplayLevel=False" -Wait -ErrorAction SilentlyContinue
+            $c2rProc = Start-Process $C2RPath -ArgumentList "scenario=install scenariosubtype=ARP sourcetype=None productstoremove=O365ProPlusRetail.16_$($Matches[1])_x-none culture=$($Matches[1]) version.16=16.0 DisplayLevel=False" -PassThru -ErrorAction SilentlyContinue
+            if ($c2rProc -and -not $c2rProc.WaitForExit(60000)) {
+                $c2rProc | Stop-Process -Force -ErrorAction SilentlyContinue
+                Get-Process -Name "OfficeClickToRun" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
@@ -652,6 +656,7 @@ if (Test-Path "C:\Windows.old") {
         $CleanupJob | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
         if (-not $CleanupJob.HasExited) {
             $CleanupJob | Stop-Process -Force -ErrorAction SilentlyContinue
+            Get-Process -Name "cleanmgr" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         }
     }
     if (Test-Path "C:\Windows.old") {
