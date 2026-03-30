@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.0
-    Developed by SteveTheKiller | Updated: 2026-03-20
+    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.2
+    Developed for The 20 MSP by Steve Riley | Updated: 2026-03-30
 .DESCRIPTION
     Automated Windows 10/11 tune-up for MSP field and remote deployment.
     Hardens AI, privacy, and browser settings; strips OEM and consumer
@@ -9,7 +9,7 @@
     database; runs DISM and SFC repair; and performs SSD TRIM while
     reporting disk space recovered at each stage.
 #>
-$_fver   = "| v15.0"
+$_fver   = "| v15.1"
 #region Pre-Flight Checks
 # ============================================================================
 # Force UTF-8 output so box-drawing characters render correctly
@@ -424,15 +424,16 @@ $Bloat = @("*BingNews*", "*BingWeather*", "*ZuneVideo*", "*ZuneMusic*", "*Office
 if ($IsCore) { try { Remove-Module Appx -ErrorAction SilentlyContinue 2>$null } catch {} }
 foreach ($App in $Bloat) { 
     try {
-        $Pkg = Get-AppxPackage -AllUsers -Name $App -ErrorAction Stop 
+        $Pkg = Get-AppxPackage -AllUsers -Name $App -ErrorAction SilentlyContinue
         if ($Pkg) { 
-            $Pkg | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Out-Null 
+            # Isolation job to prevent script hang if AppXSVC is deadlocked
+            $Job = Start-Job -ScriptBlock { param($p) $p | Remove-AppxPackage -AllUsers } -ArgumentList $Pkg
+            if (-not ($Job | Wait-Job -Timeout 20)) {
+                Stop-Job $Job
+                Write-Host "        [!] Appx $App timed out. Skipping." -ForegroundColor Yellow
+            }
         }
-    } catch {
-        # If one fails, the Appx service might be locked; skip the rest to prevent the log crash
-        Write-Host "        [!] Appx Service busy. Skipping further purges." -ForegroundColor Yellow
-        break
-    }
+    } catch { break }
 }
 if ($IsCore) { 0..5 | ForEach-Object { Write-Progress -Id $_ -Activity "Done" -Completed } } else { Write-Progress -Activity "Stripping Bloatware" -Completed }
 # --- Phase 2: Aggressive Dell Purge ---
@@ -449,16 +450,61 @@ if ($Vendor -like "*Dell*" -and -not $IsVM) {
     }
     # Targeted Software Removal using Package & WMI
     $DellPatterns = @("*SupportAssist*", "*DellUpdate*", "*DellCommand*", "*PremierColor*", "*DigitalDelivery*", "*Dell Optimizer*", "*DellCoreServices*", "*Alienware*")
-    foreach ($DP in $DellPatterns) {
-        $Found = @()
-        $Found += Get-Package -Name $DP -ErrorAction SilentlyContinue
-        $Found += Get-CimInstance -ClassName Win32_Product -ErrorAction SilentlyContinue | Where-Object { $_.Name -like $DP }
-        
-        foreach ($Pkg in $Found | Select-Object -Unique) {
-            if ($Pkg.PSObject.Properties.Name -contains 'Uninstall') { $Pkg.Uninstall() | Out-Null } 
-            else { Uninstall-Package -Name $Pkg.Name -Force -ErrorAction SilentlyContinue }
+        $UnKeys = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+        # Grab all installed software from registry once
+        $Installed = Get-ItemProperty $UnKeys -ErrorAction SilentlyContinue
+        # Combine your patterns into one master search
+        $MasterPurge = $DellPatterns + $PurgeList
+        foreach ($Item in $Installed) {
+            $Name = $Item.DisplayName
+            if ($Name) {
+                # Check if it matches anything in your purge lists
+                $IsTarget = $false
+                foreach ($P in $MasterPurge) { if ($Name -like $P) { $IsTarget = $true; break } }
+                # Safety Check: If it's in your KeepList, skip it
+                foreach ($K in $KeepList) { if ($Name -like $K) { $IsTarget = $false; break } }
+                if ($IsTarget -and $Item.UninstallString) {
+                    Write-Host "        [!] Removing: $Name" -ForegroundColor Cyan
+                    try {
+                        if ($Item.UninstallString -match "msiexec") {
+                            $Guid = ([regex]::Match($Item.UninstallString, '{[A-Z0-9-]+}').Value)
+                            if ($Guid) {
+                                $proc = Start-Process "msiexec.exe" -ArgumentList "/x $Guid /qn /norestart" -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                                if ($proc -and -not $proc.WaitForExit(60000)) {
+                                    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+                                    Write-Host "          [!] Timed out: $Name (MSI)" -ForegroundColor Yellow
+                                }
+                            }
+                        } else {
+                            # Parse UninstallString — path may have embedded args
+                            if ($Item.UninstallString -match '^"([^"]+)"(.*)$') {
+                                $exePath = $Matches[1].Trim()
+                                $exeArgs = $Matches[2].Trim()
+                            } elseif ($Item.UninstallString -match '^(\S+\.exe)(.*)$') {
+                                $exePath = $Matches[1].Trim()
+                                $exeArgs = $Matches[2].Trim()
+                            } else {
+                                $exePath = $Item.UninstallString
+                                $exeArgs = ""
+                            }
+                            $silentArgs = "/S /Silent /Quiet /VERYSILENT /SUPPRESSMSGBOXES /norestart"
+                            $finalArgs  = if ($exeArgs) { "$exeArgs $silentArgs" } else { $silentArgs }
+                            $proc = Start-Process $exePath -ArgumentList $finalArgs -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                            if ($proc -and -not $proc.WaitForExit(60000)) {
+                                $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+                                Write-Host "          [!] Timed out: $Name (EXE)" -ForegroundColor Yellow
+                            }
+                        }
+                    } catch {
+                        Write-Host "          [!] Failed to remove: $Name" -ForegroundColor Yellow
+                    }
+                }
+            }
         }
-    }
 
 # --- Phase 3: Office Language Pack Purge ---
     # Target MSI-based Language Packs (Office 2016/2019/Current)
