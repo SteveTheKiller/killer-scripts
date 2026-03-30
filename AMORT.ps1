@@ -662,7 +662,9 @@ if (Test-Path "C:\Windows.old") {
         $WinOldTotal = $WinOldItems.Count
         $WinOldDone  = 0
         foreach ($WinOldItem in ($WinOldItems | Sort-Object FullName -Descending)) {
-            Remove-Item $WinOldItem.FullName -Force -Recurse -ErrorAction SilentlyContinue
+            if (Test-Path $WinOldItem.FullName) {
+                Remove-Item $WinOldItem.FullName -Force -Recurse -ErrorAction SilentlyContinue
+            }
             $WinOldDone++
             if ($WinOldDone % 200 -eq 0 -or $WinOldDone -eq $WinOldTotal) {
                 $Pct = if ($WinOldTotal -gt 0) { [int]($WinOldDone / $WinOldTotal * 100) } else { 100 }
