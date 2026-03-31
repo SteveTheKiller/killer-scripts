@@ -40,8 +40,12 @@
     "description": "Printer management utility with network scanner, driver matching, and UNC path support."
   },
   "PRUNE.ps1": {
-  "name": "Profile Removal Utility for Neglected Entries",
-  "description": "Interactive editor for managing Windows user profiles."
+    "name": "Profile Removal Utility for Neglected Entries",
+    "description": "Interactive editor for managing Windows user profiles."
+  },
+  "SHADE.ps1": {
+    "name": "System Hardening Against Data Exposure",
+    "description": "Comprehensive Windows 10/11 privacy hardening that disables telemetry, tracking, advertising, and phone-home behavior for MSP deployment."
   },
   "STARE.ps1": {
     "name": "Scheduled Task Administration & Routine Executor",
