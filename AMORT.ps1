@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.2
-    Developed by Steve the Killer | Updated: 2026-03-30
+    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.3
+    Developed by Steve the Killer | Updated: 2026-03-31
 .DESCRIPTION
     Automated Windows 10/11 tune-up for MSP field and remote deployment.
     Hardens AI, privacy, and browser settings; strips OEM and consumer
@@ -9,7 +9,7 @@
     database; runs DISM and SFC repair; and performs SSD TRIM while
     reporting disk space recovered at each stage.
 #>
-$_fver   = "| v15.2"
+$_fver   = "| v15.3"
 #region Pre-Flight Checks
 # ============================================================================
 # Force UTF-8 output so box-drawing characters render correctly
@@ -442,17 +442,7 @@ foreach ($App in $Bloat) {
 if ($IsCore) { 0..5 | ForEach-Object { Write-Progress -Id $_ -Activity "Done" -Completed } } else { Write-Progress -Activity "Stripping Bloatware" -Completed }
 # --- Phase 2: Aggressive Dell Purge ---
 if ($Vendor -like "*Dell*" -and -not $IsVM) {
-    # Terminate and Disable Persistent Dell Services
-    $DellServices = @("Dell*", "SupportAssist*", "DDV*", "DCF*", "DellHardwareSupport*")
-    foreach ($SvcName in $DellServices) {
-        $TargetSvcs = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
-        foreach ($S in $TargetSvcs) {
-            Stop-Service $S.Name -Force -ErrorAction SilentlyContinue
-            Set-Service $S.Name -StartupType Disabled -ErrorAction SilentlyContinue
-            & sc.exe delete $S.Name | Out-Null
-        }
-    }
-    # Targeted Software Removal using Package & WMI
+    # Step 1: Run uninstallers first so they can manage their own services cleanly
     $DellPatterns = @("*SupportAssist*", "*DellUpdate*", "*DellCommand*", "*PremierColor*", "*DigitalDelivery*", "*Dell Optimizer*", "*DellCoreServices*", "*Alienware*")
         $UnKeys = @(
             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -509,6 +499,16 @@ if ($Vendor -like "*Dell*" -and -not $IsVM) {
                 }
             }
         }
+    # Step 2: Mop up any leftover Dell services the uninstallers didn't clean up
+    $DellServices = @("Dell*", "SupportAssist*", "DDV*", "DCF*", "DellHardwareSupport*")
+    foreach ($SvcName in $DellServices) {
+        $TargetSvcs = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
+        foreach ($S in $TargetSvcs) {
+            Stop-Service $S.Name -Force -ErrorAction SilentlyContinue
+            Set-Service $S.Name -StartupType Disabled -ErrorAction SilentlyContinue
+            & sc.exe delete $S.Name | Out-Null
+        }
+    }
 
 # --- Phase 3: Office Language Pack Purge ---
     # Target MSI-based Language Packs (Office 2016/2019/Current)
@@ -928,15 +928,16 @@ if (-not $SkipRepair) {
                     Stop-TiWorker
                 }
                 Remove-Item $DismTmp1 -Force -ErrorAction SilentlyContinue
+                $ExitCode1 = if ($null -ne $Proc1.ExitCode) { $Proc1.ExitCode } else { -1 }
 
                 if ($Skipped1) {
                     Clear-AndReprintStep -StartRow $Row72 -Message $S72 -CustomInfo "[SKIPPED]"
                 }
-                elseif ($Proc1.ExitCode -in @(0, 3010)) {
+                elseif ($ExitCode1 -in @(0, 3010)) {
                     Clear-AndReprintStep -StartRow $Row72 -Message $S72 -Success
                 }
                 else {
-                    Clear-AndReprintStep -StartRow $Row72 -Message $S72 -CustomInfo "[FAILED:0x$($Proc1.ExitCode.ToString('X'))]"
+                    Clear-AndReprintStep -StartRow $Row72 -Message $S72 -CustomInfo "[FAILED:0x$($ExitCode1.ToString('X'))]"
                 }
             }
 
@@ -990,6 +991,7 @@ if (-not $SkipRepair) {
                     Stop-TiWorker
                 }
                 Remove-Item $DismTmp2 -Force -ErrorAction SilentlyContinue
+                $ExitCode2 = if ($null -ne $Proc2.ExitCode) { $Proc2.ExitCode } else { -1 }
 
                 Start-Service bits -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
                 Start-Service wuauserv -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
@@ -997,11 +999,11 @@ if (-not $SkipRepair) {
                 if ($Skipped2) {
                     Clear-AndReprintStep -StartRow $Row73 -Message $S73 -CustomInfo "[SKIPPED]"
                 }
-                elseif ($Proc2.ExitCode -in @(0, 3010)) {
+                elseif ($ExitCode2 -in @(0, 3010)) {
                     Clear-AndReprintStep -StartRow $Row73 -Message $S73 -Success
                 }
                 else {
-                    Clear-AndReprintStep -StartRow $Row73 -Message $S73 -CustomInfo "[FAILED:0x$($Proc2.ExitCode.ToString('X'))]"
+                    Clear-AndReprintStep -StartRow $Row73 -Message $S73 -CustomInfo "[FAILED:0x$($ExitCode2.ToString('X'))]"
                 }
             }
 
@@ -1047,18 +1049,19 @@ if (-not $SkipRepair) {
                     $Proc3.WaitForExit()  # Flush exit code before reading
                 }
                 Remove-Item $SfcTmp -Force -ErrorAction SilentlyContinue
+                $ExitCode3 = if ($null -ne $Proc3.ExitCode) { $Proc3.ExitCode } else { -1 }
 
                 if ($Skipped3) {
                     Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[SKIPPED]"
                 }
-                elseif ($Proc3.ExitCode -in @(0, 1)) {
+                elseif ($ExitCode3 -in @(0, 1)) {
                     Clear-AndReprintStep -StartRow $Row74 -Message $S74 -Success
                 }
-                elseif ($Proc3.ExitCode -eq 2) {
+                elseif ($ExitCode3 -eq 2) {
                     Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[WARNING]"
                 }
                 else {
-                    Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[FAILED:0x$($Proc3.ExitCode.ToString('X'))]"
+                    Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[FAILED:0x$($ExitCode3.ToString('X'))]"
                 }
             }
 }
