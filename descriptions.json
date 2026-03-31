@@ -45,7 +45,7 @@
   },
   "SHADE.ps1": {
     "name": "System Hardening Against Data Exposure",
-    "description": "Comprehensive Windows 10/11 privacy hardening that disables telemetry, tracking, advertising, and phone-home behavior for MSP deployment."
+    "description": "Windows 10/11 privacy hardening that disables telemetry, tracking, advertising, and phone-home behavior."
   },
   "STARE.ps1": {
     "name": "Scheduled Task Administration & Routine Executor",
