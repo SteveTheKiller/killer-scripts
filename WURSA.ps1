@@ -65,9 +65,6 @@ function Write-StepUpdate {
     }
 }
 
-powercfg /change standby-timeout-ac 120
-powercfg /change monitor-timeout-ac 120
-
 # Baseline Data for UI
 $OS = Get-CimInstance Win32_OperatingSystem
 
@@ -290,6 +287,8 @@ if (-not $ChocoAvailable) {
             $ZipPath
         )
         # Extract using pure .NET - bypasses Microsoft.PowerShell.Archive entirely
+        # Clear any leftover extraction folder from a previous failed attempt
+        if (Test-Path $ExtractPath) { Remove-Item $ExtractPath -Recurse -Force }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractPath)
         # Run the embedded install script directly
