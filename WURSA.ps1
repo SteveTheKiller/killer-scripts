@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.6
-    Developed by SteveTheKiller | Updated: 2026-03-15
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.7
+    Developed by Steve the Killer | Updated: 2026-04-01
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
@@ -24,6 +24,8 @@ param(
     [switch]$No3rdParty,       # Skip Chocolatey / third-party app updates
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
+
+$_ver    = "| v1.7"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -183,9 +185,33 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
     $Counter = 0
     foreach ($Update in $UpdateList) {
         $Counter++
-        $_uRow  = [Console]::CursorTop
-        $_uText = "      > Deploying: $($Update.Title)"
-        Write-Host $_uText -ForegroundColor $InfoCol
+
+        # Word-wrap the title at word boundaries so long names don't blow the
+        # cursor-reposition math. All lines use the same indent; [SUCCESS]/[FAILED]
+        # is appended to the last line only.
+        $_uPrefix = "      > Deploying: "
+        $_uIndent = " " * $_uPrefix.Length
+        $_uAvail  = $script:Width - "[SUCCESS]".Length - $_uPrefix.Length
+        $_uLines  = @()
+        $_rem     = $Update.Title
+        $_first   = $true
+        while ($_rem.Length -gt 0) {
+            $_pfx = if ($_first) { $_uPrefix } else { $_uIndent }
+            if ($_rem.Length -le $_uAvail) {
+                $_uLines += "$_pfx$_rem"
+                break
+            }
+            $_chunk = $_rem.Substring(0, $_uAvail)
+            $_split = $_chunk.LastIndexOf(' ')
+            if ($_split -le 0) { $_split = $_uAvail }   # no space found — hard break
+            $_uLines += "$_pfx$($_rem.Substring(0, $_split).TrimEnd())"
+            $_rem    = $_rem.Substring($_split).TrimStart()
+            $_first  = $false
+        }
+
+        $_uRow = [Console]::CursorTop
+        foreach ($_line in $_uLines) { Write-Host $_line -ForegroundColor $InfoCol }
+
         try {
             # Bypassing Install-WindowsUpdate to clear path errors
             $UpdatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
@@ -199,16 +225,28 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
             $InstallResult = $Installer.Install()
             $_savedTop = [Console]::CursorTop
             [Console]::SetCursorPosition(0, $_uRow)
-            $_pad = " " * [math]::Max(1, $script:Width - $_uText.Length - "[SUCCESS]".Length)
-            Write-Host "$_uText$_pad" -NoNewline -ForegroundColor $DimCol
-            Write-Host "[SUCCESS]" -ForegroundColor $OkCol
+            for ($_li = 0; $_li -lt $_uLines.Count; $_li++) {
+                if ($_li -eq $_uLines.Count - 1) {
+                    $_pad = " " * [math]::Max(1, $script:Width - $_uLines[$_li].Length - "[SUCCESS]".Length)
+                    Write-Host "$($_uLines[$_li])$_pad" -NoNewline -ForegroundColor $DimCol
+                    Write-Host "[SUCCESS]" -ForegroundColor $OkCol
+                } else {
+                    Write-Host $_uLines[$_li] -ForegroundColor $DimCol
+                }
+            }
             [Console]::SetCursorPosition(0, $_savedTop)
         } catch {
             $_savedTop = [Console]::CursorTop
             [Console]::SetCursorPosition(0, $_uRow)
-            $_pad = " " * [math]::Max(1, $script:Width - $_uText.Length - "[FAILED]".Length)
-            Write-Host "$_uText$_pad" -NoNewline -ForegroundColor $DimCol
-            Write-Host "[FAILED]" -ForegroundColor Red
+            for ($_li = 0; $_li -lt $_uLines.Count; $_li++) {
+                if ($_li -eq $_uLines.Count - 1) {
+                    $_pad = " " * [math]::Max(1, $script:Width - $_uLines[$_li].Length - "[FAILED]".Length)
+                    Write-Host "$($_uLines[$_li])$_pad" -NoNewline -ForegroundColor $DimCol
+                    Write-Host "[FAILED]" -ForegroundColor Red
+                } else {
+                    Write-Host $_uLines[$_li] -ForegroundColor $DimCol
+                }
+            }
             [Console]::SetCursorPosition(0, $_savedTop)
         }
     }
@@ -547,7 +585,6 @@ $_sfx    = "█"
 $_ftrW   = $_artW + 1
 $_ffillW = $script:Width - $_ftrW - $_sfx.Length
 $_footer = "  WINDOWS UPDATE SEQUENCE COMPLETE"
-$_ver    = "| v1.6"
 $_fpad   = " " * ($_ffillW - $_footer.Length - $_ver.Length)
 Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
 Write-Host "$_footer$_fpad$_ver" -ForegroundColor $MainCol -NoNewline; Write-Host " $_art2" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
