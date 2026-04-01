@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.7
-    Developed by Steve the Killer | Updated: 2026-04-01
+    Developed for The 20 MSP by Steve Riley | Updated: 2026-04-01
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
@@ -64,6 +64,9 @@ function Write-StepUpdate {
         Write-Host $Message -ForegroundColor $InfoCol
     }
 }
+
+powercfg /change standby-timeout-ac 120
+powercfg /change monitor-timeout-ac 120
 
 # Baseline Data for UI
 $OS = Get-CimInstance Win32_OperatingSystem
