@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.3
-    Developed by Steve the Killer | Updated: 2026-03-31
+    Developed for The 20 MSP by Steve Riley | Updated: 2026-03-31
 .DESCRIPTION
     Automated Windows 10/11 tune-up for MSP field and remote deployment.
     Hardens AI, privacy, and browser settings; strips OEM and consumer
@@ -504,7 +504,7 @@ if ($Vendor -like "*Dell*" -and -not $IsVM) {
     foreach ($SvcName in $DellServices) {
         $TargetSvcs = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
         foreach ($S in $TargetSvcs) {
-            Stop-Service $S.Name -Force -ErrorAction SilentlyContinue
+            Stop-Service $S.Name -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
             Set-Service $S.Name -StartupType Disabled -ErrorAction SilentlyContinue
             & sc.exe delete $S.Name | Out-Null
         }
@@ -532,7 +532,7 @@ Get-AppxPackage -AllUsers -Name "Microsoft.Office.Desktop.*" | Where-Object { $_
     # Filesystem Scrub
     $DellFolders = @("C:\ProgramData\Dell", "C:\Program Files\Dell", "C:\Program Files (x86)\Dell", "C:\Windows\System32\Drivers\Dell")
     foreach ($DF in $DellFolders) {
-        if (Test-Path $DF) { Remove-Item $DF -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $DF) { try { Remove-Item $DF -Recurse -Force -ErrorAction SilentlyContinue } catch { } }
     }
 }
 # --- Phase 3: General Win32 Software Purge ---
