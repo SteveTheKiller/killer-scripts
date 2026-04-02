@@ -176,7 +176,7 @@ function Get-DriverString([string]$DevName) {
     return "N/A"
 }
 
-function Format-DriverString([string]$DevName, [int]$ColWidth = 25) {
+function Format-DriverString([string]$DevName, [int]$ColWidth = 26) {
     $driverString = Get-DriverString $DevName
     if ($driverString -eq "N/A") { return "N/A".PadLeft($ColWidth) }
     $parts   = $driverString -split "  ", 2
@@ -235,8 +235,8 @@ Write-Host "                    Exclusive: " -NoNewline -ForegroundColor White; 
 #endregion
 
 #region [2] - DEVICES (WIRED AND BLUETOOTH)
-Write-Host "$("Device Name".PadRight(50)) $("Status".PadRight(10)) $("Driver")" -ForegroundColor Cyan
-$_ul = ("- " * 24).Substring(0, 48) + " " + ("- " * 5).Substring(0, 10) + " " + ("- " * 13).Substring(0, 25)
+Write-Host "$("Device Name".PadRight(47)) $("Status".PadRight(10)) $("Driver")" -ForegroundColor Cyan
+$_ul = ("- " * 24).Substring(0, 47) + " " + ("- " * 5).Substring(0, 10) + " " + ("- " * 13).Substring(0, 26)
 $_ui = 0; $_uc = @([ConsoleColor]$LineCol, [ConsoleColor]$AccentCol, [ConsoleColor]$DimCol, [ConsoleColor]$MainCol)
 foreach ($_ch in $_ul.ToCharArray()) { Write-Host $_ch -NoNewline -ForegroundColor $_uc[$_ui % $_uc.Count]; if ($_ch -ne ' ') { $_ui++ } }
 Write-Host ""
@@ -253,7 +253,7 @@ foreach ($Dev in $PhysOut) {
     $Color = if     ($Dev.ConfigManagerErrorCode -eq 22)            { "Red"   }
              elseif (Test-IsDefault $Dev.Name $DefaultOutputTokens) { "Green" }
              else                                                  { "White" }
-    Write-Host "$($Dev.Name.PadRight(48).Substring(0,48)) $($Diag.PadRight(10)) $Drv" -ForegroundColor $Color
+    Write-Host "$($Dev.Name.PadRight(47).Substring(0,47)) $($Diag.PadRight(10)) $Drv" -ForegroundColor $Color
 }
 
 Write-Host "`n[>] Physical & USB: Input" -ForegroundColor Magenta
@@ -270,7 +270,7 @@ foreach ($Dev in $PhysIn) {
     $Color = if     ($Dev.ConfigManagerErrorCode -eq 22)           { "Red"   }
              elseif (Test-IsDefault $Dev.Name $DefaultInputTokens) { "Green" }
              else                                                  { "White" }
-    Write-Host "$($Dev.Name.PadRight(48).Substring(0,48)) $($Diag.PadRight(10)) $Drv" -ForegroundColor $Color
+    Write-Host "$($Dev.Name.PadRight(47).Substring(0,47)) $($Diag.PadRight(10)) $Drv" -ForegroundColor $Color
 }
 
 Write-Host "`n[>] Bluetooth: Output" -ForegroundColor Magenta
@@ -282,7 +282,7 @@ foreach ($Dev in $BTOut) {
     $Color = if     ($Dev.ConfigManagerErrorCode -eq 22)            { "Red"   }
              elseif (Test-IsDefault $Dev.Name $DefaultOutputTokens) { "Green" }
              else                                                  { "White" }
-    Write-Host "$($Dev.Name.PadRight(48).Substring(0,48)) $($Diag.PadRight(10)) $Drv" -ForegroundColor $Color
+    Write-Host "$($Dev.Name.PadRight(47).Substring(0,47)) $($Diag.PadRight(10)) $Drv" -ForegroundColor $Color
 }
 
 Write-Host "`n[>] Bluetooth: Input" -ForegroundColor Magenta
@@ -296,7 +296,7 @@ foreach ($Dev in $BTIn) {
     $Color = if     ($Dev.ConfigManagerErrorCode -eq 22)           { "Red"   }
              elseif (Test-IsDefault $Dev.Name $DefaultInputTokens) { "Green" }
              else                                                  { "White" }
-    Write-Host "$($Dev.Name.PadRight(48).Substring(0,48)) $($Diag.PadRight(10)) $Drv" -ForegroundColor $Color
+    Write-Host "$($Dev.Name.PadRight(47).Substring(0,47)) $($Diag.PadRight(10)) $Drv" -ForegroundColor $Color
 }
 #endregion
 
