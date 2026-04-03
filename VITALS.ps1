@@ -301,7 +301,7 @@ $NetworkReport = Get-NetAdapter | Where-Object Status -eq "Up" | ForEach-Object 
 Write-Host "`nInterface            IPAddress       Subnet          Gateway         DNS Servers" -ForegroundColor $script:PrefixFG
 foreach ($N in $NetworkReport) {
     $FormatStr = "{0,-20} {1,-15} {2,-15} {3,-15} {4}"
-    Write-Host ($FormatStr -f ($N.Interface.PadRight(20).Substring(0,20)), $N.IPAddress, $N.Subnet, $N.Gateway, $N.DNS[0]) -ForegroundColor $script:ValueFG
+    Write-Host ($FormatStr -f ($N.Interface.PadRight(20).Substring(0,20)), $N.IPAddress, $N.Subnet, $N.Gateway, @($N.DNS)[0]) -ForegroundColor $script:ValueFG
     if ($N.DNS.Count -gt 1) {
         $Indent = " " * 69
         foreach ($D in $N.DNS | Select-Object -Skip 1) {
