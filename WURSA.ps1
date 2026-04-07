@@ -276,9 +276,9 @@ $ThirdParty = @(
     @{ Name = "Microsoft Edge";  ChocoID = "microsoft-edge";   Path = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";                     Process = "msedge" },
     @{ Name = "Mozilla Firefox"; ChocoID = "firefox";          Path = "C:\Program Files\Mozilla Firefox\firefox.exe";                                      Process = "firefox" },
     @{ Name = "Brave";           ChocoID = "brave";            Path = "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe";                Process = "brave" },
-    @{ Name = "Adobe Acrobat";   ChocoID = "adobereader";      Path = "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe";               Process = "AcroRd32" },
-    @{ Name = "Zoom";            ChocoID = "zoom --install-arguments='/quiet /norestart'"; Path = "C:\Program Files\Zoom\bin\Zoom.exe";                     Process = "Zoom" },
-    @{ Name = "Microsoft Teams"; ChocoID = "microsoft-teams";  Path = "C:\Program Files\Microsoft\Teams\current\Teams.exe";                               Process = "Teams" },
+    @{ Name = "Adobe Acrobat";   ChocoID = "adobereader";      Path = @("C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe","C:\Program Files (x86)\Adobe\Acrobat DC\Acrobat\Acrobat.exe","C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe","C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe"); Process = @("Acrobat","AcroRd32") },
+    @{ Name = "Zoom";            ChocoID = "zoom --install-arguments='/quiet /norestart'"; Path = @("C:\Program Files\Zoom\bin\Zoom.exe","C:\Program Files (x86)\Zoom\bin\Zoom.exe","$env:APPDATA\Zoom\bin\Zoom.exe","$env:LOCALAPPDATA\Zoom\bin\Zoom.exe"); Process = "Zoom" },
+    @{ Name = "Microsoft Teams"; ChocoID = "microsoft-teams";  Path = @("C:\Program Files\Microsoft\Teams\current\Teams.exe","C:\Program Files (x86)\Microsoft\Teams\current\Teams.exe","C:\Program Files\WindowsApps\MSTeams_*\ms-teams.exe"); Process = @("Teams","ms-teams") },
     @{ Name = "Webex";           ChocoID = "webex";            Path = "C:\Program Files\Webex\bin\CiscoCollabHost.exe";                                    Process = "CiscoCollabHost" },
     @{ Name = "Slack";           ChocoID = "slack";            Path = "C:\Program Files\Slack\slack.exe";                                                  Process = "slack" },
     @{ Name = "RingCentral";     ChocoID = "ringcentral";      Path = "C:\Program Files\RingCentral\RingCentral.exe";                                      Process = "RingCentral" },
@@ -326,12 +326,23 @@ if (-not $ChocoAvailable) {
 if ($ChocoAvailable -and -not $No3rdParty) {
     Write-StepUpdate "[5/5] Updating Installed Third-Party Software..."
     foreach ($App in $ThirdParty) {
-        if (-not (Test-Path $App.Path)) {
+        # Resolve first valid path - supports arrays and wildcard paths (e.g. WindowsApps\MSTeams_*)
+        $_appPath = $null
+        foreach ($_candidate in @($App.Path)) {
+            if ($_candidate -match '\*') {
+                $_resolved = Get-Item $_candidate -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($_resolved) { $_appPath = $_resolved.FullName; break }
+            } elseif (Test-Path $_candidate) {
+                $_appPath = $_candidate; break
+            }
+        }
+        $_procs = @($App.Process)
+        if (-not $_appPath) {
             Write-Host "      > " -NoNewline -ForegroundColor $DimCol
             Write-Host "$($App.Name):" -NoNewline -ForegroundColor $DimCol
             Write-SubResult "[NOT INSTALLED]" DarkGray
         } else {
-            $IsRunning = Get-Process -Name $App.Process -ErrorAction SilentlyContinue
+            $IsRunning = $_procs | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
             if ($IsRunning) {
                 Write-Host "      > " -NoNewline -ForegroundColor $DimCol
                 Write-Host "$($App.Name):" -NoNewline -ForegroundColor $DimCol
