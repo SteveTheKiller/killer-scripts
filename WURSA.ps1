@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.7
-    Developed by Steve the Killer | Updated: 2026-04-01
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.8
+    Developed by Steve the Killer | Updated: 2026-04-07
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
@@ -25,7 +25,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v1.7"
+$_ver    = "| v1.8"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -148,11 +148,25 @@ Write-Host "[>] Operating System : " -NoNewline -ForegroundColor $LineCol
 $WinVer = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
 Write-Host "$($OS.Caption) $WinVer (Build $($OS.BuildNumber))" -ForegroundColor $AccentCol
 Write-HLine -Style dashed
+
+#region 0.5 - System Restore Point
+# ============================================================================
+Write-StepUpdate "[1/5] Creating System Restore Point..."
+try {
+    # Bypass the 24-hour cooldown Windows enforces between restore points
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "SystemRestorePointCreationFrequency" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+    # Ensure System Protection is enabled on C: (often disabled on managed endpoints)
+    Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue | Out-Null
+    Checkpoint-Computer -Description "WURSA Pre-Update $($env:COMPUTERNAME) $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+    Write-StepUpdate -Success
+} catch {
+    Write-Host "      [!] Restore point failed: $($_.Exception.Message)" -ForegroundColor $WarnCol
+}
 #endregion
 
 #region 1 - Service Registration
 # ============================================================================
-Write-StepUpdate "[1/4] Opting-in to Microsoft Product Updates..."
+Write-StepUpdate "[2/5] Opting-in to Microsoft Product Updates..."
 try {
     $ServiceManager = New-Object -ComObject Microsoft.Update.ServiceManager
     $ServiceManager.AddService2("7971f918-a847-4430-9279-4a52d1efe18d", 7, "") | Out-Null
@@ -164,7 +178,7 @@ try {
 
 #region 2 - Discovery
 # ============================================================================
-Write-StepUpdate "[2/4] Scanning for Drivers & OS Patches..."
+Write-StepUpdate "[3/5] Scanning for Drivers & OS Patches..."
 # Direct API search to bypass the 'remoteIpNoProxy' crash
 $UpdateSession = New-Object -ComObject Microsoft.Update.Session
 $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
@@ -172,7 +186,7 @@ $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software' and Is
 $UpdateList = $SearchResult.Updates
 if (-not $UpdateList -or $UpdateList.Count -eq 0) {
     Write-StepUpdate -Success -CustomInfo "(System Up to Date)"
-    Write-Host "[3/4] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
+    Write-Host "[4/5] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
     Write-SubResult "[SKIPPED]" $WarnCol
 } else {
     Write-StepUpdate -Success -CustomInfo "($($UpdateList.Count) Found)"
@@ -181,7 +195,7 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
 #region 3 - Installation & Progress
 # ========================================================================
     $ProgressPreference = 'SilentlyContinue'
-    Write-StepUpdate "[3/4] Installing Windows Updates..."
+    Write-StepUpdate "[4/5] Installing Windows Updates..."
     $Counter = 0
     foreach ($Update in $UpdateList) {
         $Counter++
@@ -251,7 +265,7 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
         }
     }
     Write-Progress -Activity "W.U.R.S.A.: Deploying Updates" -Completed
-    Write-StepUpdate "[3/4] Windows Updates" -Success
+    Write-StepUpdate "[4/5] Windows Updates" -Success
 }
 #endregion
 
@@ -310,7 +324,7 @@ if (-not $ChocoAvailable) {
     }
 }
 if ($ChocoAvailable -and -not $No3rdParty) {
-    Write-StepUpdate "[4/4] Updating Installed Third-Party Software..."
+    Write-StepUpdate "[5/5] Updating Installed Third-Party Software..."
     foreach ($App in $ThirdParty) {
         if (-not (Test-Path $App.Path)) {
             Write-Host "      > " -NoNewline -ForegroundColor $DimCol
@@ -342,7 +356,7 @@ if ($ChocoAvailable -and -not $No3rdParty) {
             }
         }
     }
-    Write-StepUpdate "[4/4] Third-Party Updates" -Success
+    Write-StepUpdate "[5/5] Third-Party Updates" -Success
 }
 #endregion
 
