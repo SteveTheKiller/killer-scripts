@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.4
-    Developed by Steve the Kikller | Updated: 2026-04-21
+    Developed by Steve the Killer | Updated: 2026-04-21
 .DESCRIPTION
     Automated Windows 10/11 tune-up for MSP field and remote deployment.
     Hardens AI, privacy, and browser settings; strips OEM and consumer
@@ -916,7 +916,7 @@ if (-not $SkipRepair) {
                     try {
                         [Console]::SetCursorPosition(0, $Row72)
                         $EscHint = "[ESC to skip]"
-                        $Width = [Console]::WindowWidth - 1
+                        $Width = $script:Width
                         $Left = "$S72 $($DismSpin[$DismSpinIdx1 % 4]) $($DismTimer1.Elapsed.ToString('mm\:ss'))"
                         $Spaces = [Math]::Max(1, $Width - $Left.Length - $EscHint.Length)
                         [Console]::ForegroundColor = [ConsoleColor]::Cyan
@@ -986,7 +986,7 @@ if (-not $SkipRepair) {
                     try {
                         [Console]::SetCursorPosition(0, $Row73)
                         $EscHint = "[ESC to skip]"
-                        $Width = [Console]::WindowWidth - 1
+                        $Width = $script:Width
                         $Left = "$S73 $($DismSpin[$DismSpinIdx2 % 4]) $($DismTimer2.Elapsed.ToString('mm\:ss'))"
                         $Spaces = [Math]::Max(1, $Width - $Left.Length - $EscHint.Length)
                         [Console]::ForegroundColor = [ConsoleColor]::Cyan
@@ -1052,7 +1052,7 @@ if (-not $SkipRepair) {
                     try {
                         [Console]::SetCursorPosition(0, $Row74)
                         $EscHint = "[ESC to skip]"
-                        $Width = [Console]::WindowWidth - 1
+                        $Width = $script:Width
                         $Left = "$S74 $($DismSpin[$SfcSpinIdx % 4]) $($SfcTimer.Elapsed.ToString('mm\:ss'))"
                         $Spaces = [Math]::Max(1, $Width - $Left.Length - $EscHint.Length)
                         [Console]::ForegroundColor = [ConsoleColor]::Cyan
