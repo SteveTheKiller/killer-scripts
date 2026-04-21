@@ -76,7 +76,7 @@ function Write-StepUpdate {
         [Console]::SetCursorPosition(0, $script:StepRow)
         
         # Clear the original Cyan line
-        Write-Host (" " * ([Console]::WindowWidth - 1)) -NoNewline
+        Write-Host (" " * $script:Width) -NoNewline
         [Console]::SetCursorPosition(0, $script:StepRow)
         
         # Reprint the line in the "Done" (Gray/White) style
@@ -617,14 +617,14 @@ if ($Svc -and $Svc.Status -ne 'Stopped') {
         $dots = '.' * (($RetryCount % 3) + 1)
         $savedRow = [Console]::CursorTop
         [Console]::SetCursorPosition(0, $script:StepRow)
-        Write-Host ("$($script:LastStepMessage) [Stopping WSearch$dots]").PadRight([Console]::WindowWidth - 1) -NoNewline -ForegroundColor Cyan
+        Write-Host ("$($script:LastStepMessage) [Stopping WSearch$dots]").PadRight($script:Width) -NoNewline -ForegroundColor Cyan
         [Console]::SetCursorPosition(0, $savedRow)
         Start-Sleep -Seconds 2
         $RetryCount++
     }
     # Restore clean step line (strip the "[Stopping WSearch...]" suffix)
     [Console]::SetCursorPosition(0, $script:StepRow)
-    Write-Host $script:LastStepMessage.PadRight([Console]::WindowWidth - 1) -NoNewline -ForegroundColor Cyan
+    Write-Host $script:LastStepMessage.PadRight($script:Width) -NoNewline -ForegroundColor Cyan
     [Console]::SetCursorPosition(0, $script:StepRow + 1)
     if ((Get-Service $SvcName).Status -ne 'Stopped') {
         Get-Process "SearchIndexer" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -834,7 +834,7 @@ if (-not $SkipRepair) {
         param([int]$StartRow, [string]$Message, [switch]$Success, [string]$CustomInfo)
         try {
             $endRow = [Console]::CursorTop
-            $width  = [Console]::WindowWidth - 1
+            $width  = $script:Width
             for ($r = $StartRow; $r -le $endRow; $r++) {
                 [Console]::SetCursorPosition(0, $r)
                 [Console]::Write(' ' * $width)
