@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.4
-    Developed by Steve the Killer | Updated: 2026-04-21
+    Developed by Steve the Kikller | Updated: 2026-04-21
 .DESCRIPTION
     Automated Windows 10/11 tune-up for MSP field and remote deployment.
     Hardens AI, privacy, and browser settings; strips OEM and consumer
@@ -504,7 +504,7 @@ if ($Vendor -like "*Dell*" -and -not $IsVM) {
     foreach ($SvcName in $DellServices) {
         $TargetSvcs = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
         foreach ($S in $TargetSvcs) {
-            Stop-Service $S.Name -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+            try { Stop-Service $S.Name -Force -ErrorAction Stop -WarningAction SilentlyContinue } catch { }
             Set-Service $S.Name -StartupType Disabled -ErrorAction SilentlyContinue
             & sc.exe delete $S.Name | Out-Null
         }
