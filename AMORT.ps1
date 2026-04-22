@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.4
-    Developed by Steve the Killer | Updated: 2026-04-21
+    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.5
+    Developed by Steve the Killer | Updated: 2026-04-22
 .DESCRIPTION
     Automated Windows 10/11 tune-up for MSP field and remote deployment.
     Hardens AI, privacy, and browser settings; strips OEM and consumer
@@ -9,7 +9,7 @@
     database; runs DISM and SFC repair; and performs SSD TRIM while
     reporting disk space recovered at each stage.
 #>
-$_fver   = "| v15.4"
+$_fver   = "| v15.5"
 #region Pre-Flight Checks
 # ============================================================================
 # Force UTF-8 output so box-drawing characters render correctly
@@ -896,7 +896,17 @@ if (-not $SkipRepair) {
             else {
                 $DismSpin = [char[]]@('|','/','-','\')
                 $DismTmp1 = [System.IO.Path]::GetTempFileName()
-                $Proc1 = Start-Process -FilePath "Dism.exe" -ArgumentList "/Online /Cleanup-Image /RestoreHealth /NoRestart" -NoNewWindow -PassThru -RedirectStandardOutput $DismTmp1
+
+                # Use .NET Process directly; Start-Process -PassThru returns $null ExitCode
+                # when combined with -RedirectStandardOutput. Wrap in cmd.exe for file redirection.
+                $psi1 = New-Object System.Diagnostics.ProcessStartInfo
+                $psi1.FileName               = "cmd.exe"
+                $psi1.Arguments              = "/c dism.exe /Online /Cleanup-Image /RestoreHealth /NoRestart > `"$DismTmp1`" 2>&1"
+                $psi1.UseShellExecute        = $false
+                $psi1.CreateNoWindow         = $true
+                $psi1.WindowStyle            = [System.Diagnostics.ProcessWindowStyle]::Hidden
+                $Proc1 = [System.Diagnostics.Process]::Start($psi1)
+
                 $Skipped1 = $false
                 $DismSpinIdx1 = 0
                 $DismTimer1 = [Diagnostics.Stopwatch]::StartNew()
@@ -906,7 +916,7 @@ if (-not $SkipRepair) {
                         if ([Console]::KeyAvailable) {
                             $Key = [Console]::ReadKey($true)
                             if ($Key.Key -eq [ConsoleKey]::Escape) {
-                                $Proc1 | Stop-Process -Force
+                                try { $Proc1.Kill() } catch {}
                                 Stop-DismTree
                                 $Skipped1 = $true
                                 break
@@ -931,11 +941,12 @@ if (-not $SkipRepair) {
                 $DismTimer1.Stop()
 
                 if (-not $Skipped1) {
-                    $Proc1.WaitForExit()  # Flush exit code before reading
+                    $Proc1.WaitForExit()
                     Stop-TiWorker
                 }
+                $ExitCode1 = $Proc1.ExitCode
+                try { $Proc1.Dispose() } catch {}
                 Remove-Item $DismTmp1 -Force -ErrorAction SilentlyContinue
-                $ExitCode1 = if ($null -ne $Proc1.ExitCode) { $Proc1.ExitCode } else { -1 }
 
                 if ($Skipped1) {
                     Clear-AndReprintStep -StartRow $Row72 -Message $S72 -CustomInfo "[SKIPPED]"
@@ -966,7 +977,15 @@ if (-not $SkipRepair) {
                 Clear-InputBuffer
 
                 $DismTmp2 = [System.IO.Path]::GetTempFileName()
-                $Proc2 = Start-Process -FilePath "Dism.exe" -ArgumentList "/Online /Cleanup-Image /StartComponentCleanup /NoRestart" -NoNewWindow -PassThru -RedirectStandardOutput $DismTmp2
+
+                $psi2 = New-Object System.Diagnostics.ProcessStartInfo
+                $psi2.FileName               = "cmd.exe"
+                $psi2.Arguments              = "/c dism.exe /Online /Cleanup-Image /StartComponentCleanup /NoRestart > `"$DismTmp2`" 2>&1"
+                $psi2.UseShellExecute        = $false
+                $psi2.CreateNoWindow         = $true
+                $psi2.WindowStyle            = [System.Diagnostics.ProcessWindowStyle]::Hidden
+                $Proc2 = [System.Diagnostics.Process]::Start($psi2)
+
                 $Skipped2 = $false
                 $DismSpinIdx2 = 0
                 $DismTimer2 = [Diagnostics.Stopwatch]::StartNew()
@@ -976,7 +995,7 @@ if (-not $SkipRepair) {
                         if ([Console]::KeyAvailable) {
                             $Key = [Console]::ReadKey($true)
                             if ($Key.Key -eq [ConsoleKey]::Escape) {
-                                $Proc2 | Stop-Process -Force
+                                try { $Proc2.Kill() } catch {}
                                 Stop-DismTree
                                 $Skipped2 = $true
                                 break
@@ -1001,11 +1020,12 @@ if (-not $SkipRepair) {
                 $DismTimer2.Stop()
 
                 if (-not $Skipped2) {
-                    $Proc2.WaitForExit()  # Flush exit code before reading
+                    $Proc2.WaitForExit()
                     Stop-TiWorker
                 }
+                $ExitCode2 = $Proc2.ExitCode
+                try { $Proc2.Dispose() } catch {}
                 Remove-Item $DismTmp2 -Force -ErrorAction SilentlyContinue
-                $ExitCode2 = if ($null -ne $Proc2.ExitCode) { $Proc2.ExitCode } else { -1 }
 
                 Start-Service bits -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
                 Start-Service wuauserv -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
@@ -1032,7 +1052,16 @@ if (-not $SkipRepair) {
             else {
                 Clear-InputBuffer
                 $SfcTmp = [System.IO.Path]::GetTempFileName()
-                $Proc3 = Start-Process -FilePath "sfc.exe" -ArgumentList "/scannow" -NoNewWindow -PassThru -RedirectStandardOutput $SfcTmp
+
+                # sfc.exe writes Unicode; capture via cmd redirection for reliable exit code
+                $psi3 = New-Object System.Diagnostics.ProcessStartInfo
+                $psi3.FileName               = "cmd.exe"
+                $psi3.Arguments              = "/c sfc.exe /scannow > `"$SfcTmp`" 2>&1"
+                $psi3.UseShellExecute        = $false
+                $psi3.CreateNoWindow         = $true
+                $psi3.WindowStyle            = [System.Diagnostics.ProcessWindowStyle]::Hidden
+                $Proc3 = [System.Diagnostics.Process]::Start($psi3)
+
                 $Skipped3 = $false
                 $SfcSpinIdx = 0
                 $SfcTimer = [Diagnostics.Stopwatch]::StartNew()
@@ -1042,7 +1071,7 @@ if (-not $SkipRepair) {
                         if ([Console]::KeyAvailable) {
                             $Key = [Console]::ReadKey($true)
                             if ($Key.Key -eq [ConsoleKey]::Escape) {
-                                $Proc3 | Stop-Process -Force
+                                try { $Proc3.Kill() } catch {}
                                 Get-Process -Name "sfc" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
                                 $Skipped3 = $true
                                 break
@@ -1067,10 +1096,11 @@ if (-not $SkipRepair) {
                 $SfcTimer.Stop()
 
                 if (-not $Skipped3) {
-                    $Proc3.WaitForExit()  # Flush exit code before reading
+                    $Proc3.WaitForExit()
                 }
+                $ExitCode3 = $Proc3.ExitCode
+                try { $Proc3.Dispose() } catch {}
                 Remove-Item $SfcTmp -Force -ErrorAction SilentlyContinue
-                $ExitCode3 = if ($null -ne $Proc3.ExitCode) { $Proc3.ExitCode } else { -1 }
 
                 if ($Skipped3) {
                     Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[SKIPPED]"
@@ -1145,16 +1175,11 @@ Write-Host "Space Recovered     : " -NoNewline -ForegroundColor $InfoCol
 Write-Host "$TotalStr" -ForegroundColor Yellow
 # Footer
 $_sfx   = "█"
-$_ftr1 = " ╔═╗ ╔╦╗ ╔═╗ ╦═╗ ╔╦╗ "
-$_ftr2 = " ╠═╣ ║║║ ║ ║ ╠╦╝  ║  "
-$_ftr3 = " ╩ ╩ ╩ ╩ ╚═╝ ╩╚═  ╩  "
-$_ftrW = [Math]::Max($_ftr1.Length, [Math]::Max($_ftr2.Length, $_ftr3.Length))
-$_ftr1 = $_ftr1.PadRight($_ftrW); $_ftr2 = $_ftr2.PadRight($_ftrW); $_ftr3 = $_ftr3.PadRight($_ftrW)
-$_ffillW = $script:Width - $_ftrW - $_sfx.Length
+$_ffillW = $script:Width - $_artW - 1 - $_sfx.Length
 $_footer = "  MAINTENANCE COMPLETE"
 $_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $_fver.Length))
 
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr1 -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr3 -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host " $_art2" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
 #endregion
