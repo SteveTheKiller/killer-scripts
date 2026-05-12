@@ -1,13 +1,15 @@
 ﻿<#
 .NAME
-    Deployment Environment Bloatware Liquidator & Optimized Automated Toolkit (D.E.B.L.O.A.T.) v2.0
-    Developed by SteveTheKiller | Updated: 2026-03-13
+    Deployment Environment Bloatware Liquidator & Optimized Automated Toolkit (D.E.B.L.O.A.T.) v2.2
+    Developed by Steve the Killer | Updated: 2026-05-12
 .DESCRIPTION
     Standardizes Windows 11 by removing OEM bloat (HP, Dell,
     ASUS/Acer), AI/Recall features, and sponsored consumer content.
     Hardens privacy via telemetry caps, Edge policy enforcement, and
     taskbar/Start menu lockdown applied across all user profiles
-    including the Default User template.
+    including the Default User template. All per-user settings are
+    routed through hive loading so they apply correctly when run as
+    SYSTEM via LiveConnect/RMM.
 #>
 
 #region 0: INITIALIZATION AND HELPER FUNCTIONS
@@ -17,7 +19,20 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit
 }
 
-Clear-Host
+$ProgressPreference = 'SilentlyContinue'
+
+# Probe for real console support. LiveConnect / RMM / redirected hosts
+# throw on cursor API; fall back to plain step output when unavailable.
+$script:UseCursor = $false
+try {
+    $_t = [Console]::CursorTop
+    [Console]::SetCursorPosition(0, $_t)
+    $script:UseCursor = $true
+} catch {
+    $script:UseCursor = $false
+}
+
+if ($script:UseCursor) { Clear-Host }
 $script:Width = 85
 
 $LineCol   = "White"
@@ -28,6 +43,12 @@ $AccentCol = "Yellow"
 $DimCol    = "DarkGray"
 $InfoCol   = "Cyan"
 $OkCol     = "Green"
+
+# Register HKU: PSDrive so HKU:\<Hive>\... paths resolve in Test-Path / Set-ItemProperty.
+if (-not (Get-PSDrive -Name HKU -PSProvider Registry -ErrorAction SilentlyContinue)) {
+    New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -Scope Script | Out-Null
+}
+
 function Write-HLine {
     param(
         [string]$Style = "dashed",
@@ -39,7 +60,7 @@ function Write-HLine {
         $line = "━" * $Width
     }
     $colors = @(
-        [ConsoleColor]$BorderCol,
+        [ConsoleColor]$LineCol,
         [ConsoleColor]$ArtCol,
         [ConsoleColor]$AccentCol,
         [ConsoleColor]$DimCol
@@ -78,61 +99,236 @@ $_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
 $_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
 $_fillW = $script:Width - $_pfx.Length - $_artW
 $_title = "DEPLOYMENT ENV BLOAT LIQUIDATOR & OPTIMIZED TOOLKIT"
-$_ver   = "| v2.0"
+$_ver   = "| v2.2"
 
 Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art1 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
 Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art2 -ForegroundColor $ArtCol -NoNewline; Write-Host "$_title" -ForegroundColor $MainCol
 Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art3 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
 $Manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
 
-# --- Step Indicator Functions ---
+# --- Step Indicator Functions (LiveConnect-safe) ---
 $script:StepRow = -1
 $script:StepMsg = ""
 
 function Write-Step {
     param([string]$Msg)
-    $script:StepRow = [Console]::CursorTop
     $script:StepMsg = $Msg
+    if ($script:UseCursor) {
+        try { $script:StepRow = [Console]::CursorTop } catch { $script:StepRow = -1 }
+    } else {
+        $script:StepRow = -1
+    }
     Write-Host $Msg -ForegroundColor $InfoCol
 }
 
 function Complete-Step {
-    $savedTop = [Console]::CursorTop
-    if ($script:StepRow -ge 0 -and $script:StepRow -lt $savedTop) {
-        [Console]::SetCursorPosition(0, $script:StepRow)
-        $_pad = " " * [math]::Max(1, $script:Width - $script:StepMsg.Length - "[SUCCESS]".Length)
-        Write-Host $script:StepMsg -ForegroundColor $DimCol -NoNewline
-        Write-Host "$_pad[SUCCESS]" -ForegroundColor $OkCol
-        [Console]::SetCursorPosition(0, $savedTop)
+    $marker = "[SUCCESS]"
+    if ($script:UseCursor -and $script:StepRow -ge 0) {
+        try {
+            $savedTop = [Console]::CursorTop
+            if ($script:StepRow -lt $savedTop) {
+                [Console]::SetCursorPosition(0, $script:StepRow)
+                $_pad = " " * [math]::Max(1, $script:Width - $script:StepMsg.Length - $marker.Length)
+                Write-Host $script:StepMsg -ForegroundColor $DimCol -NoNewline
+                Write-Host "$_pad$marker" -ForegroundColor $OkCol
+                [Console]::SetCursorPosition(0, $savedTop)
+            }
+        } catch {
+            Write-Host "  $marker $($script:StepMsg)" -ForegroundColor $OkCol
+        }
+    } else {
+        $_pad = " " * [math]::Max(1, $script:Width - $script:StepMsg.Length - $marker.Length)
+        Write-Host "$($script:StepMsg)$_pad$marker" -ForegroundColor $OkCol
     }
     $script:StepRow = -1
 }
 
-# --- Helper Functions ---
+# Universal registry value setter. Creates the key if missing.
+function Set-UserRegValue {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Value,
+        [string]$Type = "DWord"
+    )
+    try {
+        if (-not (Test-Path $Path)) {
+            New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -ErrorAction Stop
+    } catch {
+        # Path may be inside an unloaded hive or otherwise unreachable; suppress.
+    }
+}
+
+# Per-user hive cleanup. Loads each profile (or targets already-loaded SIDs
+# for logged-in users), runs each provided scriptblock against the hive,
+# then unloads. Safe to call multiple times; loaded hives are detected.
 function Invoke-ComprehensiveUserCleanup {
-    param([scriptblock]$RegistryOperations)
-    
+    param([scriptblock[]]$RegistryOperations)
+
     # 1. Target the Default User (Template for all FUTURE users)
     Write-Host "[*]   Updating Default User Template..." -ForegroundColor $WarnCol
-    reg load HKU\DefaultUser "C:\Users\Default\NTUSER.DAT" | Out-Null
-    Invoke-Command -ScriptBlock $RegistryOperations -ArgumentList "DefaultUser"
+    reg load HKU\DefaultUser "C:\Users\Default\NTUSER.DAT" *>&1 | Out-Null
+    foreach ($Op in $RegistryOperations) {
+        Invoke-Command -ScriptBlock $Op -ArgumentList "DefaultUser"
+    }
     [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-    reg unload HKU\DefaultUser | Out-Null
+    reg unload HKU\DefaultUser *>&1 | Out-Null
 
-    # 2. Target all EXISTING Users
-    $UserFolders = Get-ChildItem "C:\Users" -Directory | Where-Object { $_.Name -notmatch "Public|Default|All Users" }
-    foreach ($Folder in $UserFolders) {
-        $NTUserPath = "$($Folder.FullName)\NTUSER.DAT"
-        if (Test-Path $NTUserPath) {
-            $HiveName = "TempHive_$($Folder.Name)"
-            Write-Host "[*]   Cleaning Profile: $($Folder.Name)..." -ForegroundColor $WarnCol
-            
-            # Load, Execute, and Unload
-            reg load "HKU\$HiveName" $NTUserPath | Out-Null
-            Invoke-Command -ScriptBlock $RegistryOperations -ArgumentList $HiveName
-            [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-            reg unload "HKU\$HiveName" | Out-Null
+    # 2. Map loaded hives by username so we can target logged-in users by SID
+    #    instead of trying to reg-load their in-use NTUSER.DAT.
+    $LoadedHives = @{}
+    Get-ChildItem "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21-' -and $_.PSChildName -notmatch '_Classes$' } |
+        ForEach-Object {
+            $sid = $_.PSChildName
+            try {
+                $acct = ([System.Security.Principal.SecurityIdentifier]$sid).Translate([System.Security.Principal.NTAccount]).Value
+                $uname = $acct.Split('\')[-1]
+                $LoadedHives[$uname] = $sid
+            } catch { }
         }
+
+    # 3. Iterate every profile under C:\Users
+    $UserFolders = Get-ChildItem "C:\Users" -Directory |
+        Where-Object { $_.Name -notmatch "Public|Default|All Users|DefaultAppPool|WDAGUtilityAccount" }
+
+    foreach ($Folder in $UserFolders) {
+        if ($LoadedHives.ContainsKey($Folder.Name)) {
+            # Hive is already loaded (user logged in). Write through SID; no load/unload.
+            $HiveName = $LoadedHives[$Folder.Name]
+            Write-Host "[*]   Cleaning Profile (live): $($Folder.Name)..." -ForegroundColor $WarnCol
+            foreach ($Op in $RegistryOperations) {
+                Invoke-Command -ScriptBlock $Op -ArgumentList $HiveName
+            }
+        } else {
+            $NTUserPath = "$($Folder.FullName)\NTUSER.DAT"
+            if (Test-Path $NTUserPath) {
+                $HiveName = "TempHive_$($Folder.Name)"
+                Write-Host "[*]   Cleaning Profile: $($Folder.Name)..." -ForegroundColor $WarnCol
+                reg load "HKU\$HiveName" $NTUserPath *>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    foreach ($Op in $RegistryOperations) {
+                        Invoke-Command -ScriptBlock $Op -ArgumentList $HiveName
+                    }
+                    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+                    reg unload "HKU\$HiveName" *>&1 | Out-Null
+                } else {
+                    Write-Host "[!]   Skipped $($Folder.Name): hive in use or inaccessible." -ForegroundColor $DimCol
+                }
+            }
+        }
+    }
+}
+
+# Walk Uninstall registry directly; Get-Package is unreliable under SYSCTX.
+function Get-InstalledMsiPackage {
+    param([Parameter(Mandatory)][string]$NamePattern)
+    $UninstallPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    $matched = @()
+    foreach ($p in $UninstallPaths) {
+        $matched += Get-ItemProperty $p -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like $NamePattern -and $_.UninstallString }
+    }
+    return $matched
+}
+
+function Uninstall-MsiPackage {
+    param([Parameter(Mandatory)]$Package)
+    $name = $Package.DisplayName
+    if ($Package.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
+        Write-Host "[*]   Uninstalling MSI: $name" -ForegroundColor $WarnCol
+        Start-Process "msiexec.exe" -ArgumentList "/x $($Package.PSChildName) /qn /norestart" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+    } elseif ($Package.QuietUninstallString) {
+        Write-Host "[*]   Uninstalling (quiet): $name" -ForegroundColor $WarnCol
+        Start-Process "cmd.exe" -ArgumentList "/c $($Package.QuietUninstallString)" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+    } elseif ($Package.UninstallString) {
+        $us = $Package.UninstallString
+        if ($us -match 'msiexec') {
+            $us = $us -replace '(?i)/i\{', '/x{' -replace '(?i)/i ', '/x '
+            if ($us -notmatch '(?i)/qn|/quiet') { $us += ' /qn /norestart' }
+            Write-Host "[*]   Uninstalling: $name" -ForegroundColor $WarnCol
+            Start-Process "cmd.exe" -ArgumentList "/c $us" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "[!]   No silent uninstall available: $name" -ForegroundColor $DimCol
+        }
+    }
+}
+#endregion
+
+#region 1A: PER-USER OPERATION DEFINITIONS
+# ============================================================================
+# All HKCU-equivalent settings are defined here as scriptblocks so they can
+# be applied against every loaded hive (Default User + every real user)
+# instead of writing to whichever HKCU happens to be in scope at runtime
+# (which under LiveConnect is SYSTEM's hive).
+
+$UserHKCUOps = {
+    param($Hive)
+    $base = "HKU:\$Hive"
+
+    # 1.3: Privacy / Tailored Experiences / Language Opt-Out
+    Set-UserRegValue "$base\Software\Microsoft\Windows\CurrentVersion\Privacy" "TailoredExperiencesWithDiagnosticDataEnabled" 0
+    Set-UserRegValue "$base\Control Panel\International\User Profile" "HttpAcceptLanguageOptOut" 1
+
+    # 1.5: Bing Search / Search Highlights
+    Set-UserRegValue "$base\Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 1
+    Set-UserRegValue "$base\Software\Microsoft\Windows\CurrentVersion\SearchSettings" "IsDynamicSearchBoxPresent" 0
+    Set-UserRegValue "$base\Software\Microsoft\Windows\CurrentVersion\Search" "BingSearchEnabled" 0
+
+    # 1.7: ContentDeliveryManager (lock screen ads, sponsored apps, spotlight)
+    $cdm = "$base\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+    Set-UserRegValue $cdm "SubscribedContent-338387Enabled" 0
+    Set-UserRegValue $cdm "SubscribedContent-338388Enabled" 0
+    Set-UserRegValue $cdm "SubscribedContent-338389Enabled" 0
+    Set-UserRegValue $cdm "SubscribedContent-353694Enabled" 0
+    Set-UserRegValue $cdm "SubscribedContent-353696Enabled" 0
+    Set-UserRegValue $cdm "SubscribedContent-338393Enabled" 0
+    Set-UserRegValue $cdm "SubscribedContent-310093Enabled" 0
+    Set-UserRegValue $cdm "SystemPaneSuggestionsEnabled"    0
+    Set-UserRegValue $cdm "SoftLandingEnabled"              0
+    Set-UserRegValue $cdm "RotatingLockScreenEnabled"       0
+    Set-UserRegValue $cdm "RotatingLockScreenOverlayEnabled" 0
+    Set-UserRegValue $cdm "PreInstalledAppsEnabled"         0
+    Set-UserRegValue $cdm "ContentDeliveryAllowed"          0
+    Set-UserRegValue $cdm "SilentInstalledAppsEnabled"      0
+
+    # 1.7: Taskbar Widgets / Chat / Start tracking / Explorer LaunchTo
+    $adv = "$base\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    Set-UserRegValue $adv "TaskbarDa"         0   # Widgets
+    Set-UserRegValue $adv "TaskbarMn"         0   # Chat/Teams Consumer
+    Set-UserRegValue $adv "ShowCopilotButton" 0   # Copilot taskbar button
+    Set-UserRegValue $adv "Start_TrackProgs"  0   # Most used apps
+    Set-UserRegValue $adv "LaunchTo"          1   # Open Explorer to "This PC"
+
+    # 1.7: Suggested notifications
+    Set-UserRegValue "$base\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Suggested" "Enabled" 0
+}
+
+$HPUserOps = {
+    param($Hive)
+    $base = "HKU:\$Hive"
+
+    # Wipe HP-injected Start pinning + cloud cache. CDM deny flags are owned by
+    # $UserHKCUOps so we don't wipe the whole CDM key here.
+    foreach ($p in @(
+        "$base\Software\Microsoft\Windows\CurrentVersion\Explorer\StartPage2",
+        "$base\Software\Microsoft\Windows\CurrentVersion\CloudStore"
+    )) {
+        if (Test-Path $p) {
+            Write-Host "Removing $p..." -ForegroundColor $DimCol
+            Remove-Item -Path $p -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Wipe HP-injected silent-install subscriptions specifically.
+    $Subs = "$base\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\Subscriptions"
+    if (Test-Path $Subs) {
+        Remove-Item -Path $Subs -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 #endregion
@@ -192,81 +388,35 @@ $adPolPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo"
 if (!(Test-Path $adPolPath)) { New-Item -Path $adPolPath -Force | Out-Null }
 Set-ItemProperty -Path $adPolPath -Name "DisabledByGroupPolicy" -Value 1
 
-# 1.3: Disable Advertising ID & Tailored Experiences
-$privacyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy"
-Set-ItemProperty -Path $privacyPath -Name "TailoredExperiencesWithDiagnosticDataEnabled" -Value 0
-$genPath = "HKCU:\Control Panel\International\User Profile"
-Set-ItemProperty -Path $genPath -Name "HttpAcceptLanguageOptOut" -Value 1
-
-# 1.4: Disable Activity History & Clipboard Sync
+# 1.4: Disable Activity History & Clipboard Sync (HKLM policy)
 $sysPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
 if (!(Test-Path $sysPath)) { New-Item -Path $sysPath -Force | Out-Null }
 Set-ItemProperty -Path $sysPath -Name "PublishUserActivities" -Value 0
 Set-ItemProperty -Path $sysPath -Name "EnableActivityFeed"    -Value 0
 Set-ItemProperty -Path $sysPath -Name "UploadUserActivities"  -Value 0
 
-# 1.5: Disable Bing Search (Web Results) & Search Highlights
-# ------------------------------------------------------------------------------
-# 1.5.1. Turn off Search Suggestions (Bing Web Results)
-$searchPath = "HKCU:\Software\Policies\Microsoft\Windows\Explorer"
-if (!(Test-Path $searchPath)) { New-Item -Path $searchPath -Force | Out-Null }
-Set-ItemProperty -Path $searchPath -Name "DisableSearchBoxSuggestions" -Value 1 -ErrorAction SilentlyContinue
-# 1.5.2. Turn off Search Highlights (The random icons/pictures in the search bar)
-$shPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings"
-if (!(Test-Path $shPath)) { New-Item -Path $shPath -Force | Out-Null }
-# This keeps the box but removes the daily "Doodle" icons
-Set-ItemProperty -Path $shPath -Name "IsDynamicSearchBoxPresent" -Value 0 -ErrorAction SilentlyContinue
-# 1.5.3. Explicitly disable web search (Keep local search only)
-$webSearchPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"
-if (!(Test-Path $webSearchPath)) { New-Item -Path $webSearchPath -Force | Out-Null }
-Set-ItemProperty -Path $webSearchPath -Name "BingSearchEnabled" -Value 0 -ErrorAction SilentlyContinue
-
 # 1.6: Global OEM Re-injection & Content Prevention
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata" -Name "PreventDeviceMetadataFromNetwork" -Value 1
 $cdmPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent"
 if (!(Test-Path $cdmPath)) { New-Item -Path $cdmPath -Force | Out-Null }
 Set-ItemProperty -Path $cdmPath -Name "DisableWindowsConsumerFeatures" -Value 1
+# Windows Spotlight & soft landing
+Set-ItemProperty -Path $cdmPath -Name "DisableWindowsSpotlightFeatures" -Value 1
+Set-ItemProperty -Path $cdmPath -Name "DisableSoftLanding"              -Value 1
 
-# 1.7: Disable Lock Screen "Fun Facts" and Taskbar Widgets
-$cdmUserPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
-if (!(Test-Path $cdmUserPath)) { New-Item -Path $cdmUserPath -Force | Out-Null }
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338387Enabled" -Value 0 
-Set-ItemProperty -Path $cdmUserPath -Name "RotatingLockScreenOverlayEnabled" -Value 0
-# Disable Widgets (News) and Chat (Teams Consumer) icons
-$webPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-# TaskbarDa = Widgets | TaskbarMn = Chat
-Set-ItemProperty -Path $webPath -Name "TaskbarDa"      -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $webPath -Name "TaskbarMn"      -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $webPath -Name "Start_TrackProgs" -Value 0 -ErrorAction SilentlyContinue
-# Chat/Teams icon policy & News/Feeds
+# 1.7 (HKLM portion): Chat/Teams icon policy & News/Feeds
 $chatPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat"
 if (!(Test-Path $chatPolicyPath)) { New-Item -Path $chatPolicyPath -Force | Out-Null }
 Set-ItemProperty -Path $chatPolicyPath -Name "ChatIcon" -Value 3
 $feedsPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds"
 if (!(Test-Path $feedsPath)) { New-Item -Path $feedsPath -Force | Out-Null }
 Set-ItemProperty -Path $feedsPath -Name "EnableFeeds" -Value 0
-# Additional ContentDelivery Manager keys
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338387Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338388Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338389Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-353694Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-353696Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338393Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-310093Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SystemPaneSuggestionsEnabled"    -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SoftLandingEnabled"              -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "RotatingLockScreenEnabled"       -Value 0 -ErrorAction SilentlyContinue
-# Windows Spotlight & soft landing
-Set-ItemProperty -Path $cdmPath -Name "DisableWindowsSpotlightFeatures" -Value 1
-Set-ItemProperty -Path $cdmPath -Name "DisableSoftLanding"              -Value 1
-# Start menu recommendations
+# Start menu recommendations (HKLM policy)
 $startPolPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
 if (!(Test-Path $startPolPath)) { New-Item -Path $startPolPath -Force | Out-Null }
 Set-ItemProperty -Path $startPolPath -Name "HideRecentlyAddedApps"  -Value 1
 $explorerPolPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"
 if (!(Test-Path $explorerPolPath)) { New-Item -Path $explorerPolPath -Force | Out-Null }
-# Notification suggestions
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Suggested" -Name "Enabled" -Value 0 -ErrorAction SilentlyContinue
 
 # 1.8: Microsoft Edge Hardening
 $EdgePolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
@@ -284,7 +434,12 @@ Set-ItemProperty -Path $EdgePolicy -Name "EdgeFollowEnabled"               -Valu
 Set-ItemProperty -Path $EdgePolicy -Name "ShowRecommendationsEnabled"      -Value 0
 Set-ItemProperty -Path $EdgePolicy -Name "DiscoverPageContextEnabled"      -Value 0
 
-# 1.10: General Performance & Explorer Tweaks
+# 1.9b: Windows Copilot (machine-wide policy; per-user ShowCopilotButton handled in UserHKCUOps)
+$copilotPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
+if (!(Test-Path $copilotPath)) { New-Item -Path $copilotPath -Force | Out-Null }
+Set-ItemProperty -Path $copilotPath -Name "TurnOffWindowsCopilot" -Value 1
+
+# 1.10: General Performance & Power
 # Set Power Plan to High Performance ONLY when plugged in (AC)
 $highPerf = Get-CimInstance -Namespace root\cimv2\power -ClassName Win32_PowerPlan | Where-Object {$_.ElementName -eq "High performance"}
 if ($highPerf) {
@@ -298,22 +453,44 @@ powercfg /change standby-timeout-dc 60   # 60 mins on Battery
 powercfg /change monitor-timeout-ac 60   # 60 mins on AC
 powercfg /change monitor-timeout-dc 15   # 15 mins on Battery
 
-# Set Explorer to open to "This PC" & Disable Hibernation
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "LaunchTo" -Value 1 -ErrorAction SilentlyContinue
+# Disable Hibernation
 powercfg /hibernate off
 
-# 1.11: Office Language Cleanup (Purge non-English stubs)
+# 1.9: Apply all per-user HKCU settings across Default User + every real profile
+Write-Host "[*]   Applying per-user settings across all profiles..." -ForegroundColor $WarnCol
+Invoke-ComprehensiveUserCleanup -RegistryOperations $UserHKCUOps
+
+# 1.11: Office Language Cleanup (Purge non-English C2R cultures)
 Write-Host "[*]   Checking for non-English Office Language Packs..." -ForegroundColor $WarnCol
-$C2RPath = "C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe"
-if (Test-Path $C2RPath) {
-    $RegKeys = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" | Where-Object { $_.DisplayName -like "Microsoft 365*" -and $_.DisplayName -notmatch "en-us" }
-    foreach ($Key in $RegKeys) {
-        if ($Key.DisplayName -match " - ([a-z]{2}-[a-z]{2})") {
-            $LangToRemove = $Matches[1]
-            Write-Host "Removing: $LangToRemove" -ForegroundColor $DimCol
-            Start-Process $C2RPath -ArgumentList "scenario=install scenariosubtype=ARP sourcetype=None productstoremove=O365ProPlusRetail.16_$($LangToRemove)_x-none culture=$LangToRemove version.16=16.0 DisplayLevel=False" -Wait
+$C2RPath   = "C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe"
+$C2RConfig = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+if ((Test-Path $C2RPath) -and (Test-Path $C2RConfig)) {
+    $InstalledCultures = (Get-ItemProperty $C2RConfig -Name "ClientCulture" -ErrorAction SilentlyContinue).ClientCulture
+    if ($InstalledCultures) {
+        $Cultures = $InstalledCultures -split "," |
+            ForEach-Object { $_.Trim().ToLower() } |
+            Where-Object { $_ -and $_ -ne "en-us" }
+        if ($Cultures.Count -gt 0) {
+            foreach ($LangToRemove in $Cultures) {
+                Write-Host "[*]   Removing Office language: $LangToRemove" -ForegroundColor $DimCol
+                Start-Process $C2RPath -ArgumentList @(
+                    "scenario=install",
+                    "scenariosubtype=ARP",
+                    "sourcetype=None",
+                    "productstoremove=LanguagePack.$LangToRemove",
+                    "culture=$LangToRemove",
+                    "DisplayLevel=False",
+                    "forceappshutdown=True"
+                ) -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
+            }
+        } else {
+            Write-Host "[*]   Only en-us installed. Nothing to remove." -ForegroundColor $DimCol
         }
+    } else {
+        Write-Host "[*]   ClientCulture key not present. Skipping." -ForegroundColor $DimCol
     }
+} else {
+    Write-Host "[*]   Office C2R not installed. Skipping." -ForegroundColor $DimCol
 }
 #endregion
 
@@ -323,7 +500,7 @@ Complete-Step
 Write-Step "[2]   DEBLOAT: OEM Hardware Cleanup..."
 if ($Manufacturer -match "HP" -or $Manufacturer -match "Hewlett-Packard") {
     Write-Host "[2.1] HP Hardware Detected. Commencing Deep Cleanup..." -ForegroundColor DarkYellow
-    
+
     # 2.1: Services & Tasks
     $hpSvc = @("HPTouchpointAnalyticsService", "HPAppHelperCap", "HPDiagsCap", "HPSysInfoCap", "HPNetworkCap", "HPSupportAssistant")
     foreach ($s in $hpSvc) {
@@ -334,32 +511,9 @@ if ($Manufacturer -match "HP" -or $Manufacturer -match "Hewlett-Packard") {
     }
     Get-ScheduledTask -TaskPath "\HP*" -ErrorAction SilentlyContinue | Disable-ScheduledTask
 
-    # 2.2: The "Pre-emptive Strike" (Targeting New and Existing Users)
+    # 2.2: Per-user HP pinning/cache wipe
     Write-Host "[*]   Cleaning User Hives for HP..." -ForegroundColor $WarnCol
-    Invoke-ComprehensiveUserCleanup -RegistryOperations {
-        param($Hive)
-        # Remove HP-specific pinning and content delivery keys
-        $PathsToScrub = @(
-            "HKU\$Hive\Software\Microsoft\Windows\CurrentVersion\Explorer\StartPage2",
-            "HKU\$Hive\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
-            "HKU\$Hive\Software\Microsoft\Windows\CurrentVersion\CloudStore"
-        )
-
-        foreach ($p in $PathsToScrub) {
-            if (Test-Path $p) {
-                Write-Host "Removing $p..." -ForegroundColor $DimCol
-                Remove-Item -Path $p -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-
-        # Prevent HP from pushing consumer apps
-        $CDManager = "HKU\$Hive\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
-        if (Test-Path $CDManager) {
-            Set-ItemProperty -Path $CDManager -Name "PreInstalledAppsEnabled" -Value 0 -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $CDManager -Name "ContentDeliveryAllowed" -Value 0 -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $CDManager -Name "SilentInstalledAppsEnabled" -Value 0 -ErrorAction SilentlyContinue
-        }
-    }
+    Invoke-ComprehensiveUserCleanup -RegistryOperations $HPUserOps
 
     # Remove HP Edge Bookmarks from all profile directories
     Get-ChildItem "C:\Users" -Directory | ForEach-Object {
@@ -371,19 +525,17 @@ if ($Manufacturer -match "HP" -or $Manufacturer -match "Hewlett-Packard") {
     }
 
     # 2.3: HP Wolf Security & Bloatware Purge
-    Write-Host "Purging HP Wolf Security via MSI GUID..." -ForegroundColor Yellow
+    Write-Host "[*]   Purging HP Wolf Security via Uninstall registry..." -ForegroundColor $WarnCol
     $WolfNames = @("HP Wolf Security", "HP Wolf Security - Console", "HP Security Update Service")
     foreach ($Name in $WolfNames) {
-        $Pkg = Get-Package | Where-Object { $_.Name -eq $Name }
-        if ($Pkg -and $Pkg.FastPackageId) {
-            msiexec.exe /x $($Pkg.FastPackageId.Split('|')[0]) /qn /norestart
-        }
+        $Pkgs = Get-InstalledMsiPackage -NamePattern $Name
+        foreach ($p in $Pkgs) { Uninstall-MsiPackage -Package $p }
     }
 
     $hpAppx = @("*HPJumpStarts*", "*HPPrivacySettings*", "*HPSupportAssistant*", "*HPQuickDrop*", "*myHP*", "*HPEasyClean*", "*HPSmart*")
     foreach ($app in $hpAppx) {
-        Get-AppxPackage -AllUsers -Name $app | Remove-AppxPackage -ErrorAction SilentlyContinue
-        Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $app} | Remove-AppxProvisionedPackage -Online
+        Get-AppxPackage -AllUsers -Name $app -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $app} | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null
     }
 } else {
     Write-Host "[2.1] HP: Not applicable. Skipping." -ForegroundColor $DimCol
@@ -394,10 +546,10 @@ if ($Manufacturer -match "HP" -or $Manufacturer -match "Hewlett-Packard") {
 # ============================================================================
 if ($Manufacturer -match "Dell") {
     Write-Host "[2.2] Dell Hardware Detected. Commencing Full Purge..." -ForegroundColor DarkYellow
-    
+
     # 3.1: Services & Tasks
     $dellSvc = @(
-        "SupportAssistAgent", "DellHardwareSupport", "DellDigitalDeliveryService", 
+        "SupportAssistAgent", "DellHardwareSupport", "DellDigitalDeliveryService",
         "DellOptimizer", "DellClientManagementService", "DellUpdate",
         "KNDBWM", "Killer Network Service", "Killer Selection Service"
     )
@@ -415,30 +567,23 @@ if ($Manufacturer -match "Dell") {
     }
 
     # 3.2: Win32 Bloatware Purge
-    Write-Host "Purging Dell Win32 Bloatware via MSI..." -ForegroundColor Yellow
+    Write-Host "[*]   Purging Dell Win32 Bloatware via Uninstall registry..." -ForegroundColor $WarnCol
     $DellWin32 = @("Dell SupportAssist*", "Dell Optimizer*", "Dell Digital Delivery*", "Dell Update*", "Dell Customer Connect*", "Dell Help and Support*")
     foreach ($name in $DellWin32) {
-        $Pkgs = Get-Package -Name $name -ErrorAction SilentlyContinue
-        if ($Pkgs) {
-            foreach ($p in $Pkgs) {
-                if ($p.FastPackageId) {
-                    Write-Host "Uninstalling $($p.Name)..."
-                    msiexec.exe /x $($p.FastPackageId.Split('|')[0]) /qn /norestart
-                }
-            }
-        }
+        $Pkgs = Get-InstalledMsiPackage -NamePattern $name
+        foreach ($p in $Pkgs) { Uninstall-MsiPackage -Package $p }
     }
 
     # 3.3: Appx Cleanup
     $dellAppx = @(
-        "*DellInc.DellDigitalDelivery*", "*DellInc.DellSupportAssist*", 
-        "*DellInc.DellOptimizer*", "*DellInc.DellPowerManager*", 
+        "*DellInc.DellDigitalDelivery*", "*DellInc.DellSupportAssist*",
+        "*DellInc.DellOptimizer*", "*DellInc.DellPowerManager*",
         "*DellInc.MyDell*", "*DellInc.DellCommandUpdate*",
         "*DellInc.DellRegistration*", "*WavesAudio.WavesMaxxAudio*"
     )
     foreach ($app in $dellAppx) {
-        Get-AppxPackage -AllUsers -Name $app | Remove-AppxPackage -ErrorAction SilentlyContinue
-        Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $app} | Remove-AppxProvisionedPackage -Online
+        Get-AppxPackage -AllUsers -Name $app -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $app} | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null
     }
 
     # 3.4: Kill Killer Networking
@@ -455,10 +600,10 @@ if ($Manufacturer -match "Dell") {
 # ============================================================================
 if ($Manufacturer -match "ASUS" -or $Manufacturer -match "Acer") {
     Write-Host "[2.3] ASUS/Acer Hardware Detected. Commencing Binary Purge..." -ForegroundColor DarkYellow
-    
+
     # 4.1: Services & Tasks
     $vendorSvc = @(
-        "AsusAppService", "ASUSSystemAnalysis", "ASUSSystemDiagnosis", 
+        "AsusAppService", "ASUSSystemAnalysis", "ASUSSystemDiagnosis",
         "ArmouryCrateService", "AsusROGLSLService", "ASUSLinkRemote",
         "AcerAgentService", "AcerConfigurationManager", "AcerSvc",
         "AOP_UtilityService", "LiveUpdateSvc"
@@ -477,22 +622,15 @@ if ($Manufacturer -match "ASUS" -or $Manufacturer -match "Acer") {
     }
 
     # 4.2: Win32 Bloatware Purge
-    Write-Host "Purging ASUS/Acer Win32 Bloatware..." -ForegroundColor Yellow
+    Write-Host "[*]   Purging ASUS/Acer Win32 via Uninstall registry..." -ForegroundColor $WarnCol
     $VendorWin32 = @(
-        "Armoury Crate*", "MyASUS*", "ASUS System Control Interface*", 
+        "Armoury Crate*", "MyASUS*", "ASUS System Control Interface*",
         "Acer Care Center*", "Acer Configuration Manager*", "Acer Portal*",
         "Quick Access*", "AbFiles*", "AOP Framework*"
     )
     foreach ($name in $VendorWin32) {
-        $Pkgs = Get-Package -Name $name -ErrorAction SilentlyContinue
-        if ($Pkgs) {
-            foreach ($p in $Pkgs) {
-                if ($p.FastPackageId) {
-                    Write-Host "Uninstalling $($p.Name)..."
-                    msiexec.exe /x $($p.FastPackageId.Split('|')[0]) /qn /norestart
-                }
-            }
-        }
+        $Pkgs = Get-InstalledMsiPackage -NamePattern $name
+        foreach ($p in $Pkgs) { Uninstall-MsiPackage -Package $p }
     }
 
     # 4.3: Appx Cleanup
@@ -502,8 +640,8 @@ if ($Manufacturer -match "ASUS" -or $Manufacturer -match "Acer") {
         "*AcerUserExperience*", "*AcerProductRegistration*"
     )
     foreach ($app in $vendorAppx) {
-        Get-AppxPackage -AllUsers -Name $app | Remove-AppxPackage -ErrorAction SilentlyContinue
-        Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $app} | Remove-AppxProvisionedPackage -Online
+        Get-AppxPackage -AllUsers -Name $app -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $app} | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null
     }
 
     # 4.4: Block BIOS Injection (ASUS Armoury Crate)
@@ -519,6 +657,49 @@ if ($Manufacturer -match "ASUS" -or $Manufacturer -match "Acer") {
 }
 #endregion
 
+#region 4B: LENOVO
+# ============================================================================
+if ($Manufacturer -match "LENOVO") {
+    Write-Host "[2.4] Lenovo Hardware Detected. Commencing Full Purge..." -ForegroundColor DarkYellow
+
+    # Services
+    $lenovoSvc = @(
+        "ImControllerService", "LenovoVantageService", "LenovoUtilityService",
+        "LenovoFnAndFunctionKeys", "LenovoSystemUpdateAddin", "UDClientService"
+    )
+    foreach ($s in $lenovoSvc) {
+        if (Get-Service -Name $s -ErrorAction SilentlyContinue) {
+            Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $s -StartupType Disabled
+        }
+    }
+    Get-ScheduledTask -TaskPath "\Lenovo*" -ErrorAction SilentlyContinue | Disable-ScheduledTask
+
+    # Win32 Bloatware
+    Write-Host "[*]   Purging Lenovo Win32 Bloatware via Uninstall registry..." -ForegroundColor $WarnCol
+    $LenovoWin32 = @(
+        "Lenovo Vantage*", "Lenovo Service Bridge*", "Lenovo System Update*",
+        "Lenovo Utility*", "Lenovo Hotkeys*", "Lenovo Now*"
+    )
+    foreach ($name in $LenovoWin32) {
+        $Pkgs = Get-InstalledMsiPackage -NamePattern $name
+        foreach ($p in $Pkgs) { Uninstall-MsiPackage -Package $p }
+    }
+
+    # Appx Cleanup
+    $lenovoAppx = @(
+        "*E046963F.LenovoCompanion*", "*LenovoVantage*",
+        "*LenovoCompanion*", "*LenovoUtility*", "*LenovoSettings*"
+    )
+    foreach ($app in $lenovoAppx) {
+        Get-AppxPackage -AllUsers -Name $app -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $app} | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null
+    }
+} else {
+    Write-Host "[2.4] Lenovo: Not applicable. Skipping." -ForegroundColor $DimCol
+}
+#endregion
+
 #region 5: THIRD-PARTY CRAPWARE
 # ============================================================================
 Complete-Step
@@ -530,7 +711,7 @@ $crapware = @(
     # Social & Streaming
     "*TikTok*", "*Instagram*", "*Facebook*", "*LinkedIn*", "*Netflix*", "*PrimeVideo*", "*Disney*",
     # Games & Consumer Apps
-    "*CandyCrush*", "*Roblox*", "*Spotify*", "*SolitaireCollection*", "*WildTangent*", "*ByteDance*", 
+    "*CandyCrush*", "*Roblox*", "*Spotify*", "*SolitaireCollection*", "*WildTangent*", "*ByteDance*",
     # Partner Stubs
     "*Amazon*", "*eBay*", "*Pinterest*", "*Todoist*", "*Clipchamp*", "*MicrosoftNews*"
 )
@@ -538,7 +719,7 @@ $crapware = @(
 foreach ($item in $crapware) {
     # 1. Remove from all existing user profiles
     Get-AppxPackage -AllUsers -Name $item -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue 2>$null
-    
+
     # 2. Target the Provisioned (System-wide) package
     $ProvisionedApps = Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $item}
     foreach ($App in $ProvisionedApps) {

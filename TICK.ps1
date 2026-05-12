@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Trigger Immediate Clock Kickstart (TICK) v1.1
-    Developed by SteveTheKiller | Updated: 2026-03-12
+    Trigger Immediate Clock Kickstart (TICK) v1.2
+    Developed by Steve the Killer | Updated: 2026-05-12
 .DESCRIPTION
     Resets and resyncs the Windows Time service against a chosen NTP peer,
     then reports before/after timestamps with a plain-English summary of
@@ -81,7 +81,7 @@ function Write-Banner {
     # Header Line 1
     Write-Host "█ " -ForegroundColor $BorderCol -NoNewline
     Write-Host "╔╦╗ ╦ ╔═╗ ╦╔═  " -ForegroundColor $ArtCol -NoNewline
-    Write-Host ("-" * 65) -ForegroundColor $BorderCol
+    Write-Host ("-" * 68) -ForegroundColor $BorderCol
     # Header Line 2
     Write-Host "█  " -ForegroundColor $BorderCol -NoNewline
     Write-Host "║  ║ ║   ╠╩╗  " -ForegroundColor $ArtCol -NoNewline
@@ -89,7 +89,7 @@ function Write-Banner {
     # Header Line 3
     Write-Host "█  " -ForegroundColor $BorderCol -NoNewline
     Write-Host "╩  ╩ ╚═╝ ╩ ╩  " -ForegroundColor $ArtCol -NoNewline
-    Write-Host ("-" * 65) -ForegroundColor $BorderCol
+    Write-Host ("-" * 68) -ForegroundColor $BorderCol
     }
 function Write-Step {
     param([string]$StepNum, [string]$Message)
@@ -270,17 +270,17 @@ if ($UseDomainSync) {
     Write-Host " This computer is now synced to the Domain Controller." -ForegroundColor DarkGreen
 }
 # Footer Line 1 (The Top Bar of the Footer)
-Write-Host ("-" * 65) -ForegroundColor $BorderCol -NoNewline
+Write-Host ("-" * 69) -ForegroundColor $BorderCol -NoNewline
 Write-Host " ╔╦╗ ╦ ╔═╗ ╦╔═ " -ForegroundColor $ArtCol -NoNewline
 Write-Host "█" -ForegroundColor $BorderCol
 # Footer Line 2 (The Text Line)
 $FooterText = "  C H R O N O M E T R I C   S E Q U E N C E   C O M P L E T E"
-$Padding = " " * (65 - $FooterText.Length)
+$Padding = " " * (69 - $FooterText.Length)
 Write-Host "$FooterText$Padding" -ForegroundColor $AccentCol -NoNewline
 Write-Host "  ║  ║ ║   ╠╩╗ " -ForegroundColor $ArtCol -NoNewline
 Write-Host "█" -ForegroundColor $BorderCol
 # Footer Line 3 (The Bottom Bar of the Footer)
-Write-Host ("-" * 65) -ForegroundColor $BorderCol -NoNewline
+Write-Host ("-" * 69) -ForegroundColor $BorderCol -NoNewline
 Write-Host "  ╩  ╩ ╚═╝ ╩ ╩ " -ForegroundColor $ArtCol -NoNewline
 Write-Host "█" -ForegroundColor $BorderCol
 #endregion
