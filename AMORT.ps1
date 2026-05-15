@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.5
-    Developed by Steve the Killer | Updated: 2026-04-22
+    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.6
+    Developed by Steve the Killer | Updated: 2026-05-15
 .DESCRIPTION
     Automated Windows 10/11 tune-up for MSP field and remote deployment.
     Hardens AI, privacy, and browser settings; strips OEM and consumer
@@ -9,7 +9,7 @@
     database; runs DISM and SFC repair; and performs SSD TRIM while
     reporting disk space recovered at each stage.
 #>
-$_fver   = "| v15.5"
+$_fver   = "| v15.6"
 #region Pre-Flight Checks
 # ============================================================================
 # Force UTF-8 output so box-drawing characters render correctly
@@ -648,36 +648,24 @@ if (Test-Path $InstallerPath) {
 
 # --- Windows.old cleanup ---
 if (Test-Path "C:\Windows.old") {
-    & DISM.exe /Online /Remove-OSUninstall /NoRestart | Out-Null
-    $CleanupKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches\Previous Installations"
-    if (Test-Path $CleanupKey) {
-        Set-ItemProperty -Path $CleanupKey -Name "StateFlags1337" -Value 2 -Type DWord -ErrorAction SilentlyContinue
-        $CleanupJob = Start-Process "cleanmgr.exe" -ArgumentList "/sagerun:1337" -WindowStyle Hidden -PassThru
-        $CleanupJob | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
-        if (-not $CleanupJob.HasExited) {
-            $CleanupJob | Stop-Process -Force -ErrorAction SilentlyContinue
-            Get-Process -Name "cleanmgr" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        }
+    # Strip the previous-installation protection so Windows.old is deletable.
+    & DISM.exe /Online /Remove-OSUninstall /NoRestart *>&1 | Out-Null
+
+    # cleanmgr is skipped entirely: it ignores -WindowStyle Hidden (spawns an uncontrolled
+    # child process), shows its UI in interactive sessions, and silently fails under
+    # SYSTEM/LiveConnect where there is no desktop. rd /s /q is an order of magnitude
+    # faster than Remove-Item -Recurse for deep trees (minutes vs hours).
+    $rdProc = Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+    if ($rdProc) {
+        $rdProc | Wait-Process -Timeout 1800 -ErrorAction SilentlyContinue
+        if (-not $rdProc.HasExited) { $rdProc | Stop-Process -Force -ErrorAction SilentlyContinue }
     }
+
+    # Fallback: if rd hit locked files, take ownership and retry once
     if (Test-Path "C:\Windows.old") {
-        Write-StepUpdate "`n      [!] Cleanmgr timed out. Forcing Windows.old removal..."
         & takeown /F "C:\Windows.old" /R /A /D Y 2>$null | Out-Null
         & icacls "C:\Windows.old" /grant Administrators:F /T /C /Q 2>$null | Out-Null
-        $WinOldItems = @(Get-ChildItem "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue)
-        $WinOldTotal = $WinOldItems.Count
-        $WinOldDone  = 0
-        foreach ($WinOldItem in ($WinOldItems | Sort-Object FullName -Descending)) {
-            if (Test-Path $WinOldItem.FullName) {
-                Remove-Item $WinOldItem.FullName -Force -Recurse -ErrorAction SilentlyContinue
-            }
-            $WinOldDone++
-            if ($WinOldDone % 200 -eq 0 -or $WinOldDone -eq $WinOldTotal) {
-                $Pct = if ($WinOldTotal -gt 0) { [int]($WinOldDone / $WinOldTotal * 100) } else { 100 }
-                Write-Progress -Activity "Removing Windows.old" -Status "$WinOldDone / $WinOldTotal items removed" -PercentComplete $Pct
-            }
-        }
-        Write-Progress -Activity "Removing Windows.old" -Completed
-        Remove-Item "C:\Windows.old" -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue 2>$null
+        Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
     }
 }
 
