@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.9
-    Developed by Steve the Killer | Updated: 2026-06-06
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.8
+    Developed by Steve the Killer | Updated: 2026-04-07
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
@@ -25,7 +25,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v1.9"
+$_ver    = "| v1.8"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -284,8 +284,7 @@ $ThirdParty = @(
     @{ Name = "RingCentral";     ChocoID = "ringcentral";      Path = "C:\Program Files\RingCentral\RingCentral.exe";                                      Process = "RingCentral" },
     @{ Name = "Notepad++";       ChocoID = "notepadplusplus";  Path = "C:\Program Files\Notepad++\notepad++.exe";                                          Process = "notepad++" },
     @{ Name = "VLC";             ChocoID = "vlc";              Path = "C:\Program Files\VideoLAN\VLC\vlc.exe";                                             Process = "vlc" },
-    @{ Name = "7-Zip";           ChocoID = "7zip";             Path = "C:\Program Files\7-Zip\7z.exe";                                                     Process = "7zFM" },
-    @{ Name = "KillerPDF";      ChocoID = "killerpdf";        Path = @("C:\ProgramData\chocolatey\lib\killerpdf\tools\KillerPDF.exe","$env:LOCALAPPDATA\Programs\KillerPDF\KillerPDF.exe"); Process = "KillerPDF" }
+    @{ Name = "7-Zip";           ChocoID = "7zip";             Path = "C:\Program Files\7-Zip\7z.exe";                                                     Process = "7zFM" }
 )
 $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
 if (-not $ChocoAvailable) {
@@ -326,18 +325,6 @@ if (-not $ChocoAvailable) {
 }
 if ($ChocoAvailable -and -not $No3rdParty) {
     Write-StepUpdate "[5/5] Updating Installed Third-Party Software..."
-    # Update Chocolatey itself first
-    Write-Host "      > " -NoNewline -ForegroundColor $DimCol
-    Write-Host "Chocolatey: " -NoNewline -ForegroundColor $DimCol
-    $chocoSelfOut = choco upgrade chocolatey -y --no-progress 2>&1
-    $chocoSelfMatch = $chocoSelfOut | Select-String -Pattern 'upgraded (\d+)/'
-    if ($chocoSelfMatch -and [int]$chocoSelfMatch.Matches[0].Groups[1].Value -gt 0) {
-        Write-SubResult "[UPDATED]" Green
-        # Refresh PATH in case choco updated itself to a new path
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-    } else {
-        Write-SubResult "[ALREADY UPDATED]" Cyan
-    }
     foreach ($App in $ThirdParty) {
         # Resolve first valid path - supports arrays and wildcard paths (e.g. WindowsApps\MSTeams_*)
         $_appPath = $null
