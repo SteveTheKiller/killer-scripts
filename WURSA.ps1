@@ -184,8 +184,11 @@ Write-StepUpdate "[3/5] Scanning for Drivers & OS Patches..."
 $UpdateSession = New-Object -ComObject Microsoft.Update.Session
 $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
 try {
-    $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and (Type='Software' or Type='Driver') and IsHidden=0")
-    $UpdateList = $SearchResult.Updates
+    $s1 = $UpdateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0").Updates
+    $s2 = $UpdateSearcher.Search("IsInstalled=0 and Type='Driver' and IsHidden=0").Updates
+    $UpdateList = New-Object -ComObject Microsoft.Update.UpdateColl
+    foreach ($u in $s1) { $UpdateList.Add($u) | Out-Null }
+    foreach ($u in $s2) { $UpdateList.Add($u) | Out-Null }
 } catch {
     Write-StepUpdate -Success -CustomInfo "(Scan Error)"
     Write-Host "      [!] WU search failed: $($_.Exception.Message)" -ForegroundColor Red
