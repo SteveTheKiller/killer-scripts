@@ -182,8 +182,14 @@ Write-StepUpdate "[3/5] Scanning for Drivers & OS Patches..."
 # Direct API search to bypass the 'remoteIpNoProxy' crash
 $UpdateSession = New-Object -ComObject Microsoft.Update.Session
 $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-$SearchResult = $UpdateSearcher.Search("IsInstalled=0 and (Type='Software' or Type='Driver') and IsHidden=0")
-$UpdateList = $SearchResult.Updates
+try {
+    $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and (Type='Software' or Type='Driver') and IsHidden=0")
+    $UpdateList = $SearchResult.Updates
+} catch {
+    Write-StepUpdate -Success -CustomInfo "(Scan Error)"
+    Write-Host "      [!] WU search failed: $($_.Exception.Message)" -ForegroundColor Red
+    $UpdateList = $null
+}
 if (-not $UpdateList -or $UpdateList.Count -eq 0) {
     Write-StepUpdate -Success -CustomInfo "(System Up to Date)"
     Write-Host "[4/5] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
