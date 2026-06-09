@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.8
-    Developed by Steve the Killer | Updated: 2026-04-07
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.9
+    Developed by Steve the Killer | Updated: 2026-06-09
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
@@ -25,7 +25,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v1.8"
+$_ver    = "| v1.9"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -182,7 +182,7 @@ Write-StepUpdate "[3/5] Scanning for Drivers & OS Patches..."
 # Direct API search to bypass the 'remoteIpNoProxy' crash
 $UpdateSession = New-Object -ComObject Microsoft.Update.Session
 $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-$SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+$SearchResult = $UpdateSearcher.Search("IsInstalled=0 and (Type='Software' or Type='Driver') and IsHidden=0")
 $UpdateList = $SearchResult.Updates
 if (-not $UpdateList -or $UpdateList.Count -eq 0) {
     Write-StepUpdate -Success -CustomInfo "(System Up to Date)"
@@ -285,6 +285,8 @@ $ThirdParty = @(
     @{ Name = "Notepad++";       ChocoID = "notepadplusplus";  Path = "C:\Program Files\Notepad++\notepad++.exe";                                          Process = "notepad++" },
     @{ Name = "VLC";             ChocoID = "vlc";              Path = "C:\Program Files\VideoLAN\VLC\vlc.exe";                                             Process = "vlc" },
     @{ Name = "7-Zip";           ChocoID = "7zip";             Path = "C:\Program Files\7-Zip\7z.exe";                                                     Process = "7zFM" }
+#    @{ Name = "KillerPDF";       ChocoID = "killerpdf";        Path = @("C:\Program Files\KillerPDF\KillerPDF.exe","$env:LOCALAPPDATA\Programs\KillerPDF\KillerPDF.exe"); Process = "KillerPDF",
+#    @{ Name = "KillerScan";       ChocoID = "killerscan";        Path = @("C:\Program Files\KillerScan\KillerScan.exe","$env:LOCALAPPDATA\Programs\KillerScan\KillerScan.exe"); Process = "KillerPDF" }
 )
 $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
 if (-not $ChocoAvailable) {
@@ -325,6 +327,17 @@ if (-not $ChocoAvailable) {
 }
 if ($ChocoAvailable -and -not $No3rdParty) {
     Write-StepUpdate "[5/5] Updating Installed Third-Party Software..."
+    # Update Chocolatey itself first
+    Write-Host "      > " -NoNewline -ForegroundColor $DimCol
+    Write-Host "Chocolatey: " -NoNewline -ForegroundColor $DimCol
+    $chocoSelfOut = choco upgrade chocolatey -y --no-progress 2>&1
+    $chocoSelfMatch = $chocoSelfOut | Select-String -Pattern 'upgraded (\d+)/'
+    if ($chocoSelfMatch -and [int]$chocoSelfMatch.Matches[0].Groups[1].Value -gt 0) {
+        Write-SubResult "[UPDATED]" Green
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    } else {
+        Write-SubResult "[ALREADY UPDATED]" Cyan
+    }
     foreach ($App in $ThirdParty) {
         # Resolve first valid path - supports arrays and wildcard paths (e.g. WindowsApps\MSTeams_*)
         $_appPath = $null
@@ -553,7 +566,7 @@ if ($NoUpgrade) {
                 $childProcs = @('Windows10UpgraderApp','WindowsUpdateAssistant','SetupHost','SetupPrep')
                 if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
                     # Launcher exited - expected if it hands off to a child process
-                    if ($proc.ExitCode -ne 0) {
+                    if ($null -ne $proc.ExitCode -and $proc.ExitCode -ne 0) {
                         Write-Host "${e}[2K`r      [!] Installation Assistant failed (code: $($proc.ExitCode))" -ForegroundColor Red
                         return
                     }
