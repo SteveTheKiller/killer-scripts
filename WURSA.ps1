@@ -1,16 +1,18 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v1.9
-    Developed by Steve the Killer | Updated: 2026-06-09
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.0
+    Developed by Steve the Killer | Updated: 2026-06-11
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
-    disrupting the active user, and self-installs Chocolatey if not present. Adds a
-    reliable, unattended Windows feature upgrade using WindowsUpdateBox with
-    ESC-to-cancel and a live heartbeat indicator across all contexts.
+    disrupting the active user, and self-installs Chocolatey if not present. Performs
+    unattended Windows feature upgrades via ISO-based in-place upgrade (setup.exe),
+    with BitLocker suspension, URL pre-flight, partial download detection, and
+    ESC-to-cancel countdown. Reboot is always deferred to the caller.
 .NOTES
     Parameters:
       -InplaceUpgrade  Auto-confirms the feature upgrade prompt. Safe for unattended/RMM use.
+                       Uses ISO-based setup.exe upgrade with BitLocker suspension. No reboot.
       -No3rdParty      Skips the Chocolatey third-party app update pass entirely.
       -NoUpgrade       Skips the feature version check and upgrade prompt entirely.
 
@@ -18,6 +20,9 @@
       0    - Completed successfully, no reboot required
       3010 - Completed successfully, reboot required
       1    - Script terminated due to an unhandled error
+      10   - IPU hard driver/compat block (0xC1900101)
+      11   - IPU app/driver compat block (0xC1900208)
+      12   - IPU machine does not meet minimum requirements (0xC1900200)
 #>
 param(
     [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt
@@ -25,7 +30,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v1.9"
+$_ver    = "| v2.0"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -396,6 +401,14 @@ if ($ChocoAvailable -and -not $No3rdParty) {
 
 #region 5 - Post-Update Version Check & Optional In-Place Upgrade
 # ============================================================================
+# ISO config - update URL if Microsoft rotates the link
+$IPU_IsoUrl    = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"
+$IPU_IsoSizeGB = 7.2
+$IPU_WorkDir   = "C:\Windows\Temp\25H2IPU"
+$IPU_IsoPath   = Join-Path $IPU_WorkDir "Win11_25H2_x64.iso"
+$IPU_LogDir    = Join-Path $IPU_WorkDir "SetupLogs"
+$IPU_SetupLog  = Join-Path $IPU_WorkDir "setup_exit.log"
+
 Write-HLine -Style dashed
 Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
 $InstalledVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
@@ -411,101 +424,11 @@ if ($NoUpgrade) {
         $Battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
         if ($Battery -and $Battery.BatteryStatus -ne 2) { $OnBattery = $true }
     } catch {}
-    # Heartbeat indicator - defined here so it's available for both attach and new-launch paths
-    function Show-UpgradeHeartbeat {
-        param([string[]]$PathsToWatch, [int]$LauncherPid)
-        $e = [char]27
-        $upgradeProcs   = @('Windows11InstallationAssistant','Windows10UpgraderApp','WindowsUpdateAssistant','SetupHost','SetupPrep')
-        $friendlyNames  = @{ 'Windows11InstallationAssistant' = 'Installation Assistant'; 'Windows10UpgraderApp' = 'Installation Assistant'; 'SetupHost' = 'Windows Setup'; 'SetupPrep' = 'Windows Setup (Prep)' }
-        Write-Host -NoNewline "${e}[2K`r      > Upgrade in progress... (Press ESC to detach)" -ForegroundColor Yellow
-        $spinner = @('|','/','-','\')
-        $tick = 0
-        function Get-UpgradeRunning {
-            if ($LauncherPid -and (Get-Process -Id $LauncherPid -ErrorAction SilentlyContinue)) { return $true }
-            foreach ($n in $upgradeProcs) {
-                if (Get-Process -Name $n -ErrorAction SilentlyContinue) { return $true }
-            }
-            return $false
-        }
-        $shared = [hashtable]::Synchronized(@{ Escape = $false; SizeMB = 0.0; Label = 'Installation Assistant' })
 
-        # ESC watcher runspace
-        $rsEsc = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-        $rsEsc.Open()
-        $psEsc = [System.Management.Automation.PowerShell]::Create()
-        $psEsc.Runspace = $rsEsc
-        $psEsc.AddScript({
-            param($shared)
-            try {
-                while (-not $shared.Escape) {
-                    if ([Console]::KeyAvailable) {
-                        $k = [Console]::ReadKey($true)
-                        if ($k.Key -eq [System.ConsoleKey]::Escape) { $shared.Escape = $true; return }
-                    }
-                    [System.Threading.Thread]::Sleep(50)
-                }
-            } catch {}
-        }).AddArgument($shared) | Out-Null
-        $psEsc.BeginInvoke() | Out-Null
-
-        # Folder size + label watcher runspace (runs independently so it never blocks the spinner)
-        $rsSize = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-        $rsSize.Open()
-        $psSize = [System.Management.Automation.PowerShell]::Create()
-        $psSize.Runspace = $rsSize
-        $psSize.AddScript({
-            param($shared, $PathsToWatch, $upgradeProcs, $friendlyNames)
-            while (-not $shared.Escape) {
-                $total = 0
-                foreach ($p in $PathsToWatch) {
-                    if (Test-Path $p) {
-                        $s = (Get-ChildItem $p -Recurse -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-                        if ($s) { $total += $s }
-                    }
-                }
-                $shared.SizeMB = [math]::Round($total / 1MB, 1)
-                $active = $upgradeProcs | Where-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
-                if ($active) { $shared.Label = if ($friendlyNames[$active]) { $friendlyNames[$active] } else { $active } }
-                Start-Sleep -Seconds 4
-            }
-        }).AddArgument($shared).AddArgument($PathsToWatch).AddArgument($upgradeProcs).AddArgument($friendlyNames) | Out-Null
-        $psSize.BeginInvoke() | Out-Null
-
-        # Lightweight spinner loop - just reads shared state, never blocks
-        while (Get-UpgradeRunning -and -not $shared.Escape) {
-            $sizeStr = if ($shared.SizeMB -gt 0) { "  |  $($shared.SizeMB) MB staged" } else { "" }
-            Write-Host -NoNewline ("${e}[2K`r        $($spinner[$tick % $spinner.Length])  $($shared.Label)$sizeStr") -ForegroundColor DarkGray
-            $tick++
-            Start-Sleep -Milliseconds 200
-        }
-        $didEscape = $shared.Escape
-        $shared.Escape = $true
-        $psEsc.Stop(); $psEsc.Dispose(); $rsEsc.Close(); $rsEsc.Dispose()
-        $psSize.Stop(); $psSize.Dispose(); $rsSize.Close(); $rsSize.Dispose()
-        if ($didEscape) {
-            Write-Host "${e}[2K`r      > Detached. Upgrade continues in background." -ForegroundColor Yellow
-            return
-        }
-        $rebootPending = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue
-        if ($rebootPending) {
-            Write-Host "${e}[2K`r      > Staging complete — reboot required to apply upgrade." -ForegroundColor Yellow
-        } else {
-            Write-Host "${e}[2K`r      > Upgrade process has exited." -ForegroundColor Green
-        }
-    }
-    # Check if an upgrade process is already running from a previous session
-    $upgradeProcsCheck = @('Windows11InstallationAssistant','Windows10UpgraderApp','WindowsUpdateAssistant','SetupHost','SetupPrep')
-    $alreadyRunning = $upgradeProcsCheck | Where-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
-    if ($alreadyRunning) {
-        $alreadyPid = (Get-Process -Name $alreadyRunning -ErrorAction SilentlyContinue | Select-Object -First 1).Id
-        Write-Host "      [i] Upgrade already in progress ($alreadyRunning, PID $alreadyPid) - attaching..." -ForegroundColor $DimCol
-        Show-UpgradeHeartbeat -PathsToWatch @("C:\`$WINDOWS.~BT", "C:\ESD") -LauncherPid $alreadyPid
-        $proceed = $false
-    } elseif ($OnBattery) {
+    if ($OnBattery) {
         Write-Host "      [!] Upgrade skipped: device is running on battery power." -ForegroundColor Yellow
-        $proceed = $false
     } elseif ($InplaceUpgrade) {
-        Write-Host "      [-InplaceUpgrade] Auto-proceeding with upgrade." -ForegroundColor $DimCol
+        Write-Host "      [-InplaceUpgrade] Auto-proceeding with ISO-based upgrade." -ForegroundColor $DimCol
         $proceed = $true
     } else {
         $proceed = $false
@@ -524,11 +447,11 @@ if ($NoUpgrade) {
             Write-Host "      [i] Non-interactive - defaulting to NO." -ForegroundColor $DimCol
         }
     }
-    if ($proceed) {
-        # Preparing Windows Upgrade
-        Write-Host "[>] Preparing Windows Upgrade..." -ForegroundColor $LineCol
+
+    if (-not $OnBattery -and $proceed) {
+        Write-Host "[>] Preparing ISO-Based In-Place Upgrade..." -ForegroundColor $LineCol
         while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
-        Write-Host "     > Upgrade will begin in 10 seconds. " -NoNewline -ForegroundColor Yellow
+        Write-Host "      > Upgrade will begin in 10 seconds. " -NoNewline -ForegroundColor Yellow
         Write-Host "(Press ESC to cancel...)" -ForegroundColor DarkGray
         $cancel = $false
         [Console]::TreatControlCAsInput = $true
@@ -536,77 +459,147 @@ if ($NoUpgrade) {
             for ($t = 0; $t -lt 10; $t++) {
                 Start-Sleep -Milliseconds 100
                 if ([Console]::KeyAvailable) {
-                    $key = [Console]::ReadKey($true)
-                    if ($key.Key -eq "Escape") {
-                        $cancel = $true
-                        break
-                    }
+                    $k = [Console]::ReadKey($true)
+                    if ($k.Key -eq "Escape") { $cancel = $true; break }
                 }
             }
             if ($cancel) { break }
-            Write-Host -NoNewline "`r     $i... " -ForegroundColor DarkGray
+            Write-Host -NoNewline "`r      $i... " -ForegroundColor DarkGray
         }
         $esc = [char]27
         Write-Host -NoNewline "${esc}[2K`r${esc}[1A${esc}[2K`r"
         [Console]::TreatControlCAsInput = $false
         while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
-        if ($cancel) {
-            Write-Host "     [!] Upgrade canceled by user." -ForegroundColor Yellow
-        } else {
-        function Invoke-FeatureUpdate {
-            $e             = [char]27
-            $AssistantUrl  = "https://go.microsoft.com/fwlink/?linkid=2171764"
-            $AssistantPath = "$env:TEMP\Windows11InstallationAssistant.exe"
-            try {
-                Write-Host -NoNewline "${e}[2K`r      > Downloading Windows 11 Installation Assistant..." -ForegroundColor Gray
-                Invoke-WebRequest -Uri $AssistantUrl -OutFile $AssistantPath -UseBasicParsing
 
-                if (-not (Test-Path $AssistantPath)) {
-                    Write-Host "${e}[2K`r      [!] Download failed - file not found at $AssistantPath" -ForegroundColor Red
-                    return
+        if ($cancel) {
+            Write-Host "      [!] Upgrade canceled by user." -ForegroundColor Yellow
+        } else {
+            # BitLocker suspension - 4 reboots covers SafeOS + first boot + second boot + buffer
+            $BLStatus = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+            if ($BLStatus -and $BLStatus.ProtectionStatus -eq 'On') {
+                Write-Host "      > Suspending BitLocker for 4 reboots..." -ForegroundColor $DimCol
+                try {
+                    Suspend-BitLocker -MountPoint "C:" -RebootCount 4
+                    Write-Host "      > BitLocker suspended." -ForegroundColor $DimCol
+                } catch {
+                    Write-Host "      [!] BitLocker suspension failed: $($_.Exception.Message)" -ForegroundColor $WarnCol
                 }
-                $sizeMB = [math]::Round((Get-Item $AssistantPath).Length / 1MB, 1)
-                if ($sizeMB -lt 1) {
-                    Write-Host "${e}[2K`r      [!] Download suspect - only $sizeMB MB at $AssistantPath" -ForegroundColor Red
-                    return
-                }
-                Write-Host -NoNewline "${e}[2K`r      > Launching Installation Assistant ($sizeMB MB)..." -ForegroundColor Gray
-                $proc = Start-Process -FilePath $AssistantPath -ArgumentList "/QuietInstall /SkipEULA /Auto Upgrade" -PassThru
-                Start-Sleep -Milliseconds 3000
-                $childProcs = @('Windows10UpgraderApp','WindowsUpdateAssistant','SetupHost','SetupPrep')
-                if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
-                    # Launcher exited - expected if it hands off to a child process
-                    if ($null -ne $proc.ExitCode -and $proc.ExitCode -ne 0) {
-                        Write-Host "${e}[2K`r      [!] Installation Assistant failed (code: $($proc.ExitCode))" -ForegroundColor Red
-                        return
-                    }
-                    # Wait up to 20 seconds for the child upgrade process to appear
-                    Write-Host -NoNewline "${e}[2K`r      > Waiting for upgrade process..." -ForegroundColor Gray
-                    $found = $null
-                    for ($w = 0; $w -lt 20 -and -not $found; $w++) {
-                        $found = $childProcs | Where-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
-                        if (-not $found) { Start-Sleep -Seconds 1 }
-                    }
-                    if (-not $found) {
-                        Write-Host "${e}[2K`r      [!] Launcher exited cleanly but no upgrade process appeared" -ForegroundColor Yellow
-                        return
-                    }
-                    $foundPid = (Get-Process -Name $found -ErrorAction SilentlyContinue | Select-Object -First 1).Id
-                    Write-Host "${e}[2K`r      > Handed off to $found (PID $foundPid)" -ForegroundColor DarkGray
-                    Show-UpgradeHeartbeat -PathsToWatch @("C:\`$WINDOWS.~BT", "C:\ESD") -LauncherPid $foundPid
-                } else {
-                    Write-Host "${e}[2K`r      > Installation Assistant running (PID $($proc.Id))" -ForegroundColor DarkGray
-                    Show-UpgradeHeartbeat -PathsToWatch @("C:\`$WINDOWS.~BT", "C:\ESD") -LauncherPid $proc.Id
-                }
-                Write-StepUpdate "[X] In-Place Upgrade" -Success
+            } else {
+                Write-Host "      > BitLocker not active on C: -- skipping suspension." -ForegroundColor $DimCol
             }
-            catch {
-                Write-Host "${e}[2K`r      [!] Failed to start upgrade: $($_.Exception.Message)" -ForegroundColor Red
+
+            # Work directories
+            if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
+            if (-not (Test-Path $IPU_LogDir))  { New-Item -ItemType Directory -Path $IPU_LogDir  -Force | Out-Null }
+
+            # ISO download with partial detection
+            $NeedDownload = $true
+            if (Test-Path $IPU_IsoPath) {
+                $ExistingGB = [math]::Round((Get-Item $IPU_IsoPath).Length / 1GB, 2)
+                if ($ExistingGB -ge $IPU_IsoSizeGB) {
+                    Write-Host "      > ISO already present ($ExistingGB GB) -- skipping download." -ForegroundColor $DimCol
+                    $NeedDownload = $false
+                } else {
+                    Write-Host "      [!] Existing ISO is only $ExistingGB GB -- partial download, re-downloading." -ForegroundColor $WarnCol
+                    Remove-Item $IPU_IsoPath -Force
+                }
+            }
+
+            if ($NeedDownload) {
+                # URL pre-flight check
+                Write-Host "      > Checking ISO URL accessibility..." -ForegroundColor $DimCol
+                try {
+                    $HeadResponse = Invoke-WebRequest -Uri $IPU_IsoUrl -Method Head -UseBasicParsing -TimeoutSec 30
+                    Write-Host "      > URL OK (HTTP $($HeadResponse.StatusCode))." -ForegroundColor $DimCol
+                } catch {
+                    Write-Host "      [!] ISO URL not accessible: $_" -ForegroundColor Red
+                    Write-Host "      [!] Update IPU_IsoUrl with a current link and re-run." -ForegroundColor Red
+                    $cancel = $true
+                }
+            }
+
+            if (-not $cancel -and $NeedDownload) {
+                Write-Host "      > Downloading Windows 11 25H2 ISO (~7.2 GB) -- this will take a while..." -ForegroundColor $WarnCol
+                try {
+                    $ProgressPreference = 'SilentlyContinue'
+                    Invoke-WebRequest -Uri $IPU_IsoUrl -OutFile $IPU_IsoPath -UseBasicParsing
+                    Write-Host "      > Download complete." -ForegroundColor $DimCol
+                } catch {
+                    Write-Host "      [!] ISO download failed: $_" -ForegroundColor Red
+                    if (Test-Path $IPU_IsoPath) { Remove-Item $IPU_IsoPath -Force }
+                    $cancel = $true
+                }
+                # Post-download size validation
+                if (-not $cancel) {
+                    if (-not (Test-Path $IPU_IsoPath)) {
+                        Write-Host "      [!] ISO not found after download." -ForegroundColor Red
+                        $cancel = $true
+                    } else {
+                        $DownloadedGB = [math]::Round((Get-Item $IPU_IsoPath).Length / 1GB, 2)
+                        if ($DownloadedGB -lt $IPU_IsoSizeGB) {
+                            Write-Host "      [!] Downloaded ISO is only $DownloadedGB GB -- incomplete. Removing." -ForegroundColor Red
+                            Remove-Item $IPU_IsoPath -Force
+                            $cancel = $true
+                        } else {
+                            Write-Host "      > ISO size verified: $DownloadedGB GB." -ForegroundColor $DimCol
+                        }
+                    }
+                }
+            }
+
+            if (-not $cancel) {
+                # Mount ISO
+                Write-Host "      > Mounting ISO..." -ForegroundColor $DimCol
+                $MountedDrive = $null
+                try {
+                    $MountResult = Mount-DiskImage -ImagePath $IPU_IsoPath -PassThru
+                    $MountedDrive = ($MountResult | Get-Volume).DriveLetter
+                    Write-Host "      > ISO mounted at ${MountedDrive}:\" -ForegroundColor $DimCol
+                } catch {
+                    Write-Host "      [!] Could not mount ISO: $_" -ForegroundColor Red
+                    $cancel = $true
+                }
+
+                if (-not $cancel) {
+                    $SetupExe = "${MountedDrive}:\setup.exe"
+                    if (-not (Test-Path $SetupExe)) {
+                        Dismount-DiskImage -ImagePath $IPU_IsoPath -ErrorAction SilentlyContinue
+                        Write-Host "      [!] setup.exe not found on mounted ISO at $SetupExe" -ForegroundColor Red
+                        $cancel = $true
+                    }
+                }
+
+                if (-not $cancel) {
+                    Write-Host "      > Launching Windows Setup (downlevel phase)..." -ForegroundColor $WarnCol
+                    $SetupArgs = "/auto upgrade /quiet /compat ignorewarning /DynamicUpdate disable /showoobe None /Telemetry Disable /EULA Accept /noreboot /Copylogs `"$IPU_LogDir`""
+                    $IPU_ExitCode = -1
+                    try {
+                        $proc = Start-Process -FilePath $SetupExe -ArgumentList $SetupArgs -Wait -PassThru
+                        $IPU_ExitCode = $proc.ExitCode
+                    } catch {
+                        Write-Host "      [!] setup.exe failed to launch: $_" -ForegroundColor Red
+                    }
+                    "setup.exe exit code: $IPU_ExitCode" | Out-File -FilePath $IPU_SetupLog -Encoding UTF8
+                    Write-Host ("      > setup.exe exited: $IPU_ExitCode (0x{0:X})" -f $IPU_ExitCode) -ForegroundColor $DimCol
+
+                    # Dismount
+                    Dismount-DiskImage -ImagePath $IPU_IsoPath -ErrorAction SilentlyContinue
+                    Write-Host "      > ISO dismounted." -ForegroundColor $DimCol
+
+                    # Exit code handling
+                    switch ($IPU_ExitCode) {
+                        0           { Write-Host "      [OK] Downlevel phase complete. Reboot to finish upgrade." -ForegroundColor Green; $script:ExitCode = 3010 }
+                        3010        { Write-Host "      [OK] Downlevel phase complete (3010). Reboot to finish upgrade." -ForegroundColor Green; $script:ExitCode = 3010 }
+                        -0x3EB6FEFF { Write-Host "      [!] Hard driver/compat block (0xC1900101). Check $IPU_LogDir\compat*.xml" -ForegroundColor Red; $script:ExitCode = 10 }
+                        -0x3EB6FFF8 { Write-Host "      [!] App/driver compat block (0xC1900208). Check $IPU_LogDir" -ForegroundColor Red; $script:ExitCode = 11 }
+                        -0x3EB70000 { Write-Host "      [!] Machine does not meet minimum requirements (0xC1900200)." -ForegroundColor Red; $script:ExitCode = 12 }
+                        default     { Write-Host "      [!] Unexpected exit code $IPU_ExitCode. Check $IPU_LogDir for details." -ForegroundColor $WarnCol }
+                    }
+                    Write-StepUpdate "[X] In-Place Upgrade" -Success
+                }
             }
         }
-        Invoke-FeatureUpdate
-        } # end else (not canceled)
-    } else {
+    } elseif (-not $OnBattery) {
         Write-Host "      Upgrade skipped." -ForegroundColor Yellow
     }
 } else {
