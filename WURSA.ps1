@@ -590,9 +590,10 @@ if ($NoUpgrade) {
                     switch ($IPU_ExitCode) {
                         0           { Write-Host "      [OK] Downlevel phase complete. Reboot to finish upgrade." -ForegroundColor Green; $script:ExitCode = 3010 }
                         3010        { Write-Host "      [OK] Downlevel phase complete (3010). Reboot to finish upgrade." -ForegroundColor Green; $script:ExitCode = 3010 }
-                        -0x3EB6FEFF { Write-Host "      [!] Hard driver/compat block (0xC1900101). Check $IPU_LogDir\compat*.xml" -ForegroundColor Red; $script:ExitCode = 10 }
-                        -0x3EB6FFF8 { Write-Host "      [!] App/driver compat block (0xC1900208). Check $IPU_LogDir" -ForegroundColor Red; $script:ExitCode = 11 }
-                        -0x3EB70000 { Write-Host "      [!] Machine does not meet minimum requirements (0xC1900200)." -ForegroundColor Red; $script:ExitCode = 12 }
+                        -1047527167 { Write-Host "      [!] Hard driver/compat block (0xC1900101). Check $IPU_LogDir\compat*.xml" -ForegroundColor Red; $script:ExitCode = 10 }
+                        -1047526904 { Write-Host "      [!] App/driver compat block (0xC1900208). Check $IPU_LogDir" -ForegroundColor Red; $script:ExitCode = 11 }
+                        -1047526912 { Write-Host "      [!] Machine does not meet minimum requirements (0xC1900200)." -ForegroundColor Red; $script:ExitCode = 12 }
+                        -1047526908 { Write-Host "      [OK] Upgrade already staged (0xC1900204). Reboot to complete." -ForegroundColor Green; $script:ExitCode = 3010 }
                         default     { Write-Host "      [!] Unexpected exit code $IPU_ExitCode. Check $IPU_LogDir for details." -ForegroundColor $WarnCol }
                     }
                     Write-StepUpdate "[X] In-Place Upgrade" -Success
