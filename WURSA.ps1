@@ -1,18 +1,22 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.0
-    Developed by Steve the Killer | Updated: 2026-06-11
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.1
+    Developed by Steve the Killer | Updated: 2026-06-15
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
     disrupting the active user, and self-installs Chocolatey if not present. Performs
-    unattended Windows feature upgrades via ISO-based in-place upgrade (setup.exe),
-    with BitLocker suspension, URL pre-flight, partial download detection, and
-    ESC-to-cancel countdown. Reboot is always deferred to the caller.
+    unattended Windows feature upgrades via an ISO-based in-place upgrade (setup.exe)
+    dispatched to a detached SYSTEM scheduled task, so the upgrade survives RMM /
+    LiveConnect session disconnects. Includes BitLocker suspension, URL pre-flight,
+    and partial download detection. Reboot is always deferred to the caller.
 .NOTES
     Parameters:
       -InplaceUpgrade  Auto-confirms the feature upgrade prompt. Safe for unattended/RMM use.
-                       Uses ISO-based setup.exe upgrade with BitLocker suspension. No reboot.
+                       Dispatches the ISO-based setup.exe upgrade to a detached SYSTEM
+                       scheduled task; the WURSA run returns immediately and the upgrade
+                       continues independently. Progress/result is written to
+                       C:\Windows\Temp\25H2IPU\ipu_status.txt. BitLocker is suspended.
       -No3rdParty      Skips the Chocolatey third-party app update pass entirely.
       -NoUpgrade       Skips the feature version check and upgrade prompt entirely.
 
@@ -23,6 +27,11 @@
       10   - IPU hard driver/compat block (0xC1900101)
       11   - IPU app/driver compat block (0xC1900208)
       12   - IPU machine does not meet minimum requirements (0xC1900200)
+
+    Note: When the feature upgrade is dispatched it runs detached as SYSTEM, so its
+    result (including compat blocks 10/11/12 and the 3010 reboot signal) is written
+    to ipu_status.txt rather than returned as this script's exit code. Poll that file
+    from the RMM to determine when to reboot.
 #>
 param(
     [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt
@@ -30,7 +39,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.0"
+$_ver    = "| v2.1"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -401,13 +410,19 @@ if ($ChocoAvailable -and -not $No3rdParty) {
 
 #region 5 - Post-Update Version Check & Optional In-Place Upgrade
 # ============================================================================
-# ISO config - update URL if Microsoft rotates the link
-$IPU_IsoUrl    = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"
-$IPU_IsoSizeGB = 7.2
-$IPU_WorkDir   = "C:\Windows\Temp\25H2IPU"
-$IPU_IsoPath   = Join-Path $IPU_WorkDir "Win11_25H2_x64.iso"
-$IPU_LogDir    = Join-Path $IPU_WorkDir "SetupLogs"
-$IPU_SetupLog  = Join-Path $IPU_WorkDir "setup_exit.log"
+# ISO config - hosted on Cloudflare R2 behind a stable custom domain
+# (iso.killertools.net) so the link does not expire. To target a different
+# feature build, swap the object in the killer-isos bucket and update the URL.
+$IPU_IsoUrl     = "https://iso.killertools.net/Win11_25H2_x64.iso"
+$IPU_IsoSizeGB  = 7.9
+$IPU_WorkDir    = "C:\Windows\Temp\25H2IPU"
+$IPU_IsoPath    = Join-Path $IPU_WorkDir "Win11_25H2_x64.iso"
+$IPU_LogDir     = Join-Path $IPU_WorkDir "SetupLogs"
+$IPU_SetupLog   = Join-Path $IPU_WorkDir "setup_exit.log"
+$IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
+$IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
+$IPU_TaskName   = "WURSA-25H2-IPU"
+$IPU_IsoSha256  = "66B7B4B71763ED6F9B2CE29326ED9284544DA6F5283D00329921540C01AAAEEA"
 
 Write-HLine -Style dashed
 Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
@@ -425,183 +440,182 @@ if ($NoUpgrade) {
         if ($Battery -and $Battery.BatteryStatus -ne 2) { $OnBattery = $true }
     } catch {}
 
+    $proceed = $false
     if ($OnBattery) {
         Write-Host "      [!] Upgrade skipped: device is running on battery power." -ForegroundColor Yellow
     } elseif ($InplaceUpgrade) {
-        Write-Host "      [-InplaceUpgrade] Auto-proceeding with ISO-based upgrade." -ForegroundColor $DimCol
+        Write-Host "      [-InplaceUpgrade] Auto-dispatching detached ISO-based upgrade." -ForegroundColor $DimCol
         $proceed = $true
     } else {
-        $proceed = $false
-        # Flush any buffered keystrokes from earlier steps
-        while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
+        # Flush buffered keystrokes; guarded so redirected (RMM) consoles do not throw
+        try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
         try {
             Write-Host "Would you like to perform an in-place upgrade to $($LatestVersion)? (Y/N): " -NoNewline -ForegroundColor $WarnCol
             $key    = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
             $choice = $key.Character
             if ($choice -ne "`n" -and $choice -ne "`r") { Write-Host $choice -NoNewline }
-            Write-Host -NoNewline "`r"
+            Write-Host ""
             if ($choice -in @('Y','y')) { $proceed = $true }
-            $esc = [char]27
-            Write-Host -NoNewline "${esc}[2K`r"
         } catch {
-            Write-Host "      [i] Non-interactive - defaulting to NO." -ForegroundColor $DimCol
+            Write-Host "      [i] Non-interactive - defaulting to NO. Use -InplaceUpgrade for unattended runs." -ForegroundColor $DimCol
         }
     }
 
     if (-not $OnBattery -and $proceed) {
-        Write-Host "[>] Preparing ISO-Based In-Place Upgrade..." -ForegroundColor $LineCol
-        while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
-        Write-Host "      > Upgrade will begin in 10 seconds. " -NoNewline -ForegroundColor Yellow
-        Write-Host "(Press ESC to cancel...)" -ForegroundColor DarkGray
-        $cancel = $false
-        [Console]::TreatControlCAsInput = $true
-        for ($i = 10; $i -gt 0; $i--) {
-            for ($t = 0; $t -lt 10; $t++) {
-                Start-Sleep -Milliseconds 100
-                if ([Console]::KeyAvailable) {
-                    $k = [Console]::ReadKey($true)
-                    if ($k.Key -eq "Escape") { $cancel = $true; break }
-                }
-            }
-            if ($cancel) { break }
-            Write-Host -NoNewline "`r      $i... " -ForegroundColor DarkGray
-        }
-        $esc = [char]27
-        Write-Host -NoNewline "${esc}[2K`r${esc}[1A${esc}[2K`r"
-        [Console]::TreatControlCAsInput = $false
-        while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
+        Write-Host "[>] Dispatching detached In-Place Upgrade (survives session disconnect)..." -ForegroundColor $LineCol
 
-        if ($cancel) {
-            Write-Host "      [!] Upgrade canceled by user." -ForegroundColor Yellow
-        } else {
-            # BitLocker suspension - 4 reboots covers SafeOS + first boot + second boot + buffer
-            $BLStatus = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
-            if ($BLStatus -and $BLStatus.ProtectionStatus -eq 'On') {
-                Write-Host "      > Suspending BitLocker for 4 reboots..." -ForegroundColor $DimCol
-                try {
-                    Suspend-BitLocker -MountPoint "C:" -RebootCount 4
-                    Write-Host "      > BitLocker suspended." -ForegroundColor $DimCol
-                } catch {
-                    Write-Host "      [!] BitLocker suspension failed: $($_.Exception.Message)" -ForegroundColor $WarnCol
-                }
+        if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
+
+        # --- Build the standalone runner the scheduled task executes as SYSTEM ---
+        # Config preamble (double-quoted here-string: values are injected now).
+        $RunnerConfig = @"
+`$IPU_IsoUrl     = '$IPU_IsoUrl'
+`$IPU_IsoSizeGB  = $IPU_IsoSizeGB
+`$IPU_WorkDir    = '$IPU_WorkDir'
+`$IPU_IsoPath    = '$IPU_IsoPath'
+`$IPU_LogDir     = '$IPU_LogDir'
+`$IPU_SetupLog   = '$IPU_SetupLog'
+`$IPU_StatusFile = '$IPU_StatusFile'
+`$IPU_TaskName   = '$IPU_TaskName'
+`$IPU_IsoSha256  = '$IPU_IsoSha256'
+"@
+
+        # Runner body (single-quoted here-string: written verbatim, runs later).
+        $RunnerBody = @'
+$ErrorActionPreference = "Continue"
+function Set-Status { param([string]$Text) try { $Text | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force } catch {} }
+$stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
+if (-not (Test-Path $IPU_LogDir))  { New-Item -ItemType Directory -Path $IPU_LogDir  -Force | Out-Null }
+Set-Status "RUNNING $stamp"
+Start-Transcript -Path (Join-Path $IPU_LogDir "ipu_runner.log") -Append -Force | Out-Null
+
+# BitLocker suspension - 4 reboots covers SafeOS + first boot + second boot + buffer
+try {
+    $BLStatus = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+    if ($BLStatus -and $BLStatus.ProtectionStatus -eq 'On') {
+        Suspend-BitLocker -MountPoint "C:" -RebootCount 4 -ErrorAction Stop
+        Write-Output "BitLocker suspended."
+    }
+} catch { Write-Output "BitLocker suspension failed: $($_.Exception.Message)" }
+
+$cancel = $false
+
+# ISO download with partial-file detection
+$NeedDownload = $true
+if (Test-Path $IPU_IsoPath) {
+    $ExistingGB = [math]::Round((Get-Item $IPU_IsoPath).Length / 1GB, 2)
+    if ($ExistingGB -ge $IPU_IsoSizeGB) { $NeedDownload = $false }
+    else { Remove-Item $IPU_IsoPath -Force -ErrorAction SilentlyContinue }
+}
+
+if ($NeedDownload) {
+    try {
+        $HeadResponse = Invoke-WebRequest -Uri $IPU_IsoUrl -Method Head -UseBasicParsing -TimeoutSec 30
+        Write-Output "URL OK (HTTP $($HeadResponse.StatusCode))."
+    } catch {
+        Write-Output "ISO URL not accessible: $_"
+        Set-Status "FAILED URL_UNREACHABLE $stamp"
+        $cancel = $true
+    }
+}
+
+if (-not $cancel -and $NeedDownload) {
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $IPU_IsoUrl -OutFile $IPU_IsoPath -UseBasicParsing
+    } catch {
+        Write-Output "ISO download failed: $_"
+        if (Test-Path $IPU_IsoPath) { Remove-Item $IPU_IsoPath -Force -ErrorAction SilentlyContinue }
+        Set-Status "FAILED DOWNLOAD $stamp"
+        $cancel = $true
+    }
+    if (-not $cancel) {
+        if (-not (Test-Path $IPU_IsoPath)) { Set-Status "FAILED NO_ISO $stamp"; $cancel = $true }
+        else {
+            $DownloadedGB = [math]::Round((Get-Item $IPU_IsoPath).Length / 1GB, 2)
+            if ($DownloadedGB -lt $IPU_IsoSizeGB) {
+                Remove-Item $IPU_IsoPath -Force -ErrorAction SilentlyContinue
+                Set-Status "FAILED PARTIAL_DOWNLOAD $stamp"
+                $cancel = $true
+            }
+        }
+    }
+}
+
+if (-not $cancel) {
+    $actualHash = (Get-FileHash $IPU_IsoPath -Algorithm SHA256).Hash
+    if ($actualHash -ne $IPU_IsoSha256) {
+        Write-Output "ISO hash mismatch. Expected $IPU_IsoSha256 got $actualHash"
+        Remove-Item $IPU_IsoPath -Force -ErrorAction SilentlyContinue
+        Set-Status "FAILED HASH_MISMATCH $stamp"
+        $cancel = $true
+    } else { Write-Output "ISO hash verified." }
+}
+
+if (-not $cancel) {
+    $MountedDrive = $null
+    try {
+        $MountResult  = Mount-DiskImage -ImagePath $IPU_IsoPath -PassThru
+        $MountedDrive = ($MountResult | Get-Volume).DriveLetter
+    } catch { Write-Output "Could not mount ISO: $_"; Set-Status "FAILED MOUNT $stamp"; $cancel = $true }
+
+    if (-not $cancel) {
+        $SetupExe = "${MountedDrive}:\setup.exe"
+        if (-not (Test-Path $SetupExe)) {
+            Dismount-DiskImage -ImagePath $IPU_IsoPath -ErrorAction SilentlyContinue
+            Set-Status "FAILED NO_SETUP $stamp"
+            $cancel = $true
+        }
+    }
+
+    if (-not $cancel) {
+        $SetupArgs = "/auto upgrade /quiet /compat ignorewarning /DynamicUpdate disable /showoobe None /Telemetry Disable /EULA Accept /noreboot /Copylogs `"$IPU_LogDir`""
+        $IPU_ExitCode = -1
+        try {
+            $proc = Start-Process -FilePath $SetupExe -ArgumentList $SetupArgs -Wait -PassThru
+            $IPU_ExitCode = $proc.ExitCode
+        } catch { Write-Output "setup.exe failed to launch: $_" }
+        "setup.exe exit code: $IPU_ExitCode" | Out-File -FilePath $IPU_SetupLog -Encoding ASCII
+        Dismount-DiskImage -ImagePath $IPU_IsoPath -ErrorAction SilentlyContinue
+
+        $done = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        switch ($IPU_ExitCode) {
+            0           { Set-Status "REBOOT_REQUIRED 3010 $done" }
+            3010        { Set-Status "REBOOT_REQUIRED 3010 $done" }
+            -1047526908 { Set-Status "REBOOT_REQUIRED 3010 $done" }
+            -1047527167 { Set-Status "BLOCK_HARD_COMPAT 0xC1900101 $done" }
+            -1047526904 { Set-Status "BLOCK_APP_DRIVER 0xC1900208 $done" }
+            -1047526912 { Set-Status "BLOCK_MIN_REQ 0xC1900200 $done" }
+            default     { Set-Status "UNEXPECTED $IPU_ExitCode $done" }
+        }
+    }
+}
+
+Stop-Transcript | Out-Null
+# Remove the one-shot task so it does not linger
+schtasks.exe /Delete /TN "$IPU_TaskName" /F | Out-Null
+'@
+
+        $RunnerConfig + "`r`n" + $RunnerBody | Out-File -FilePath $IPU_RunnerPath -Encoding ASCII -Force
+
+        # --- Register + start the detached SYSTEM task ---
+        $null = ('DISPATCHED ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
+        $TR = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $IPU_RunnerPath"
+        $createOut = schtasks.exe /Create /TN $IPU_TaskName /TR $TR /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $runOut = schtasks.exe /Run /TN $IPU_TaskName 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "      > Upgrade dispatched as SYSTEM. It continues after you disconnect." -ForegroundColor Green
+                Write-Host "      > Status file : $IPU_StatusFile" -ForegroundColor $DimCol
+                Write-Host "      > Setup logs  : $IPU_LogDir" -ForegroundColor $DimCol
+                Write-Host "      > A reboot will be required once the detached upgrade completes." -ForegroundColor $WarnCol
             } else {
-                Write-Host "      > BitLocker not active on C: -- skipping suspension." -ForegroundColor $DimCol
+                Write-Host "      [!] Task created but failed to start: $runOut" -ForegroundColor Red
             }
-
-            # Work directories
-            if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
-            if (-not (Test-Path $IPU_LogDir))  { New-Item -ItemType Directory -Path $IPU_LogDir  -Force | Out-Null }
-
-            # ISO download with partial detection
-            $NeedDownload = $true
-            if (Test-Path $IPU_IsoPath) {
-                $ExistingGB = [math]::Round((Get-Item $IPU_IsoPath).Length / 1GB, 2)
-                if ($ExistingGB -ge $IPU_IsoSizeGB) {
-                    Write-Host "      > ISO already present ($ExistingGB GB) -- skipping download." -ForegroundColor $DimCol
-                    $NeedDownload = $false
-                } else {
-                    Write-Host "      [!] Existing ISO is only $ExistingGB GB -- partial download, re-downloading." -ForegroundColor $WarnCol
-                    Remove-Item $IPU_IsoPath -Force
-                }
-            }
-
-            if ($NeedDownload) {
-                # URL pre-flight check
-                Write-Host "      > Checking ISO URL accessibility..." -ForegroundColor $DimCol
-                try {
-                    $HeadResponse = Invoke-WebRequest -Uri $IPU_IsoUrl -Method Head -UseBasicParsing -TimeoutSec 30
-                    Write-Host "      > URL OK (HTTP $($HeadResponse.StatusCode))." -ForegroundColor $DimCol
-                } catch {
-                    Write-Host "      [!] ISO URL not accessible: $_" -ForegroundColor Red
-                    Write-Host "      [!] Update IPU_IsoUrl with a current link and re-run." -ForegroundColor Red
-                    $cancel = $true
-                }
-            }
-
-            if (-not $cancel -and $NeedDownload) {
-                Write-Host "      > Downloading Windows 11 25H2 ISO (~7.2 GB) -- this will take a while..." -ForegroundColor $WarnCol
-                try {
-                    $ProgressPreference = 'SilentlyContinue'
-                    Invoke-WebRequest -Uri $IPU_IsoUrl -OutFile $IPU_IsoPath -UseBasicParsing
-                    Write-Host "      > Download complete." -ForegroundColor $DimCol
-                } catch {
-                    Write-Host "      [!] ISO download failed: $_" -ForegroundColor Red
-                    if (Test-Path $IPU_IsoPath) { Remove-Item $IPU_IsoPath -Force }
-                    $cancel = $true
-                }
-                # Post-download size validation
-                if (-not $cancel) {
-                    if (-not (Test-Path $IPU_IsoPath)) {
-                        Write-Host "      [!] ISO not found after download." -ForegroundColor Red
-                        $cancel = $true
-                    } else {
-                        $DownloadedGB = [math]::Round((Get-Item $IPU_IsoPath).Length / 1GB, 2)
-                        if ($DownloadedGB -lt $IPU_IsoSizeGB) {
-                            Write-Host "      [!] Downloaded ISO is only $DownloadedGB GB -- incomplete. Removing." -ForegroundColor Red
-                            Remove-Item $IPU_IsoPath -Force
-                            $cancel = $true
-                        } else {
-                            Write-Host "      > ISO size verified: $DownloadedGB GB." -ForegroundColor $DimCol
-                        }
-                    }
-                }
-            }
-
-            if (-not $cancel) {
-                # Mount ISO
-                Write-Host "      > Mounting ISO..." -ForegroundColor $DimCol
-                $MountedDrive = $null
-                try {
-                    $MountResult = Mount-DiskImage -ImagePath $IPU_IsoPath -PassThru
-                    $MountedDrive = ($MountResult | Get-Volume).DriveLetter
-                    Write-Host "      > ISO mounted at ${MountedDrive}:\" -ForegroundColor $DimCol
-                } catch {
-                    Write-Host "      [!] Could not mount ISO: $_" -ForegroundColor Red
-                    $cancel = $true
-                }
-
-                if (-not $cancel) {
-                    $SetupExe = "${MountedDrive}:\setup.exe"
-                    if (-not (Test-Path $SetupExe)) {
-                        Dismount-DiskImage -ImagePath $IPU_IsoPath -ErrorAction SilentlyContinue
-                        Write-Host "      [!] setup.exe not found on mounted ISO at $SetupExe" -ForegroundColor Red
-                        $cancel = $true
-                    }
-                }
-
-                if (-not $cancel) {
-                    Write-Host "      > Launching Windows Setup (downlevel phase)..." -ForegroundColor $WarnCol
-                    $SetupArgs = "/auto upgrade /quiet /compat ignorewarning /DynamicUpdate disable /showoobe None /Telemetry Disable /EULA Accept /noreboot /Copylogs `"$IPU_LogDir`""
-                    $IPU_ExitCode = -1
-                    try {
-                        $proc = Start-Process -FilePath $SetupExe -ArgumentList $SetupArgs -Wait -PassThru
-                        $IPU_ExitCode = $proc.ExitCode
-                    } catch {
-                        Write-Host "      [!] setup.exe failed to launch: $_" -ForegroundColor Red
-                    }
-                    "setup.exe exit code: $IPU_ExitCode" | Out-File -FilePath $IPU_SetupLog -Encoding UTF8
-                    Write-Host ("      > setup.exe exited: $IPU_ExitCode (0x{0:X})" -f $IPU_ExitCode) -ForegroundColor $DimCol
-
-                    # Dismount
-                    Dismount-DiskImage -ImagePath $IPU_IsoPath -ErrorAction SilentlyContinue
-                    Write-Host "      > ISO dismounted." -ForegroundColor $DimCol
-
-                    # Exit code handling
-                    switch ($IPU_ExitCode) {
-                        0           { Write-Host "      [OK] Downlevel phase complete. Reboot to finish upgrade." -ForegroundColor Green; $script:ExitCode = 3010 }
-                        3010        { Write-Host "      [OK] Downlevel phase complete (3010). Reboot to finish upgrade." -ForegroundColor Green; $script:ExitCode = 3010 }
-                        -1047527167 { Write-Host "      [!] Hard driver/compat block (0xC1900101). Check $IPU_LogDir\compat*.xml" -ForegroundColor Red; $script:ExitCode = 10 }
-                        -1047526904 { Write-Host "      [!] App/driver compat block (0xC1900208). Check $IPU_LogDir" -ForegroundColor Red; $script:ExitCode = 11 }
-                        -1047526912 { Write-Host "      [!] Machine does not meet minimum requirements (0xC1900200)." -ForegroundColor Red; $script:ExitCode = 12 }
-                        -1047526908 { Write-Host "      [OK] Upgrade already staged (0xC1900204). Reboot to complete." -ForegroundColor Green; $script:ExitCode = 3010 }
-                        default     { Write-Host "      [!] Unexpected exit code $IPU_ExitCode. Check $IPU_LogDir for details." -ForegroundColor $WarnCol }
-                    }
-                    Write-StepUpdate "[X] In-Place Upgrade" -Success
-                }
-            }
+        } else {
+            Write-Host "      [!] Failed to register scheduled task: $createOut" -ForegroundColor Red
         }
-    } elseif (-not $OnBattery) {
-        Write-Host "      Upgrade skipped." -ForegroundColor Yellow
     }
 } else {
     Write-Host "      System is already on the latest feature update." -ForegroundColor Green
