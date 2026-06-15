@@ -490,15 +490,6 @@ if (-not (Test-Path $IPU_LogDir))  { New-Item -ItemType Directory -Path $IPU_Log
 Set-Status "RUNNING $stamp"
 Start-Transcript -Path (Join-Path $IPU_LogDir "ipu_runner.log") -Append -Force | Out-Null
 
-# BitLocker suspension - 4 reboots covers SafeOS + first boot + second boot + buffer
-try {
-    $BLStatus = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
-    if ($BLStatus -and $BLStatus.ProtectionStatus -eq 'On') {
-        Suspend-BitLocker -MountPoint "C:" -RebootCount 4 -ErrorAction Stop
-        Write-Output "BitLocker suspended."
-    }
-} catch { Write-Output "BitLocker suspension failed: $($_.Exception.Message)" }
-
 $cancel = $false
 
 # ISO download with partial-file detection
@@ -570,6 +561,16 @@ if (-not $cancel) {
     }
 
     if (-not $cancel) {
+        # BitLocker suspension - 4 reboots covers SafeOS + first/second boot + buffer.
+        # Done here, after all gates pass, so an aborted run never leaves protection off.
+        try {
+            $BLStatus = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+            if ($BLStatus -and $BLStatus.ProtectionStatus -eq 'On') {
+                Suspend-BitLocker -MountPoint "C:" -RebootCount 4 -ErrorAction Stop
+                Write-Output "BitLocker suspended."
+            }
+        } catch { Write-Output "BitLocker suspension failed: $($_.Exception.Message)" }
+
         $SetupArgs = "/auto upgrade /quiet /compat ignorewarning /DynamicUpdate disable /showoobe None /Telemetry Disable /EULA Accept /noreboot /Copylogs `"$IPU_LogDir`""
         $IPU_ExitCode = -1
         try {
