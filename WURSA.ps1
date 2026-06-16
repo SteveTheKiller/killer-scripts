@@ -44,6 +44,11 @@ $_ver    = "| v2.1"
 # Define the latest known Windows release
 $LatestVersion = "25H2"
 
+# Set true in region 3 if Windows Update stages the target feature build, so
+# region 5 skips the redundant in-place upgrade prompt (DisplayVersion does not
+# flip until the pending reboot finalizes).
+$script:FeatureUpdateStaged = $false
+
 #region 0 - Pre-Flight & Helpers
 $script:ExitCode = 0
 trap { Write-Host "[!] Fatal: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
@@ -281,6 +286,8 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
             $Installer.Updates = $UpdatesToInstall
             $Installer.AllowSourcePrompts = $false
             $InstallResult = $Installer.Install()
+            # Flag the target feature update so region 5 skips the redundant IPU prompt
+            if ($Update.Title -match [regex]::Escape($LatestVersion)) { $script:FeatureUpdateStaged = $true }
             $_savedTop = [Console]::CursorTop
             [Console]::SetCursorPosition(0, $_uRow)
             for ($_li = 0; $_li -lt $_uLines.Count; $_li++) {
@@ -451,6 +458,8 @@ Write-Host "      Installed Version : $InstalledVersion" -ForegroundColor Yellow
 Write-Host "      Latest Version    : $LatestVersion"    -ForegroundColor Yellow
 if ($NoUpgrade) {
     Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
+} elseif ($script:FeatureUpdateStaged) {
+    Write-Host "      > $LatestVersion already staged via Windows Update; pending reboot. In-place upgrade not needed." -ForegroundColor $DimCol
 } elseif ($InstalledVersion -ne $LatestVersion) {
     Write-Host "      > Feature update available." -ForegroundColor $WarnCol
     # Battery safety
