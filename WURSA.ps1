@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.1
-    Developed by Steve the Killer | Updated: 2026-06-15
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.2
+    Developed by Steve the Killer | Updated: 2026-06-16
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
@@ -27,11 +27,14 @@
       10   - IPU hard driver/compat block (0xC1900101)
       11   - IPU app/driver compat block (0xC1900208)
       12   - IPU machine does not meet minimum requirements (0xC1900200)
+      13   - IPU migration choice block (0xC1900204), ISO language or edition mismatch
 
     Note: When the feature upgrade is dispatched it runs detached as SYSTEM, so its
-    result (including compat blocks 10/11/12 and the 3010 reboot signal) is written
-    to ipu_status.txt rather than returned as this script's exit code. Poll that file
-    from the RMM to determine when to reboot.
+    result is written to ipu_status.txt rather than returned as this script's exit
+    code. Status strings: REBOOT_REQUIRED (reboot to finish), BLOCK_HARD_COMPAT,
+    BLOCK_APP_DRIVER, BLOCK_MIN_REQ, BLOCK_MIGCHOICE (language/edition mismatch),
+    UNEXPECTED. Only REBOOT_REQUIRED should trigger a reboot. Poll that file from
+    the RMM to determine when to reboot.
 #>
 param(
     [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt
@@ -39,7 +42,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.1"
+$_ver    = "| v2.2"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -440,16 +443,26 @@ if ($ChocoAvailable -and -not $No3rdParty) {
 # ISO config - hosted on Cloudflare R2 behind a stable custom domain
 # (iso.killertools.net) so the link does not expire. To target a different
 # feature build, swap the object in the killer-isos bucket and update the URL.
-$IPU_IsoUrl     = "https://iso.killertools.net/Win11_25H2_x64.iso"
-$IPU_IsoSizeGB  = 7.9
+#
+# Language-aware: the in-place upgrade requires the ISO language to match the
+# running OS UI language, or setup.exe returns 0xC1900204 and the keep files
+# path is silently blocked. Read the base install language from the NLS registry
+# (reliable under SYSTEM) and pick the matching image: en-GB (0809) gets the
+# International ISO, everything else defaults to en-US for the US fleet.
+$IPU_InstallLang = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction SilentlyContinue).InstallLanguage
+switch ($IPU_InstallLang) {
+    '0809'  { $IPU_IsoName = "Win11_25H2_x64_en-GB.iso"; $IPU_IsoSha256 = "66B7B4B71763ED6F9B2CE29326ED9284544DA6F5283D00329921540C01AAAEEA" }
+    default { $IPU_IsoName = "Win11_25H2_x64_en-US.iso"; $IPU_IsoSha256 = "768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3" }
+}
+$IPU_IsoUrl     = "https://iso.killertools.net/$IPU_IsoName"
+$IPU_IsoSizeGB  = 6.0
 $IPU_WorkDir    = "C:\Windows\Temp\25H2IPU"
-$IPU_IsoPath    = Join-Path $IPU_WorkDir "Win11_25H2_x64.iso"
+$IPU_IsoPath    = Join-Path $IPU_WorkDir $IPU_IsoName
 $IPU_LogDir     = Join-Path $IPU_WorkDir "SetupLogs"
 $IPU_SetupLog   = Join-Path $IPU_WorkDir "setup_exit.log"
 $IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
 $IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
 $IPU_TaskName   = "WURSA-25H2-IPU"
-$IPU_IsoSha256  = "66B7B4B71763ED6F9B2CE29326ED9284544DA6F5283D00329921540C01AAAEEA"
 
 Write-HLine -Style dashed
 Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
@@ -516,6 +529,8 @@ function Set-Status { param([string]$Text) try { $Text | Out-File -FilePath $IPU
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
 if (-not (Test-Path $IPU_LogDir))  { New-Item -ItemType Directory -Path $IPU_LogDir  -Force | Out-Null }
+$IPU_LegacyIso = Join-Path $IPU_WorkDir "Win11_25H2_x64.iso"
+if (Test-Path $IPU_LegacyIso) { Remove-Item $IPU_LegacyIso -Force -ErrorAction SilentlyContinue }
 Set-Status "RUNNING $stamp"
 Start-Transcript -Path (Join-Path $IPU_LogDir "ipu_runner.log") -Append -Force | Out-Null
 
@@ -613,7 +628,7 @@ if (-not $cancel) {
         switch ($IPU_ExitCode) {
             0           { Set-Status "REBOOT_REQUIRED 3010 $done" }
             3010        { Set-Status "REBOOT_REQUIRED 3010 $done" }
-            -1047526908 { Set-Status "REBOOT_REQUIRED 3010 $done" }
+            -1047526908 { Set-Status "BLOCK_MIGCHOICE 0xC1900204 $done" }
             -1047527167 { Set-Status "BLOCK_HARD_COMPAT 0xC1900101 $done" }
             -1047526904 { Set-Status "BLOCK_APP_DRIVER 0xC1900208 $done" }
             -1047526912 { Set-Status "BLOCK_MIN_REQ 0xC1900200 $done" }
