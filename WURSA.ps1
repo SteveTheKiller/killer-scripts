@@ -166,16 +166,36 @@ Write-HLine -Style dashed
 #region 0.5 - System Restore Point
 # ============================================================================
 Write-StepUpdate "[1/5] Creating System Restore Point..."
-try {
-    # Bypass the 24-hour cooldown Windows enforces between restore points
-    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "SystemRestorePointCreationFrequency" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
-    # Ensure System Protection is enabled on C: (often disabled on managed endpoints)
-    Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue | Out-Null
-    Checkpoint-Computer -Description "WURSA Pre-Update $($env:COMPUTERNAME) $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
-    Write-StepUpdate -Success
-} catch {
-    Write-Host "      [!] Restore point failed: $($_.Exception.Message)" -ForegroundColor $WarnCol
+# Bypass the 24-hour cooldown Windows enforces between restore points
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "SystemRestorePointCreationFrequency" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+# The checkpoint calls into VSS/SrClient, which can stall or hard-fault the host
+# process under RMM and take the whole run down before try/catch can fire. Run it
+# in a timeboxed child job so a VSS hang can't kill WURSA; treat it as non-fatal.
+$_rpTimeout = 90
+$_rpDesc    = "WURSA Pre-Update $($env:COMPUTERNAME) $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+$_rpJob = Start-Job -ScriptBlock {
+    param($Desc)
+    try {
+        # Ensure System Protection is enabled on C: (often disabled on managed endpoints)
+        Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue | Out-Null
+        Checkpoint-Computer -Description $Desc -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+        "OK"
+    } catch {
+        "ERR: $($_.Exception.Message)"
+    }
+} -ArgumentList $_rpDesc
+if (Wait-Job -Job $_rpJob -Timeout $_rpTimeout) {
+    $_rpResult = Receive-Job -Job $_rpJob
+    if ($_rpResult -match '^OK') {
+        Write-StepUpdate -Success
+    } else {
+        Write-Host "      [!] Restore point failed: $($_rpResult -replace '^ERR: ','')" -ForegroundColor $WarnCol
+    }
+} else {
+    Write-Host "      [!] Restore point timed out after ${_rpTimeout}s (VSS stalled); continuing." -ForegroundColor $WarnCol
+    Stop-Job -Job $_rpJob -ErrorAction SilentlyContinue
 }
+Remove-Job -Job $_rpJob -Force -ErrorAction SilentlyContinue
 #endregion
 
 #region 1 - Service Registration
