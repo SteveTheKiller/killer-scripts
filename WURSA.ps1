@@ -224,6 +224,21 @@ try {
 #region 2 - Discovery
 # ============================================================================
 Write-StepUpdate "[3/5] Scanning for Drivers & OS Patches..."
+# Resume Windows Update if it is paused. While paused, WU returns nothing, so an
+# update run would silently find zero updates and the feature upgrade is never
+# offered. Clears the local "Pause updates" values (UX\Settings); leaves any
+# policy-driven pause alone.
+$_uxk = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+if (Test-Path $_uxk) {
+    $_wasPaused = $false
+    foreach ($_pn in 'PauseUpdatesExpiryTime','PauseUpdatesStartTime','PauseFeatureUpdatesStartTime','PauseFeatureUpdatesEndTime','PauseQualityUpdatesStartTime','PauseQualityUpdatesEndTime') {
+        if ($null -ne (Get-ItemProperty -Path $_uxk -Name $_pn -ErrorAction SilentlyContinue)) {
+            Remove-ItemProperty -Path $_uxk -Name $_pn -ErrorAction SilentlyContinue
+            $_wasPaused = $true
+        }
+    }
+    if ($_wasPaused) { Write-Host "      [i] Windows Update was paused - resumed." -ForegroundColor $WarnCol }
+}
 # Direct API search to bypass the 'remoteIpNoProxy' crash
 $UpdateSession = New-Object -ComObject Microsoft.Update.Session
 $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
