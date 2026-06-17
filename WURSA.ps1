@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.2
-    Developed by Steve the Killer | Updated: 2026-06-16
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.3
+    Developed by Steve the Killer | Updated: 2026-06-17
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
@@ -27,14 +27,16 @@
       10   - IPU hard driver/compat block (0xC1900101)
       11   - IPU app/driver compat block (0xC1900208)
       12   - IPU machine does not meet minimum requirements (0xC1900200)
-      13   - IPU migration choice block (0xC1900204), ISO language or edition mismatch
+      13   - IPU migration choice block (0xC1900204); language or edition mismatch, now routed to the Installation Assistant
 
     Note: When the feature upgrade is dispatched it runs detached as SYSTEM, so its
     result is written to ipu_status.txt rather than returned as this script's exit
-    code. Status strings: REBOOT_REQUIRED (reboot to finish), BLOCK_HARD_COMPAT,
-    BLOCK_APP_DRIVER, BLOCK_MIN_REQ, BLOCK_MIGCHOICE (language/edition mismatch),
-    UNEXPECTED. Only REBOOT_REQUIRED should trigger a reboot. Poll that file from
-    the RMM to determine when to reboot.
+    code. Status strings: REBOOT_REQUIRED (reboot to finish; covers both the ISO
+    path and the Installation Assistant, which stages with /NoReboot and never
+    auto-restarts), RUNNING IA_INPROGRESS (Assistant still working), BLOCK_HARD_COMPAT,
+    BLOCK_APP_DRIVER, BLOCK_MIN_REQ, and FAILED * for download/hash/mount/launch/exit
+    failures. Only REBOOT_REQUIRED should trigger a reboot, and the reboot is always
+    left to the caller. Poll that file from the RMM to determine when to reboot.
 #>
 param(
     [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt
@@ -42,7 +44,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.2"
+$_ver    = "| v2.3"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -464,6 +466,14 @@ $IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
 $IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
 $IPU_TaskName   = "WURSA-25H2-IPU"
 
+# Installation Assistant fallback (online, edition-correct). The local ISO is a
+# consumer image with no Enterprise SKU, so an Enterprise-composition box fails the
+# ISO match with 0xC1900204. The Assistant pulls the matching edition straight from
+# Microsoft. Host the exe alongside the ISO in the killer-isos bucket; the hash pin
+# is optional (leave empty to skip).
+$IPU_IAUrl      = "https://iso.killertools.net/Windows11InstallationAssistant.exe"
+$IPU_IASha256   = ""
+
 Write-HLine -Style dashed
 Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
 $InstalledVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
@@ -520,12 +530,68 @@ if ($NoUpgrade) {
 `$IPU_StatusFile = '$IPU_StatusFile'
 `$IPU_TaskName   = '$IPU_TaskName'
 `$IPU_IsoSha256  = '$IPU_IsoSha256'
+`$IPU_IAUrl     = '$IPU_IAUrl'
+`$IPU_IASha256  = '$IPU_IASha256'
 "@
 
         # Runner body (single-quoted here-string: written verbatim, runs later).
         $RunnerBody = @'
 $ErrorActionPreference = "Continue"
 function Set-Status { param([string]$Text) try { $Text | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force } catch {} }
+$IPU_IAExe  = Join-Path $IPU_WorkDir "Windows11InstallationAssistant.exe"
+$IPU_IAArgs = "/QuietInstall /SkipEULA /auto upgrade /NoReboot"
+function Invoke-IPUInstallationAssistant {
+    param([string]$Reason)
+    Write-Output "Routing to Windows 11 Installation Assistant ($Reason)."
+    $iaStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    # Suspend BitLocker for the reboots the Assistant will drive
+    try {
+        $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+        if ($bl -and $bl.ProtectionStatus -eq 'On') { Suspend-BitLocker -MountPoint "C:" -RebootCount 4 -ErrorAction Stop; Write-Output "BitLocker suspended." }
+    } catch { Write-Output "BitLocker suspension failed: $($_.Exception.Message)" }
+    if (Get-Process -Name 'Windows11InstallationAssistant' -ErrorAction SilentlyContinue) {
+        Write-Output "Installation Assistant already running; leaving it to finish."
+        Set-Status "RUNNING IA_INPROGRESS $iaStamp"
+        return
+    }
+    if (-not (Test-Path $IPU_IAExe)) {
+        try {
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $IPU_IAUrl -OutFile $IPU_IAExe -UseBasicParsing
+        } catch {
+            Write-Output "Installation Assistant download failed: $_"
+            Set-Status "FAILED IA_DOWNLOAD $iaStamp"
+            return
+        }
+    }
+    if ($IPU_IASha256) {
+        $iaHash = (Get-FileHash $IPU_IAExe -Algorithm SHA256).Hash
+        if ($iaHash -ne $IPU_IASha256) {
+            Write-Output "Installation Assistant hash mismatch. Expected $IPU_IASha256 got $iaHash"
+            Remove-Item $IPU_IAExe -Force -ErrorAction SilentlyContinue
+            Set-Status "FAILED IA_HASH $iaStamp"
+            return
+        }
+        Write-Output "Installation Assistant hash verified."
+    }
+    # Run to completion and wait. /NoReboot stages the upgrade without restarting,
+    # so the reboot is deferred to the caller exactly like the ISO path. We never
+    # auto-reboot here. ( /NoRestartUI is deliberately NOT used: as SYSTEM it forces
+    # an immediate silent restart, which is the opposite of what we want. )
+    try {
+        $iaProc = Start-Process -FilePath $IPU_IAExe -ArgumentList $IPU_IAArgs -Wait -PassThru
+        $iaCode = $iaProc.ExitCode
+        Write-Output "Installation Assistant exited with code $iaCode."
+        if ($iaCode -eq 0 -or $iaCode -eq 3010) {
+            Set-Status "REBOOT_REQUIRED IA $iaStamp"
+        } else {
+            Set-Status "FAILED IA_EXIT $iaCode $iaStamp"
+        }
+    } catch {
+        Write-Output "Installation Assistant launch failed: $_"
+        Set-Status "FAILED IA_LAUNCH $iaStamp"
+    }
+}
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
 if (-not (Test-Path $IPU_LogDir))  { New-Item -ItemType Directory -Path $IPU_LogDir  -Force | Out-Null }
@@ -535,6 +601,16 @@ Set-Status "RUNNING $stamp"
 Start-Transcript -Path (Join-Path $IPU_LogDir "ipu_runner.log") -Append -Force | Out-Null
 
 $cancel = $false
+
+# Edition routing: the consumer ISO has no Enterprise SKU, so an Enterprise
+# composition cannot be matched (setup blocks with 0xC1900204). Hand off to the
+# Installation Assistant, which pulls the edition-correct image from Microsoft.
+$IPU_CompEd = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).CompositionEditionID
+if ($IPU_CompEd -match 'Enterprise') {
+    Write-Output "Composition edition is '$IPU_CompEd'; the local ISO cannot serve it."
+    Invoke-IPUInstallationAssistant -Reason "composition edition $IPU_CompEd"
+    $cancel = $true
+}
 
 # ISO download with partial-file detection
 $NeedDownload = $true
@@ -628,7 +704,7 @@ if (-not $cancel) {
         switch ($IPU_ExitCode) {
             0           { Set-Status "REBOOT_REQUIRED 3010 $done" }
             3010        { Set-Status "REBOOT_REQUIRED 3010 $done" }
-            -1047526908 { Set-Status "BLOCK_MIGCHOICE 0xC1900204 $done" }
+            -1047526908 { Invoke-IPUInstallationAssistant -Reason "0xC1900204 edition/migchoice block" }
             -1047527167 { Set-Status "BLOCK_HARD_COMPAT 0xC1900101 $done" }
             -1047526904 { Set-Status "BLOCK_APP_DRIVER 0xC1900208 $done" }
             -1047526912 { Set-Status "BLOCK_MIN_REQ 0xC1900200 $done" }
