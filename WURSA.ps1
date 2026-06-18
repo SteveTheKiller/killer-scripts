@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.3
-    Developed by Steve the Killer | Updated: 2026-06-17
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.4
+    Developed by Steve the Killer | Updated: 2026-06-18
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
@@ -27,16 +27,18 @@
       10   - IPU hard driver/compat block (0xC1900101)
       11   - IPU app/driver compat block (0xC1900208)
       12   - IPU machine does not meet minimum requirements (0xC1900200)
-      13   - IPU migration choice block (0xC1900204); language or edition mismatch, now routed to the Installation Assistant
+      13   - IPU migration choice block (0xC1900204); routed to the Installation Assistant, then Windows Update if that cannot serve the box
 
     Note: When the feature upgrade is dispatched it runs detached as SYSTEM, so its
     result is written to ipu_status.txt rather than returned as this script's exit
-    code. Status strings: REBOOT_REQUIRED (reboot to finish; covers both the ISO
-    path and the Installation Assistant, which stages with /NoReboot and never
-    auto-restarts), RUNNING IA_INPROGRESS (Assistant still working), BLOCK_HARD_COMPAT,
-    BLOCK_APP_DRIVER, BLOCK_MIN_REQ, and FAILED * for download/hash/mount/launch/exit
-    failures. Only REBOOT_REQUIRED should trigger a reboot, and the reboot is always
-    left to the caller. Poll that file from the RMM to determine when to reboot.
+    code. Status strings: REBOOT_REQUIRED (reboot to finish; ISO or Installation
+    Assistant, both stage with /NoReboot and never auto-restart), WU_HANDOFF (handed
+    to Windows Update - Enterprise composition, ARM64, a non-hosted UI language, or
+    the Assistant could not complete; nothing is staged, do NOT reboot from this),
+    RUNNING IA_INPROGRESS (Assistant still working), BLOCK_LTSC (LTSC/LTSB, not
+    feature-upgraded this way), BLOCK_HARD_COMPAT, BLOCK_APP_DRIVER, BLOCK_MIN_REQ,
+    and FAILED * for hash/mount failures. Only REBOOT_REQUIRED should trigger a
+    reboot, and the reboot is always left to the caller. Poll that file from the RMM.
 #>
 param(
     [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt
@@ -44,7 +46,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.3"
+$_ver    = "| v2.4"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -575,7 +577,7 @@ function Invoke-IPUInstallationAssistant {
             Invoke-WebRequest -Uri $IPU_IAUrl -OutFile $IPU_IAExe -UseBasicParsing
         } catch {
             Write-Output "Installation Assistant download failed: $_"
-            Set-Status "FAILED IA_DOWNLOAD $iaStamp"
+            Invoke-IPUWindowsUpdate -Reason "Assistant download failed"
             return
         }
     }
@@ -600,12 +602,31 @@ function Invoke-IPUInstallationAssistant {
         if ($iaCode -eq 0 -or $iaCode -eq 3010) {
             Set-Status "REBOOT_REQUIRED IA $iaStamp"
         } else {
-            Set-Status "FAILED IA_EXIT $iaCode $iaStamp"
+            Write-Output "Installation Assistant could not complete (exit $iaCode); falling back to Windows Update."
+            Invoke-IPUWindowsUpdate -Reason "Assistant exit $iaCode"
         }
     } catch {
         Write-Output "Installation Assistant launch failed: $_"
-        Set-Status "FAILED IA_LAUNCH $iaStamp"
+        Invoke-IPUWindowsUpdate -Reason "Assistant launch failed"
     }
+}
+function Invoke-IPUWindowsUpdate {
+    # Universal last-resort path. Windows Update is edition- and language-aware and is
+    # the only mechanism that upgrades Enterprise composition and ARM64. It does not
+    # stage locally and WU controls the timing, so clear any pause, nudge a scan, and
+    # flag it. No reboot flag is set because nothing is staged.
+    param([string]$Reason)
+    $wuStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Output "Handing off to Windows Update ($Reason)."
+    $uxk = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+    if (Test-Path $uxk) {
+        foreach ($pn in 'PauseUpdatesExpiryTime','PauseUpdatesStartTime','PauseFeatureUpdatesStartTime','PauseFeatureUpdatesEndTime','PauseQualityUpdatesStartTime','PauseQualityUpdatesEndTime') {
+            Remove-ItemProperty -Path $uxk -Name $pn -ErrorAction SilentlyContinue
+        }
+    }
+    Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
+    Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
+    Set-Status "WU_HANDOFF $wuStamp"
 }
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
@@ -617,15 +638,45 @@ Start-Transcript -Path (Join-Path $IPU_LogDir "ipu_runner.log") -Append -Force |
 
 $cancel = $false
 
-# Edition routing: the consumer ISO has no Enterprise SKU, so an Enterprise
-# composition cannot be matched (setup blocks with 0xC1900204). Hand off to the
-# Installation Assistant, which pulls the edition-correct image from Microsoft.
-$IPU_CompEd = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).CompositionEditionID
-if ($IPU_CompEd -match 'Enterprise') {
-    Write-Output "Composition edition is '$IPU_CompEd'; the local ISO cannot serve it."
-    Invoke-IPUInstallationAssistant -Reason "composition edition $IPU_CompEd"
+# Universal routing: pick a mechanism that can actually serve THIS box. WURSA runs
+# worldwide, so the device may be any architecture, edition, or UI language. The
+# local ISO only covers x64 + retail editions + the languages we host (en-US/en-GB).
+#   ARM64                  -> Windows Update (x64 ISO and x64-only Assistant cannot run)
+#   LTSC / LTSB            -> skip and report (not feature-upgraded this way)
+#   Enterprise composition -> Windows Update (no retail media carries Enterprise)
+#   non-hosted UI language -> Installation Assistant (MS serves matching language+edition)
+#   hosted language, retail-> the local ISO below
+# The Assistant itself falls back to Windows Update if it cannot serve the box.
+$IPU_CV      = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+$IPU_CompEd  = $IPU_CV.CompositionEditionID
+$IPU_EdId    = $IPU_CV.EditionID
+$IPU_Prod    = $IPU_CV.ProductName
+$IPU_RunLang = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction SilentlyContinue).InstallLanguage
+$IPU_IsArm   = ($env:PROCESSOR_ARCHITECTURE -match 'ARM') -or ($env:PROCESSOR_ARCHITEW6432 -match 'ARM')
+$IPU_IsLtsc  = ($IPU_EdId -match 'EnterpriseS|IoTEnterpriseS') -or ($IPU_Prod -match 'LTSC|LTSB')
+$IPU_Hosted  = ($IPU_RunLang -eq '0409' -or $IPU_RunLang -eq '0809')
+
+if ($IPU_IsLtsc) {
+    Write-Output "Edition '$IPU_EdId' ($IPU_Prod) is LTSC/LTSB; not feature-upgraded this way. Skipping for manual handling."
+    Set-Status "BLOCK_LTSC $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     $cancel = $true
 }
+elseif ($IPU_IsArm) {
+    Write-Output "ARM64 device; the x64 ISO and Installation Assistant cannot run here."
+    Invoke-IPUWindowsUpdate -Reason "ARM64"
+    $cancel = $true
+}
+elseif ($IPU_CompEd -match 'Enterprise') {
+    Write-Output "Composition edition '$IPU_CompEd'; no retail media (ISO or Assistant) carries Enterprise."
+    Invoke-IPUWindowsUpdate -Reason "composition $IPU_CompEd"
+    $cancel = $true
+}
+elseif (-not $IPU_Hosted) {
+    Write-Output "UI language '$IPU_RunLang' is not one we host an ISO for; using the Installation Assistant."
+    Invoke-IPUInstallationAssistant -Reason "non-hosted language $IPU_RunLang"
+    $cancel = $true
+}
+# else: hosted language + retail edition -> fall through to the ISO path below
 
 # ISO download with partial-file detection
 $NeedDownload = $true
