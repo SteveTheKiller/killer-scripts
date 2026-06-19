@@ -670,6 +670,41 @@ function Set-WUUpgradeOverrides {
     Write-Output "Cleared NoAutoUpdate and pinned active hours $IPU_ActiveHoursStart-$IPU_ActiveHoursEnd so WU can deliver and reboot out of hours (originals recorded)."
 }
 
+function Invoke-IPUStaleCleanup {
+    # Clear anything a prior aborted attempt left behind: orphaned setup processes,
+    # mounted media (which pile up FsDepends/WIMMount filter instances), and setup
+    # scratch folders. Any of these can lock files during the next downlevel finalize
+    # and produce a 0xC1900101 sharing-violation failure, or leave a stale ~BT that
+    # misleads Windows Update. Scoped to our work dir so an unrelated admin-mounted
+    # image is never touched. Runs before routing, so every path (WU, Assistant, ISO)
+    # starts from a clean state.
+    Write-Output "Clearing stale upgrade state..."
+    foreach ($pname in 'setup','setuphost','setupprep','setupplatform') {
+        Get-Process -Name $pname -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Output "  Stopping leftover process: $($_.Name) (PID $($_.Id))"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Get-CimInstance -Namespace 'root\Microsoft\Windows\Storage' -ClassName 'MSFT_DiskImage' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Attached -and $_.ImagePath -like "$IPU_WorkDir\*" } |
+        ForEach-Object {
+            try {
+                Dismount-DiskImage -ImagePath $_.ImagePath -ErrorAction Stop | Out-Null
+                Write-Output "  Dismounted stale image: $($_.ImagePath)"
+            } catch {
+                Write-Output "  WARN: could not dismount $($_.ImagePath): $_"
+            }
+        }
+    foreach ($d in "$env:SystemDrive\`$WINDOWS.~BT","$env:SystemDrive\`$WINDOWS.~WS","$env:SystemDrive\`$WINDOWS.~Q") {
+        if (Test-Path -LiteralPath $d) {
+            Write-Output "  Removing setup scratch: $d"
+            Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $d) { cmd /c "rd /s /q `"$d`"" 2>$null }
+        }
+    }
+    Write-Output "Stale state cleanup complete."
+}
+
 function Invoke-IPUWindowsUpdate {
     # Universal last-resort path. Windows Update is edition- and language-aware and is
     # the only mechanism that upgrades Enterprise composition and ARM64. It does not
@@ -696,6 +731,11 @@ $IPU_LegacyIso = Join-Path $IPU_WorkDir "Win11_25H2_x64.iso"
 if (Test-Path $IPU_LegacyIso) { Remove-Item $IPU_LegacyIso -Force -ErrorAction SilentlyContinue }
 Set-Status "RUNNING $stamp"
 Start-Transcript -Path (Join-Path $IPU_LogDir "ipu_runner.log") -Append -Force | Out-Null
+
+# Hygiene first: clear stale setup scratch / processes / mounts a prior aborted run
+# left behind, so it cannot lock files at finalize or leave a stale ~BT that misleads
+# Windows Update. Runs ahead of routing, so it benefits the WU, Assistant and ISO paths.
+Invoke-IPUStaleCleanup
 
 $cancel = $false
 
