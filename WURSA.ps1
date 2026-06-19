@@ -34,7 +34,9 @@
     code. Status strings: REBOOT_REQUIRED (reboot to finish; ISO or Installation
     Assistant, both stage with /NoReboot and never auto-restart), WU_HANDOFF (handed
     to Windows Update - Enterprise composition, ARM64, a non-hosted UI language, or
-    the Assistant could not complete; nothing is staged, do NOT reboot from this),
+    the Assistant could not complete; nothing is staged, do NOT reboot from this. The
+    handoff clears a NoAutoUpdate lock and pins active hours so WU can deliver, and
+    restores both once on the latest build),
     RUNNING IA_INPROGRESS (Assistant still working), BLOCK_LTSC (LTSC/LTSB, not
     feature-upgraded this way), BLOCK_HARD_COMPAT, BLOCK_APP_DRIVER, BLOCK_MIN_REQ,
     and FAILED * for hash/mount failures. Only REBOOT_REQUIRED should trigger a
@@ -482,6 +484,9 @@ $IPU_SetupLog   = Join-Path $IPU_WorkDir "setup_exit.log"
 $IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
 $IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
 $IPU_TaskName   = "WURSA-25H2-IPU"
+$IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
+$IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
+$IPU_ActiveHoursEnd   = 19
 
 # Installation Assistant fallback (online, edition-correct). The local ISO is a
 # consumer image with no Enterprise SKU, so an Enterprise-composition box fails the
@@ -490,6 +495,28 @@ $IPU_TaskName   = "WURSA-25H2-IPU"
 # is optional (leave empty to skip).
 $IPU_IAUrl      = "https://iso.killertools.net/Windows11InstallationAssistant.exe"
 $IPU_IASha256   = ""
+
+function Restore-WUUpgradeOverrides {
+    # Runs in the MAIN script (not the detached runner), when the box is found already
+    # on the latest build. Undoes Set-WUUpgradeOverrides: each value is put back exactly,
+    # or removed if it did not exist before. The runner only ever sets the overrides;
+    # the main script is what restores them.
+    if (-not (Test-Path $IPU_AURestoreFile)) { return }
+    $polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auk  = "$polk\AU"
+    $map  = @{}
+    foreach ($line in (Get-Content $IPU_AURestoreFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^([^=]+)=(.+)$') { $map[$matches[1]] = $matches[2] }
+    }
+    $targets = @{ NoAutoUpdate = $auk; SetActiveHours = $polk; ActiveHoursStart = $polk; ActiveHoursEnd = $polk }
+    foreach ($name in @($targets.Keys)) {
+        $key = $targets[$name]; $orig = $map[$name]
+        if ($null -eq $orig -or $orig -eq 'ABSENT') { Remove-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue }
+        else { Set-ItemProperty -Path $key -Name $name -Value ([int]$orig) -Type DWord -Force }
+    }
+    Remove-Item $IPU_AURestoreFile -Force -ErrorAction SilentlyContinue
+    Write-Host "      Restored original Windows Update policy values (auto-update and active hours)." -ForegroundColor $DimCol
+}
 
 Write-HLine -Style dashed
 Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
@@ -549,6 +576,9 @@ if ($NoUpgrade) {
 `$IPU_IsoSha256  = '$IPU_IsoSha256'
 `$IPU_IAUrl     = '$IPU_IAUrl'
 `$IPU_IASha256  = '$IPU_IASha256'
+`$IPU_AURestoreFile    = '$IPU_AURestoreFile'
+`$IPU_ActiveHoursStart = $IPU_ActiveHoursStart
+`$IPU_ActiveHoursEnd   = $IPU_ActiveHoursEnd
 "@
 
         # Runner body (single-quoted here-string: written verbatim, runs later).
@@ -610,6 +640,36 @@ function Invoke-IPUInstallationAssistant {
         Invoke-IPUWindowsUpdate -Reason "Assistant launch failed"
     }
 }
+function Set-WUUpgradeOverrides {
+    # Bypass with reboot protection. Some boxes can only upgrade through Windows Update
+    # (Enterprise composition, ARM64), but a NoAutoUpdate=1 policy stops WU from ever
+    # delivering the feature update. Clear it and pin active hours so the WU-driven
+    # reboot lands out of hours. Originals are recorded and restored once the box is on
+    # the latest build; an enforced policy also self-reverts, and each run re-opens the
+    # window until the upgrade lands.
+    $polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auk  = "$polk\AU"
+    if (-not (Test-Path $polk)) { New-Item -Path $polk -Force | Out-Null }
+    if (-not (Test-Path $auk))  { New-Item -Path $auk  -Force | Out-Null }
+    if (-not (Test-Path $IPU_AURestoreFile)) {
+        $noAuto = (Get-ItemProperty -Path $auk  -Name NoAutoUpdate     -ErrorAction SilentlyContinue).NoAutoUpdate
+        $setAH  = (Get-ItemProperty -Path $polk -Name SetActiveHours   -ErrorAction SilentlyContinue).SetActiveHours
+        $ahS    = (Get-ItemProperty -Path $polk -Name ActiveHoursStart -ErrorAction SilentlyContinue).ActiveHoursStart
+        $ahE    = (Get-ItemProperty -Path $polk -Name ActiveHoursEnd   -ErrorAction SilentlyContinue).ActiveHoursEnd
+        @(
+            "NoAutoUpdate=$(if ($null -eq $noAuto) {'ABSENT'} else {$noAuto})"
+            "SetActiveHours=$(if ($null -eq $setAH) {'ABSENT'} else {$setAH})"
+            "ActiveHoursStart=$(if ($null -eq $ahS) {'ABSENT'} else {$ahS})"
+            "ActiveHoursEnd=$(if ($null -eq $ahE) {'ABSENT'} else {$ahE})"
+        ) | Set-Content -Path $IPU_AURestoreFile -Encoding ASCII -Force
+    }
+    Set-ItemProperty -Path $auk  -Name NoAutoUpdate     -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $polk -Name SetActiveHours   -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $polk -Name ActiveHoursStart -Value $IPU_ActiveHoursStart -Type DWord -Force
+    Set-ItemProperty -Path $polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
+    Write-Output "Cleared NoAutoUpdate and pinned active hours $IPU_ActiveHoursStart-$IPU_ActiveHoursEnd so WU can deliver and reboot out of hours (originals recorded)."
+}
+
 function Invoke-IPUWindowsUpdate {
     # Universal last-resort path. Windows Update is edition- and language-aware and is
     # the only mechanism that upgrades Enterprise composition and ARM64. It does not
@@ -624,6 +684,7 @@ function Invoke-IPUWindowsUpdate {
             Remove-ItemProperty -Path $uxk -Name $pn -ErrorAction SilentlyContinue
         }
     }
+    Set-WUUpgradeOverrides
     Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
     Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
     Set-Status "WU_HANDOFF $wuStamp"
@@ -806,6 +867,7 @@ schtasks.exe /Delete /TN "$IPU_TaskName" /F | Out-Null
     }
 } else {
     Write-Host "      System is already on the latest feature update." -ForegroundColor Green
+    Restore-WUUpgradeOverrides
 }
 #endregion
 
