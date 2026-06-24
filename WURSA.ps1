@@ -3,50 +3,17 @@
     Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.5
     Developed by Steve the Killer | Updated: 2026-06-24
 .DESCRIPTION
-    Enforces all essential and optional OS patches, OEM driver updates, and third-party
-    app upgrades via Chocolatey. Skips apps that are currently in use to avoid
-    disrupting the active user, and self-installs Chocolatey if not present. Performs
-    unattended Windows feature upgrades to 25H2, choosing the right path per box:
-    boxes already on 25H2 are skipped, 24H2 boxes take the small KB5054156 enablement
-    package, and Windows 10 plus older Windows 11 builds take an ISO-based in-place
-    upgrade (setup.exe). The work is dispatched to a detached SYSTEM scheduled task, so
-    the upgrade survives RMM / LiveConnect session disconnects. Includes BitLocker
-    suspension, component store repair, URL pre-flight, and partial download detection.
-    Reboot is always deferred to the caller.
+    Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
+    (skips in-use apps). Performs unattended feature upgrades to 25H2, dispatched to a
+    detached SYSTEM task so it survives RMM / LiveConnect disconnects: 24H2 takes the
+    KB5054156 eKB, Windows 10 and older Windows 11 take the ISO. Reboot is deferred to
+    the caller.
 .NOTES
-    Parameters:
-      -InplaceUpgrade  Auto-confirms the feature upgrade prompt. Safe for unattended/RMM use.
-                       Dispatches the ISO-based setup.exe upgrade to a detached SYSTEM
-                       scheduled task; the WURSA run returns immediately and the upgrade
-                       continues independently. Progress/result is written to
-                       C:\Windows\Temp\25H2IPU\ipu_status.txt. BitLocker is suspended.
-      -No3rdParty      Skips the Chocolatey third-party app update pass entirely.
-      -NoUpgrade       Skips the feature version check and upgrade prompt entirely.
-
-    Exit Codes:
-      0    - Completed successfully, no reboot required
-      3010 - Completed successfully, reboot required
-      1    - Script terminated due to an unhandled error
-      10   - IPU hard driver/compat block (0xC1900101)
-      11   - IPU app/driver compat block (0xC1900208)
-      12   - IPU machine does not meet minimum requirements (0xC1900200)
-      13   - IPU migration choice block (0xC1900204); routed to the Installation Assistant, then Windows Update if that cannot serve the box
-
-    Note: When the feature upgrade is dispatched it runs detached as SYSTEM, so its
-    result is written to ipu_status.txt rather than returned as this script's exit
-    code. Status strings: REBOOT_REQUIRED (reboot to finish; ISO or Installation
-    Assistant, both stage with /NoReboot and never auto-restart), WU_HANDOFF (handed
-    to Windows Update - Enterprise composition, ARM64, a non-hosted UI language, or
-    the Assistant could not complete; nothing is staged, do NOT reboot from this. The
-    handoff clears a NoAutoUpdate lock and pins active hours so WU can deliver, and
-    restores both once on the latest build),
-    RUNNING IA_INPROGRESS (Assistant still working), REPAIRING (DISM/SFC repairing the
-    component store before a retry), BLOCK_LTSC (LTSC/LTSB, not
-    feature-upgraded this way), BLOCK_HARD_COMPAT, BLOCK_APP_DRIVER, BLOCK_MIN_REQ,
-    and FAILED * for hash/mount failures. Only REBOOT_REQUIRED should trigger a
-    reboot, and the reboot is always left to the caller. Poll that file from the RMM.
-    Upgrade path is chosen by build: 26200+ already 25H2 (skipped); 26100 is 24H2 and
-    takes the KB5054156 enablement package; Windows 10 and older Windows 11 take the ISO.
+    Params: -InplaceUpgrade (auto-confirm, unattended/RMM), -No3rdParty, -NoUpgrade.
+    Feature-upgrade result is written to C:\Windows\Temp\25H2IPU\ipu_status.txt; poll it.
+    Status: REBOOT_REQUIRED (staged, reboot to finish), WU_HANDOFF (handed to Windows
+    Update, nothing staged, do NOT reboot), REPAIRING, BLOCK_* (manual), FAILED_*.
+    Only REBOOT_REQUIRED should trigger a reboot, always left to the caller.
 #>
 param(
     [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt
