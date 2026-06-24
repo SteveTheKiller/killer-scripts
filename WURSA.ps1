@@ -1,15 +1,18 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.4
-    Developed by Steve the Killer | Updated: 2026-06-18
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.5
+    Developed by Steve the Killer | Updated: 2026-06-24
 .DESCRIPTION
     Enforces all essential and optional OS patches, OEM driver updates, and third-party
     app upgrades via Chocolatey. Skips apps that are currently in use to avoid
     disrupting the active user, and self-installs Chocolatey if not present. Performs
-    unattended Windows feature upgrades via an ISO-based in-place upgrade (setup.exe)
-    dispatched to a detached SYSTEM scheduled task, so the upgrade survives RMM /
-    LiveConnect session disconnects. Includes BitLocker suspension, URL pre-flight,
-    and partial download detection. Reboot is always deferred to the caller.
+    unattended Windows feature upgrades to 25H2, choosing the right path per box:
+    boxes already on 25H2 are skipped, 24H2 boxes take the small KB5054156 enablement
+    package, and Windows 10 plus older Windows 11 builds take an ISO-based in-place
+    upgrade (setup.exe). The work is dispatched to a detached SYSTEM scheduled task, so
+    the upgrade survives RMM / LiveConnect session disconnects. Includes BitLocker
+    suspension, component store repair, URL pre-flight, and partial download detection.
+    Reboot is always deferred to the caller.
 .NOTES
     Parameters:
       -InplaceUpgrade  Auto-confirms the feature upgrade prompt. Safe for unattended/RMM use.
@@ -37,10 +40,13 @@
     the Assistant could not complete; nothing is staged, do NOT reboot from this. The
     handoff clears a NoAutoUpdate lock and pins active hours so WU can deliver, and
     restores both once on the latest build),
-    RUNNING IA_INPROGRESS (Assistant still working), BLOCK_LTSC (LTSC/LTSB, not
+    RUNNING IA_INPROGRESS (Assistant still working), REPAIRING (DISM/SFC repairing the
+    component store before a retry), BLOCK_LTSC (LTSC/LTSB, not
     feature-upgraded this way), BLOCK_HARD_COMPAT, BLOCK_APP_DRIVER, BLOCK_MIN_REQ,
     and FAILED * for hash/mount failures. Only REBOOT_REQUIRED should trigger a
     reboot, and the reboot is always left to the caller. Poll that file from the RMM.
+    Upgrade path is chosen by build: 26200+ already 25H2 (skipped); 26100 is 24H2 and
+    takes the KB5054156 enablement package; Windows 10 and older Windows 11 take the ISO.
 #>
 param(
     [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt
@@ -48,7 +54,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.4"
+$_ver    = "| v2.5"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -488,6 +494,12 @@ $IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
 $IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
 $IPU_ActiveHoursEnd   = 19
 
+# 24H2 (26100) -> 25H2 enablement package (KB5054156). x64 only; host MSU in killer-isos bucket.
+$IPU_EkbName    = "Win11_25H2_eKB_KB5054156_x64.msu"
+$IPU_EkbUrl     = "https://iso.killertools.net/$IPU_EkbName"
+$IPU_EkbSha256  = "92EDDA7EEAA19B60D15CCDF777556BF0662EE9FEA1DCC9AEC281FCF12068044C"
+$IPU_EkbPath    = Join-Path $IPU_WorkDir $IPU_EkbName
+
 # Installation Assistant fallback (online, edition-correct). The local ISO is a
 # consumer image with no Enterprise SKU, so an Enterprise-composition box fails the
 # ISO match with 0xC1900204. The Assistant pulls the matching edition straight from
@@ -579,6 +591,9 @@ if ($NoUpgrade) {
 `$IPU_AURestoreFile    = '$IPU_AURestoreFile'
 `$IPU_ActiveHoursStart = $IPU_ActiveHoursStart
 `$IPU_ActiveHoursEnd   = $IPU_ActiveHoursEnd
+`$IPU_EkbUrl     = '$IPU_EkbUrl'
+`$IPU_EkbSha256  = '$IPU_EkbSha256'
+`$IPU_EkbPath    = '$IPU_EkbPath'
 "@
 
         # Runner body (single-quoted here-string: written verbatim, runs later).
@@ -724,6 +739,57 @@ function Invoke-IPUWindowsUpdate {
     Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
     Set-Status "WU_HANDOFF $wuStamp"
 }
+function Invoke-IPUComponentRepair {
+    # Repair component store (StartComponentCleanup, RestoreHealth, SFC). Fixes 0xC1900204 / eKB apply failures. Needs internet.
+    Set-Status "REPAIRING $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Write-Output "Repairing component store (DISM StartComponentCleanup, RestoreHealth, SFC)..."
+    try { & dism.exe /Online /Cleanup-Image /StartComponentCleanup | Out-Null } catch {}
+    try { & dism.exe /Online /Cleanup-Image /RestoreHealth        | Out-Null } catch {}
+    try { & sfc.exe /scannow                                       | Out-Null } catch {}
+    Write-Output "Component store repair complete."
+}
+function Invoke-IPUEnablementPackage {
+    # 24H2 (26100) -> 25H2 via KB5054156 eKB. Apply, repair+retry once, else WU fallback. x64 only.
+    Write-Output "24H2 detected (build 26100). Applying the 25H2 enablement package (KB5054156)."
+    try {
+        $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+        if ($bl -and $bl.ProtectionStatus -eq 'On') { Suspend-BitLocker -MountPoint "C:" -RebootCount 2 -ErrorAction Stop; Write-Output "BitLocker suspended for the eKB reboot." }
+    } catch { Write-Output "BitLocker suspension failed: $($_.Exception.Message)" }
+
+    Set-Status "DOWNLOADING $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    if (Test-Path $IPU_EkbPath) { Remove-Item $IPU_EkbPath -Force -ErrorAction SilentlyContinue }
+    $ekOK = $true
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $IPU_EkbUrl -OutFile $IPU_EkbPath -UseBasicParsing -TimeoutSec 180
+    } catch { Write-Output "eKB download failed from $IPU_EkbUrl : $_"; $ekOK = $false }
+    if ($ekOK -and $IPU_EkbSha256) {
+        $h = (Get-FileHash $IPU_EkbPath -Algorithm SHA256).Hash
+        if ($h -ne $IPU_EkbSha256) { Write-Output "eKB hash mismatch. Expected $IPU_EkbSha256 got $h."; Remove-Item $IPU_EkbPath -Force -ErrorAction SilentlyContinue; $ekOK = $false }
+        else { Write-Output "eKB hash verified." }
+    }
+    if ($ekOK) {
+        $codes = @()
+        for ($t = 1; $t -le 2; $t++) {
+            Write-Output "Applying eKB via wusa (attempt $t of 2)..."
+            $wp = Start-Process -FilePath "$env:SystemRoot\System32\wusa.exe" -ArgumentList "`"$IPU_EkbPath`" /quiet /norestart" -Wait -PassThru
+            $ec = $wp.ExitCode
+            $codes += ("0x{0:X}" -f $ec)
+            "wusa exit code: $ec (0x$('{0:X}' -f $ec))" | Out-File -FilePath $IPU_SetupLog -Encoding ASCII
+            # 0 = applied; 3010 = applied, reboot required; 0x240006 (2359302) = already installed
+            if ($ec -eq 0 -or $ec -eq 3010 -or $ec -eq 2359302) {
+                Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                Write-Output "eKB applied (exit $($codes[-1])). Reboot to finish 25H2."
+                return
+            }
+            if ($t -eq 1) { Write-Output "eKB apply returned $($codes[-1]). Repairing component store and retrying once."; Invoke-IPUComponentRepair }
+        }
+        Write-Output "eKB did not apply after repair and retry (codes: $($codes -join ', ')). Handing off to Windows Update."
+    } else {
+        Write-Output "eKB not available locally. Handing off to Windows Update (it delivers prerequisite CUs and the 25H2 feature update)."
+    }
+    Invoke-IPUWindowsUpdate -Reason "24H2 eKB unavailable or failed"
+}
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
 if (-not (Test-Path $IPU_LogDir))  { New-Item -ItemType Directory -Path $IPU_LogDir  -Force | Out-Null }
@@ -740,18 +806,20 @@ Invoke-IPUStaleCleanup
 $cancel = $false
 
 # Universal routing: pick a mechanism that can actually serve THIS box. WURSA runs
-# worldwide, so the device may be any architecture, edition, or UI language. The
-# local ISO only covers x64 + retail editions + the languages we host (en-US/en-GB).
-#   ARM64                  -> Windows Update (x64 ISO and x64-only Assistant cannot run)
+# worldwide, so the device may be any architecture, edition, UI language, or build.
+# The local ISO only covers x64 + retail editions + the languages we host (en-US/en-GB).
 #   LTSC / LTSB            -> skip and report (not feature-upgraded this way)
-#   Enterprise composition -> Windows Update (no retail media carries Enterprise)
+#   ARM64                  -> Windows Update (x64 ISO and x64-only Assistant cannot run)
+#   24H2 x64 (build 26100) -> KB5054156 enablement package (light, one reboot)
+#   Enterprise             -> Windows Update (no retail media carries Enterprise)
 #   non-hosted UI language -> Installation Assistant (MS serves matching language+edition)
-#   hosted language, retail-> the local ISO below
+#   hosted language, retail-> the local ISO below (covers Win10 and older Win11 x64)
 # The Assistant itself falls back to Windows Update if it cannot serve the box.
 $IPU_CV      = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
 $IPU_CompEd  = $IPU_CV.CompositionEditionID
 $IPU_EdId    = $IPU_CV.EditionID
 $IPU_Prod    = $IPU_CV.ProductName
+$IPU_Build   = [int]$IPU_CV.CurrentBuild
 $IPU_RunLang = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction SilentlyContinue).InstallLanguage
 $IPU_IsArm   = ($env:PROCESSOR_ARCHITECTURE -match 'ARM') -or ($env:PROCESSOR_ARCHITEW6432 -match 'ARM')
 $IPU_IsLtsc  = ($IPU_EdId -match 'EnterpriseS|IoTEnterpriseS') -or ($IPU_Prod -match 'LTSC|LTSB')
@@ -767,9 +835,14 @@ elseif ($IPU_IsArm) {
     Invoke-IPUWindowsUpdate -Reason "ARM64"
     $cancel = $true
 }
-elseif ($IPU_CompEd -match 'Enterprise') {
-    Write-Output "Composition edition '$IPU_CompEd'; no retail media (ISO or Assistant) carries Enterprise."
-    Invoke-IPUWindowsUpdate -Reason "composition $IPU_CompEd"
+elseif ($IPU_Build -eq 26100) {
+    # 24H2 (x64, since ARM was handled above): take the enablement package, not the ISO.
+    Invoke-IPUEnablementPackage
+    $cancel = $true
+}
+elseif ($IPU_EdId -match 'Enterprise') {
+    Write-Output "Edition '$IPU_EdId'; no retail media (ISO or Assistant) carries Enterprise."
+    Invoke-IPUWindowsUpdate -Reason "edition $IPU_EdId"
     $cancel = $true
 }
 elseif (-not $IPU_Hosted) {
@@ -860,18 +933,32 @@ if (-not $cancel) {
 
         $SetupArgs = "/auto upgrade /quiet /compat ignorewarning /DynamicUpdate disable /showoobe None /Telemetry Disable /EULA Accept /noreboot /Copylogs `"$IPU_LogDir`""
         $IPU_ExitCode = -1
-        try {
-            $proc = Start-Process -FilePath $SetupExe -ArgumentList $SetupArgs -Wait -PassThru
-            $IPU_ExitCode = $proc.ExitCode
-        } catch { Write-Output "setup.exe failed to launch: $_" }
-        "setup.exe exit code: $IPU_ExitCode" | Out-File -FilePath $IPU_SetupLog -Encoding ASCII
+        $storeRepaired = $false
+        for ($setupTry = 1; $setupTry -le 2; $setupTry++) {
+            Write-Output "Launching Windows Setup (downlevel phase, attempt $setupTry of 2)..."
+            $IPU_ExitCode = -1
+            try {
+                $proc = Start-Process -FilePath $SetupExe -ArgumentList $SetupArgs -Wait -PassThru
+                $IPU_ExitCode = $proc.ExitCode
+            } catch { Write-Output "setup.exe failed to launch: $_" }
+            "setup.exe exit code: $IPU_ExitCode" | Out-File -FilePath $IPU_SetupLog -Encoding ASCII
+            if ($IPU_ExitCode -eq 0 -or $IPU_ExitCode -eq 3010) { break }
+            # 0xC1900204 with matched edition/language = corrupt store, not a real block. Repair once and retry.
+            if ($IPU_ExitCode -eq -1047526908 -and -not $storeRepaired -and $setupTry -lt 2) {
+                Write-Output "0xC1900204 with matched edition/language: repairing component store and retrying."
+                Invoke-IPUComponentRepair
+                $storeRepaired = $true
+                continue
+            }
+            break
+        }
         Dismount-DiskImage -ImagePath $IPU_IsoPath -ErrorAction SilentlyContinue
 
         $done = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         switch ($IPU_ExitCode) {
             0           { Set-Status "REBOOT_REQUIRED 3010 $done" }
             3010        { Set-Status "REBOOT_REQUIRED 3010 $done" }
-            -1047526908 { Invoke-IPUInstallationAssistant -Reason "0xC1900204 edition/migchoice block" }
+            -1047526908 { Invoke-IPUInstallationAssistant -Reason "0xC1900204 persists after store repair" }
             -1047527167 { Set-Status "BLOCK_HARD_COMPAT 0xC1900101 $done" }
             -1047526904 { Set-Status "BLOCK_APP_DRIVER 0xC1900208 $done" }
             -1047526912 { Set-Status "BLOCK_MIN_REQ 0xC1900200 $done" }
