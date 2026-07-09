@@ -1,10 +1,42 @@
 # killer-scripts
 
+> Production-ready PowerShell for Windows administration, deployment, repair, and hardening.
+
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)
+![License](https://img.shields.io/badge/License-GPLv3-blue)
+![Scripts](https://img.shields.io/badge/Scripts-18-brightgreen)
+
 A collection of production-ready PowerShell scripts for Windows administration, deployment, repair, and hardening. Most scripts require an elevated PowerShell session to function correctly. Scripts that enforce this automatically are noted in their headers. Most are compatible with RMM platforms for unattended execution.
 
 **Compatibility:** PowerShell 5.1, PowerShell 7, and Kaseya LiveConnect. No external dependencies unless noted in the script header. All scripts are tested on Windows 10 and Windows 11.
 
-Repository: <https://github.com/SteveTheKiller/killer-scripts>
+**Repository:** <https://github.com/SteveTheKiller/killer-scripts>
+
+---
+
+## Contents
+
+| Script | Description |
+| --- | --- |
+| [AMORT](#amortps1) | Advanced Windows tune-up for MSP field and remote support |
+| [BEAM](#beamps1) | Cloud-only Intune Win32 app deployer for pushing any installer to Entra-joined devices |
+| [BERET](#beretps1) | BitLocker lifecycle manager with TPM enforcement and AD / Entra ID key escrow |
+| [DEBLOAT](#debloatps1) | Windows 11 standardization removing OEM bloat, AI features, and telemetry |
+| [DEFEND](#defendps1) | Kernel-level security audit of TPM, Secure Boot, HVCI, and Defender |
+| [DEPOT](#depotps1) | New-machine provisioning with silent app deployment and hardening |
+| [FACTS](#factsps1) | Foxit PDF install audit and automatic update blocking |
+| [MACE](#maceps1) | Full removal of OneDrive, New Outlook, Office, M365, Project, and Teams |
+| [ODD](#oddps1) | Audio device inventory with categorization and driver reporting |
+| [ORCA](#orcaps1) | Outlook repair for New (Store) and Classic (Office / M365) editions |
+| [PRINT](#printps1) | Printer management, network discovery, and driver installation |
+| [PRUNE](#pruneps1) | User profile staleness analyzer and orphaned profile detector |
+| [SHADE](#shadeps1) | Privacy hardening removing telemetry, tracking, and advertising |
+| [STARE](#stareps1) | Scheduled Task creation wizard with flexible triggers |
+| [TICK](#tickps1) | Windows Time service resync and NTP peer validation |
+| [URT](#urtps1) | Local or domain-joined computer rename preserving AD trust |
+| [VITALS](#vitalsps1) | Hardware and network inventory snapshot with visual formatting |
+| [WURSA](#wursaps1) | Windows Update, driver, and third-party app enforcement via Chocolatey |
 
 ---
 
@@ -19,6 +51,22 @@ Runs a sequence of hardening and optimization tasks in a single pass. The script
 Key function Get-SystemData handles WMI to CIM compatibility by detecting PowerShell edition and using CIM for PS7 or WMI for earlier versions.
 
 RMM/Unattended support enabled. Safe to execute on systems with active users without intervention required. Exit code 0 on success.
+
+---
+
+## BEAM.ps1
+
+### Bulk Endpoint App Mover
+
+Cloud-only Intune Win32 app deployment tool for pushing any installer to Entra-joined devices.
+
+Packages any local or hosted .exe or .msi as an Intune Win32 app and deploys it to one or more Entra-joined devices as SYSTEM, with no LAN access and no stored credentials. Built for machines reachable only through the cloud, where an on-site install or a remote-control repair is not practical. Prompts for an installer source (a direct download URL, or press Enter to browse for a local file), an app name, a publisher, optional silent-install switches, the target hostnames, and a Global Admin sign-in. MSI packages default to /qn when no switches are given; EXE switches are passed through as entered. Sign-in uses an interactive browser prompt via authorization-code flow with PKCE and a loopback listener, so no code or URL pasting is required.
+
+Each run generates a unique run ID. The install runs the package, stamps the ID into a marker file, and the detection rule matches that ID, so each run installs exactly once per machine and never loops. Re-running deploys again. Detection is marker-based and does not inspect the app itself, which keeps it universal across any installer. Devices that are offline at deploy time install automatically on their next Intune check-in once they reconnect, as long as the app and its assignment group remain in place.
+
+Downloads the Microsoft Win32 Content Prep Tool automatically and stages all work under %LOCALAPPDATA%\BEAM. Requires a Global Admin or Intune Admin sign-in; first use in a new tenant needs one-time admin consent to the Graph permissions.
+
+Not intended for unattended RMM execution. The browser sign-in and loopback listener require an interactive session, and BEAM runs from the operator's own workstation rather than on the endpoint.
 
 ---
 
@@ -238,4 +286,4 @@ Enforces all essential and optional OS patches, OEM driver updates, and third-pa
 
 Includes support for Windows feature version upgrades with live heartbeat indicator showing installation progress, staged file size, and ESC-to-detach functionality. Safe for unattended and RMM execution via optional parameters.
 
-Parameters -InplaceUpgrade auto-confirms feature upgrade prompt for unattended use. Parameter -No3rdParty skips the Chocolatey third-party app update pass entirely. Parameter -NoUpgrade skips featu
+Parameters -InplaceUpgrade auto-confirms feature upgrade prompt for unattended use. Parameter -No3rdParty skips the Chocolatey third-party app update pass entirely. Parameter -NoUpgrade skips the feature version upgrade pass entirely.

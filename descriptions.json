@@ -3,6 +3,10 @@
     "name": "Advanced Maintenance, Optimization, and Repair Tool",
     "description": "Automated Windows 10/11 tune-up for MSP field and remote deployment."
   },
+  "BEAM.ps1": {
+    "name": "Bulk Endpoint App Mover",
+    "description": "Deploys any .exe or .msi to Entra-joined devices as an Intune Win32 app."
+  },
   "BERET.ps1": {
     "name": "BitLocker Encryption, Recovery, & Escrow Tool",
     "description": "Interactive BitLocker lifecycle manager with TPM enforcement and AD/Entra ID key escrow."
