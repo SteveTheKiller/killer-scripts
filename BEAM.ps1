@@ -224,6 +224,9 @@ function Select-FileBrowser {
 function Read-TargetsField {
     # Read-Host for the targets field, plus an [F] shortcut that opens the CSV browser. Falls back
     # to plain Read-Host on non-interactive/relayed consoles where key reading isn't available.
+    # A paste arrives as a burst of keystrokes, so a hostname list starting with F (FUNDPHX-...)
+    # would otherwise fire the file browser and the rest of the paste would drive it. F only counts
+    # as the shortcut when nothing else is queued behind it (a human keypress); F2 always works.
     param([string]$Prompt)
     if (-not $script:IsInteractive) { return (Read-Host $Prompt) }
 
@@ -233,7 +236,13 @@ function Read-TargetsField {
     while ($true) {
         $k = [Console]::ReadKey($true)
         if ($k.Key -eq [ConsoleKey]::Enter) { Write-Host ""; return $buf }
-        if ($buf -eq "" -and ($k.KeyChar -eq 'f' -or $k.KeyChar -eq 'F')) {
+
+        $pending = $false
+        try { $pending = [Console]::KeyAvailable } catch { }
+        $wantsCsv = ($k.Key -eq [ConsoleKey]::F2) -or
+                    ($buf -eq "" -and -not $pending -and ($k.KeyChar -eq 'f' -or $k.KeyChar -eq 'F'))
+
+        if ($wantsCsv) {
             Write-Host ""
             $csv = Select-FileBrowser -Extensions @('.csv', '.txt') -Label "CSV/TXT browser"
             if ($csv) {
@@ -251,7 +260,7 @@ function Read-TargetsField {
             if ($buf.Length -gt 0) { $buf = $buf.Substring(0, $buf.Length - 1); Write-Host "`b `b" -NoNewline }
             continue
         }
-        if ($k.KeyChar) { $buf += $k.KeyChar; Write-Host $k.KeyChar -NoNewline }
+        if ($k.KeyChar -and -not [char]::IsControl($k.KeyChar)) { $buf += $k.KeyChar; Write-Host $k.KeyChar -NoNewline }
     }
 }
 
