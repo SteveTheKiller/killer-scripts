@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.5
-    Developed by Steve the Killer | Updated: 2026-06-24
+    Developed by Steve the Killer | Updated: 2026-07-16
 .DESCRIPTION
     Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
     (skips in-use apps). Performs unattended feature upgrades to 25H2, dispatched to a
@@ -195,6 +195,57 @@ try {
     Start-Sleep -Seconds 3
 } catch {
     Write-Host "      [!] Failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+#endregion
+
+#region 1.4 - Open Windows Update for the feature-update path (runs before the scan)
+# ============================================================================
+# The 25H2 feature update rides USO/UUP, which a fleet NoAutoUpdate=1 policy gags.
+# On the managed and re-keyed Enterprise-composition boxes, Windows Update is the
+# ONLY path that upgrades them, so open it here, before the region-2 scan, instead
+# of discovering that too late in region 5 and burning an ISO cycle first. USO then
+# has this whole run (regions 2-4 take minutes) plus the hours after to surface and
+# stage 25H2 as pending. Gated on a real feature gap so Kaseya's policy is left alone
+# on already-current boxes; originals are recorded and Restore-WUUpgradeOverrides puts
+# them back once the box reaches 25H2. This is the confirmed LP27 unblock sequence.
+$IPU_WorkDir          = "C:\Windows\Temp\25H2IPU"
+$IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
+$IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
+$IPU_ActiveHoursEnd   = 19
+if (-not $NoUpgrade -and $WinVer -ne $LatestVersion) {
+    Write-Host "[>] Opening Windows Update for the $LatestVersion feature update..." -ForegroundColor $LineCol
+    $_polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $_auk  = "$_polk\AU"
+    if (-not (Test-Path $_polk)) { New-Item -Path $_polk -Force | Out-Null }
+    if (-not (Test-Path $_auk))  { New-Item -Path $_auk  -Force | Out-Null }
+    if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
+    # Record originals once, in the same format Restore-WUUpgradeOverrides expects.
+    if (-not (Test-Path $IPU_AURestoreFile)) {
+        $_noAuto = (Get-ItemProperty -Path $_auk  -Name NoAutoUpdate     -ErrorAction SilentlyContinue).NoAutoUpdate
+        $_auOpt  = (Get-ItemProperty -Path $_auk  -Name AUOptions        -ErrorAction SilentlyContinue).AUOptions
+        $_setAH  = (Get-ItemProperty -Path $_polk -Name SetActiveHours   -ErrorAction SilentlyContinue).SetActiveHours
+        $_ahS    = (Get-ItemProperty -Path $_polk -Name ActiveHoursStart -ErrorAction SilentlyContinue).ActiveHoursStart
+        $_ahE    = (Get-ItemProperty -Path $_polk -Name ActiveHoursEnd   -ErrorAction SilentlyContinue).ActiveHoursEnd
+        @(
+            "NoAutoUpdate=$(if ($null -eq $_noAuto) {'ABSENT'} else {$_noAuto})"
+            "AUOptions=$(if ($null -eq $_auOpt) {'ABSENT'} else {$_auOpt})"
+            "SetActiveHours=$(if ($null -eq $_setAH) {'ABSENT'} else {$_setAH})"
+            "ActiveHoursStart=$(if ($null -eq $_ahS) {'ABSENT'} else {$_ahS})"
+            "ActiveHoursEnd=$(if ($null -eq $_ahE) {'ABSENT'} else {$_ahE})"
+        ) | Set-Content -Path $IPU_AURestoreFile -Encoding ASCII -Force
+    }
+    # NoAutoUpdate=0 alone does not release a pending feature update on the re-keyed
+    # Enterprise-composition boxes; AUOptions=4 (auto download + schedule install) is
+    # what actually moves it. Pin active hours so any WU-driven reboot lands out of hours.
+    Set-ItemProperty -Path $_auk  -Name NoAutoUpdate     -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $_auk  -Name AUOptions        -Value 4 -Type DWord -Force
+    Set-ItemProperty -Path $_polk -Name SetActiveHours   -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $_polk -Name ActiveHoursStart -Value $IPU_ActiveHoursStart -Type DWord -Force
+    Set-ItemProperty -Path $_polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
+    Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartInteractiveScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
+    Write-Host "      WU opened (NoAutoUpdate=0, AUOptions=4); USO scan kicked. Feature update will surface as pending." -ForegroundColor $DimCol
 }
 #endregion
 
@@ -450,16 +501,14 @@ switch ($IPU_InstallLang) {
 }
 $IPU_IsoUrl     = "https://iso.killertools.net/$IPU_IsoName"
 $IPU_IsoSizeGB  = 6.0
-$IPU_WorkDir    = "C:\Windows\Temp\25H2IPU"
+# $IPU_WorkDir, $IPU_AURestoreFile, and $IPU_ActiveHoursStart/End are defined earlier
+# (region 1.4 WU ungag, which runs before the scan); reused here.
 $IPU_IsoPath    = Join-Path $IPU_WorkDir $IPU_IsoName
 $IPU_LogDir     = Join-Path $IPU_WorkDir "SetupLogs"
 $IPU_SetupLog   = Join-Path $IPU_WorkDir "setup_exit.log"
 $IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
 $IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
 $IPU_TaskName   = "WURSA-25H2-IPU"
-$IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
-$IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
-$IPU_ActiveHoursEnd   = 19
 
 # 24H2 (26100) -> 25H2 enablement package (KB5054156). x64 only; host MSU in killer-isos bucket.
 $IPU_EkbName    = "Win11_25H2_eKB_KB5054156_x64.msu"
@@ -487,7 +536,7 @@ function Restore-WUUpgradeOverrides {
     foreach ($line in (Get-Content $IPU_AURestoreFile -ErrorAction SilentlyContinue)) {
         if ($line -match '^([^=]+)=(.+)$') { $map[$matches[1]] = $matches[2] }
     }
-    $targets = @{ NoAutoUpdate = $auk; SetActiveHours = $polk; ActiveHoursStart = $polk; ActiveHoursEnd = $polk }
+    $targets = @{ NoAutoUpdate = $auk; AUOptions = $auk; SetActiveHours = $polk; ActiveHoursStart = $polk; ActiveHoursEnd = $polk }
     foreach ($name in @($targets.Keys)) {
         $key = $targets[$name]; $orig = $map[$name]
         if ($null -eq $orig -or $orig -eq 'ABSENT') { Remove-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue }
@@ -495,6 +544,23 @@ function Restore-WUUpgradeOverrides {
     }
     Remove-Item $IPU_AURestoreFile -Force -ErrorAction SilentlyContinue
     Write-Host "      Restored original Windows Update policy values (auto-update and active hours)." -ForegroundColor $DimCol
+}
+
+function Test-WUFeatureUpdatePending {
+    # True if Windows Update is now servicing the target feature update -- either
+    # offering / downloading it (IsInstalled=0) or holding it staged pending reboot
+    # (RebootRequired=1). Either state means the early ungag worked and WU has the box
+    # on the edition-aware path, so we must NOT race it with local media. Reuses the
+    # region-2 $UpdateSearcher. Regions 2-4 gave USO minutes to surface it since the ungag.
+    foreach ($_crit in @("IsInstalled=0 and IsHidden=0", "RebootRequired=1")) {
+        try {
+            $_res = $UpdateSearcher.Search($_crit).Updates
+            foreach ($_u in $_res) {
+                if ($_u.Title -match [regex]::Escape($LatestVersion) -or $_u.Title -match 'Feature update to Windows') { return $true }
+            }
+        } catch {}
+    }
+    return $false
 }
 
 Write-HLine -Style dashed
@@ -506,6 +572,15 @@ if ($NoUpgrade) {
     Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
 } elseif ($script:FeatureUpdateStaged) {
     Write-Host "      > $LatestVersion already staged via Windows Update; pending reboot. In-place upgrade not needed." -ForegroundColor $DimCol
+} elseif ($InstalledVersion -ne $LatestVersion -and (Test-WUFeatureUpdatePending)) {
+    # WU-first: the region-1.4 ungag let USO pick up $LatestVersion and it is now
+    # pending / downloading. This is the edition-aware path and the only one that works
+    # on the managed and Enterprise-composition boxes, so hand off and let USO finish
+    # over the coming hours. Nothing is staged for an immediate reboot; do NOT dispatch
+    # local media (racing WU against the CBS store is what causes 0xC1900101).
+    Write-Host "      > Windows Update is now servicing $LatestVersion (edition-aware path). Handing off; no local media needed." -ForegroundColor $DimCol
+    if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
+    ('WU_HANDOFF ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
 } elseif ($InstalledVersion -ne $LatestVersion) {
     Write-Host "      > Feature update available." -ForegroundColor $WarnCol
     # Battery safety
@@ -635,21 +710,27 @@ function Set-WUUpgradeOverrides {
     if (-not (Test-Path $auk))  { New-Item -Path $auk  -Force | Out-Null }
     if (-not (Test-Path $IPU_AURestoreFile)) {
         $noAuto = (Get-ItemProperty -Path $auk  -Name NoAutoUpdate     -ErrorAction SilentlyContinue).NoAutoUpdate
+        $auOpt  = (Get-ItemProperty -Path $auk  -Name AUOptions        -ErrorAction SilentlyContinue).AUOptions
         $setAH  = (Get-ItemProperty -Path $polk -Name SetActiveHours   -ErrorAction SilentlyContinue).SetActiveHours
         $ahS    = (Get-ItemProperty -Path $polk -Name ActiveHoursStart -ErrorAction SilentlyContinue).ActiveHoursStart
         $ahE    = (Get-ItemProperty -Path $polk -Name ActiveHoursEnd   -ErrorAction SilentlyContinue).ActiveHoursEnd
         @(
             "NoAutoUpdate=$(if ($null -eq $noAuto) {'ABSENT'} else {$noAuto})"
+            "AUOptions=$(if ($null -eq $auOpt) {'ABSENT'} else {$auOpt})"
             "SetActiveHours=$(if ($null -eq $setAH) {'ABSENT'} else {$setAH})"
             "ActiveHoursStart=$(if ($null -eq $ahS) {'ABSENT'} else {$ahS})"
             "ActiveHoursEnd=$(if ($null -eq $ahE) {'ABSENT'} else {$ahE})"
         ) | Set-Content -Path $IPU_AURestoreFile -Encoding ASCII -Force
     }
     Set-ItemProperty -Path $auk  -Name NoAutoUpdate     -Value 0 -Type DWord -Force
+    # NoAutoUpdate=0 alone does not release an already-pending feature update on the
+    # re-keyed Enterprise-composition boxes; AUOptions=4 (auto download + schedule
+    # install) is what actually moves it. Set both.
+    Set-ItemProperty -Path $auk  -Name AUOptions        -Value 4 -Type DWord -Force
     Set-ItemProperty -Path $polk -Name SetActiveHours   -Value 1 -Type DWord -Force
     Set-ItemProperty -Path $polk -Name ActiveHoursStart -Value $IPU_ActiveHoursStart -Type DWord -Force
     Set-ItemProperty -Path $polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
-    Write-Output "Cleared NoAutoUpdate and pinned active hours $IPU_ActiveHoursStart-$IPU_ActiveHoursEnd so WU can deliver and reboot out of hours (originals recorded)."
+    Write-Output "Cleared NoAutoUpdate, set AUOptions=4, and pinned active hours $IPU_ActiveHoursStart-$IPU_ActiveHoursEnd so WU can deliver and reboot out of hours (originals recorded)."
 }
 
 function Invoke-IPUStaleCleanup {
@@ -703,7 +784,8 @@ function Invoke-IPUWindowsUpdate {
     }
     Set-WUUpgradeOverrides
     Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
-    Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartInteractiveScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
     Set-Status "WU_HANDOFF $wuStamp"
 }
 function Invoke-IPUComponentRepair {
