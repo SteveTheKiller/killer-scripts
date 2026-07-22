@@ -1,15 +1,26 @@
 ﻿<#
 .SYNOPSIS
-    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v15.6
-    Developed by Steve the Killer | Updated: 2026-05-15
+    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v16.0
+    Developed by Steve the Killer | Updated: 2026-07-22
 .DESCRIPTION
-    Automated Windows 10/11 tune-up for MSP field and remote deployment.
-    Hardens AI, privacy, and browser settings; strips OEM and consumer
-    bloat; purges browser and system caches; resets the Windows Update
-    database; runs DISM and SFC repair; and performs SSD TRIM while
-    reporting disk space recovered at each stage.
+    Automated Windows 10/11 disk-space reclamation and integrity repair for
+    MSP field and remote use. Purges Dell SupportAssist snapshots, browser,
+    Office and GPU caches, the Recycle Bin, Delivery Optimization, the installer
+    cache, the search index, and aged Windows.old; resets the Windows Update
+    database; runs DISM and SFC repair; removes the hibernation file; and
+    performs SSD TRIM while reporting disk space recovered at each stage.
+
+    v16.0 scope change: privacy/telemetry hardening (old Region 1), browser
+    hardening/uBlock (old Region 2), and OEM/software debloat (old Region 3)
+    were removed. Those behaviors now belong to SHADE and DEBLOAT. AMORT is
+    cleanup + repair only, safe to run on live, managed endpoints.
+.PARAMETER DryRun
+    Read-only estimate mode. Makes no changes: every destructive step is skipped
+    and each target is sized instead, reporting estimated reclaim per category
+    plus a projected free-space total. Use before committing on a disk alert.
 #>
-$_fver   = "| v15.6"
+param([switch]$DryRun)
+$_fver   = "| v16.0"
 #region Pre-Flight Checks
 # ============================================================================
 # Force UTF-8 output so box-drawing characters render correctly
@@ -20,15 +31,13 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Write-Warning "Elevation Required: Please run as Administrator."
     Exit
 }
-# Kill any stuck processes from a previous run
-$StaleProcs = @("DISM", "sfc", "cleanmgr", "TiWorker")
-foreach ($ProcName in $StaleProcs) {
-    $Found = Get-Process -Name $ProcName -ErrorAction SilentlyContinue
-    if ($Found) {
-        Write-Host "[Pre-Flight] Stopping stuck process: $ProcName" -ForegroundColor Yellow
-        $Found | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
-} 
+# Detect active Windows servicing - do NOT kill it.
+# Force-killing TiWorker/DISM mid-servicing corrupts the component store, which
+# the repair region would then have to fix. Instead we detect and skip repair.
+$ServicingActive = $null -ne (Get-Process -Name "TiWorker", "DISM" -ErrorAction SilentlyContinue)
+if ($ServicingActive) {
+    Write-Host "[Pre-Flight] Windows servicing active (TiWorker/DISM running). Repair steps will be skipped." -ForegroundColor Yellow
+}
 
 # Helper to handle WMI/CIM switching
 function Get-SystemData {
@@ -92,6 +101,8 @@ function Write-StepUpdate {
                 Write-Host $tag -ForegroundColor Yellow
             } elseif ($CustomInfo.StartsWith("(Saved:")) {
                 Write-Host " $CustomInfo" -NoNewline -ForegroundColor Red
+            } elseif ($CustomInfo.StartsWith("(Est:")) {
+                Write-Host " $CustomInfo" -NoNewline -ForegroundColor Magenta
             } else {
                 Write-Host " $CustomInfo" -NoNewline -ForegroundColor Gray
             }
@@ -99,11 +110,11 @@ function Write-StepUpdate {
 
         # Final Success Tag (right-aligned to console width)
         if ($Success) {
-            $tag = "[SUCCESS]"
+            $tag = if ($script:DryRun) { "[EST]" } else { "[SUCCESS]" }
             $currentCol = [Console]::CursorLeft
             $targetCol  = $script:Width - $tag.Length
             if ($targetCol -gt $currentCol) { Write-Host (" " * ($targetCol - $currentCol)) -NoNewline }
-            Write-Host $tag -ForegroundColor Green
+            Write-Host $tag -ForegroundColor $(if ($script:DryRun) { "Magenta" } else { "Green" })
         }
 
         # Return the cursor to where it was (below any warnings that appeared)
@@ -124,13 +135,36 @@ function Start-ServiceSilent {
         $Timer++
     }
 }
+# Dry-run size estimator (read-only; handles missing paths and wildcards)
+function Get-PathSize {
+    param([string]$Path)
+    try {
+        $sum = (Get-ChildItem -Path $Path -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+        if ($null -eq $sum) { return 0 }
+        return [int64]$sum
+    } catch { return 0 }
+}
+# Dry-run per-step reporter: prints an estimate tag and accumulates the total
+function Write-DryEstimate {
+    param([int64]$Bytes)
+    if ($Bytes -gt 0) {
+        $s = if ($Bytes -ge 1GB) { "{0:N2} GB" -f ($Bytes / 1GB) } else { "{0:N2} MB" -f ($Bytes / 1MB) }
+        Write-StepUpdate -Success -CustomInfo "(Est: $s)"
+    } else {
+        Write-StepUpdate -Success -CustomInfo "Est: 0 MB"
+    }
+    if (-not $script:EstYieldBytes) { $script:EstYieldBytes = 0 }
+    $script:EstYieldBytes = [int64]$script:EstYieldBytes + [int64]$Bytes
+}
 # Environment Setup
-$IsCore = ($PSVersionTable.PSEdition -eq "Core")
+# Expose DryRun at script scope so the output helpers can see it
+$script:DryRun = [bool]$DryRun
 $Drive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
 $StartSpace = $Drive.FreeSpace
 $TotalSize = $Drive.Size
 # Initialize cumulative yield (bytes)
 if (-not $TotalYieldBytes) { $TotalYieldBytes = 0 }
+$script:EstYieldBytes = 0
 # Ensure TotalSize is valid
 $TotalSize = [double]$TotalSize
 $script:RegionHistory = @()
@@ -141,7 +175,7 @@ $LastRegionSpace = $Drive.FreeSpace # Rolling baseline for step-by-step reportin
 $CS = Get-CimInstance Win32_ComputerSystem
 $Vendor = $CS.Manufacturer
 $IsVM = ($Vendor -match "QEMU|VMware|Virtual|Hyper-V")
-# --- UPDATED LOGIC FOR CUSTOM BUILDS ---
+# --- Custom-build architecture display ---
 $Sys = Get-SystemData Win32_ComputerSystem
 $Baseboard = Get-SystemData Win32_BaseBoard
 # Rule: If Manufacturer and Model are the same (typical of "To Be Filled By O.E.M."), 
@@ -158,7 +192,7 @@ $CS = Get-SystemData Win32_LogicalDisk | Where-Object { $_.DeviceID -eq 'C:' }
 $ProgressPreference = 'SilentlyContinue'
 
 Clear-Host
-$script:Width    = 85
+$script:Width    = 90
 $LineCol   = "DarkCyan"
 $MainCol   = "DarkYellow"
 $BorderCol = "Cyan"
@@ -230,482 +264,182 @@ $StartTotalGB = [Math]::Round($TotalSize / 1GB, 0)
 $DiskColor = if ($StartUsagePct -ge 90) { "Red" } elseif ($StartUsagePct -ge 80) { "DarkYellow" } else { "Green" }
 Write-Host "Disk Usage          : " -ForegroundColor $InfoCol -NoNewline; Write-Host "${StartUsedGB}GB Used of ${StartTotalGB}GB ($StartUsagePct%)" -ForegroundColor $DiskColor
 Write-HLine -Style dashed
+if ($DryRun) {
+    Write-Host "      Mode: DRY RUN - estimate only, no changes will be made" -ForegroundColor Magenta
+}
 if ($IsVM) {
     Write-Host "      Mode: Virtual Machine" -ForegroundColor Yellow 
 }
 #endregion
 
-#region 1. AI, Recall, Privacy & Widget Block
+#region 1. Snapshot & Storage Purge
 # ============================================================================
-Write-StepUpdate "[01/10] Killing AI, Widgets, Recall & Bing..."
-$Policies = @(
-    # AI & Copilot
-    @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI"; Name="DisableAIDataAnalysis"; Value=1},
-    @{Path="HKCU:\Software\Policies\Microsoft\Windows\WindowsAI"; Name="DisableAIDataAnalysis"; Value=1},
-    @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Dsh"; Name="AllowNewsAndInterests"; Value=0},
-    @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\Widgets"; Name="AllowWidgets"; Value=0},
-    @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"; Name="TurnOffWindowsCopilot"; Value=1},
-    
-    # Telemetry & Recall
-    @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"; Name="AllowTelemetry"; Value=0},
-    @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsExperience"; Name="AllowRecall"; Value=0},
-    
-    # Search Privacy
-    @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"; Name="BingSearchEnabled"; Value=0},
-    @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"; Name="CanCortanaSeeBrowserHistory"; Value=0}
-)
-
-foreach ($Pol in $Policies) {
-    if (-not (Test-Path $Pol.Path)) { New-Item $Pol.Path -Force | Out-Null }
-    Set-ItemProperty -Path $Pol.Path -Name $Pol.Name -Value $Pol.Value -Force -ErrorAction SilentlyContinue | Out-Null
-}
-# Telemetry services - stop and permanently disable
-foreach ($Svc in @("DiagTrack", "dmwappushservice")) {
-    if (Get-Service -Name $Svc -ErrorAction SilentlyContinue) {
-        & sc.exe stop $Svc 2>$null | Out-Null
-        & sc.exe config $Svc start= disabled 2>$null | Out-Null
-        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Svc" -Name "Start" -Value 4 -ErrorAction SilentlyContinue
-    }
-}
-# Additional telemetry caps, WER, and CEIP
-$dcPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
-if (!(Test-Path $dcPath)) { New-Item -Path $dcPath -Force | Out-Null }
-Set-ItemProperty -Path $dcPath -Name "DoNotShowFeedbackNotifications" -Value 1 -ErrorAction SilentlyContinue
-$dcPath2 = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
-if (!(Test-Path $dcPath2)) { New-Item -Path $dcPath2 -Force | Out-Null }
-Set-ItemProperty -Path $dcPath2 -Name "AllowTelemetry"      -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $dcPath2 -Name "MaxTelemetryAllowed" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -Name "Disabled" -Value 1 -ErrorAction SilentlyContinue
-$werPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting"
-if (!(Test-Path $werPath)) { New-Item -Path $werPath -Force | Out-Null }
-Set-ItemProperty -Path $werPath -Name "Disabled" -Value 1 -ErrorAction SilentlyContinue
-$sqmPath = "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows"
-if (!(Test-Path $sqmPath)) { New-Item -Path $sqmPath -Force | Out-Null }
-Set-ItemProperty -Path $sqmPath -Name "CEIPEnable" -Value 0 -ErrorAction SilentlyContinue
-# Advertising ID & tailored experiences
-$adPolPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo"
-if (!(Test-Path $adPolPath)) { New-Item -Path $adPolPath -Force | Out-Null }
-Set-ItemProperty -Path $adPolPath -Name "DisabledByGroupPolicy" -Value 1 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy" -Name "TailoredExperiencesWithDiagnosticDataEnabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path "HKCU:\Control Panel\International\User Profile" -Name "HttpAcceptLanguageOptOut" -Value 1 -ErrorAction SilentlyContinue
-# OEM content re-injection prevention
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata" -Name "PreventDeviceMetadataFromNetwork" -Value 1 -ErrorAction SilentlyContinue
-$cdmPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent"
-if (!(Test-Path $cdmPath)) { New-Item -Path $cdmPath -Force | Out-Null }
-Set-ItemProperty -Path $cdmPath -Name "DisableWindowsConsumerFeatures" -Value 1 -ErrorAction SilentlyContinue
-# Lock screen, taskbar, Start menu & notification clutter
-$cdmUserPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
-if (!(Test-Path $cdmUserPath)) { New-Item -Path $cdmUserPath -Force | Out-Null }
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338387Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338388Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338389Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-353694Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-353696Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-338393Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SubscribedContent-310093Enabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SystemPaneSuggestionsEnabled"    -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "SoftLandingEnabled"              -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "RotatingLockScreenOverlayEnabled"-Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmUserPath -Name "RotatingLockScreenEnabled"       -Value 0 -ErrorAction SilentlyContinue
-$chatPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat"
-if (!(Test-Path $chatPolicyPath)) { New-Item -Path $chatPolicyPath -Force | Out-Null }
-Set-ItemProperty -Path $chatPolicyPath -Name "ChatIcon" -Value 3 -ErrorAction SilentlyContinue
-$feedsPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds"
-if (!(Test-Path $feedsPath)) { New-Item -Path $feedsPath -Force | Out-Null }
-Set-ItemProperty -Path $feedsPath -Name "EnableFeeds" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmPath -Name "DisableWindowsSpotlightFeatures" -Value 1 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $cdmPath -Name "DisableSoftLanding"              -Value 1 -ErrorAction SilentlyContinue
-$startPolPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
-if (!(Test-Path $startPolPath)) { New-Item -Path $startPolPath -Force | Out-Null }
-Set-ItemProperty -Path $startPolPath -Name "HideRecentlyAddedApps" -Value 1 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Suggested" -Name "Enabled" -Value 0 -ErrorAction SilentlyContinue
-# Explorer: open to This PC instead of Quick Access
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "LaunchTo" -Value 1 -ErrorAction SilentlyContinue
-# Recall feature removal via DISM (full uninstall, not just policy block)
-$RecallCheck = Get-WindowsOptionalFeature -Online -FeatureName "Recall" -ErrorAction SilentlyContinue
-if ($RecallCheck -and $RecallCheck.State -ne "Disabled") {
-    $DismArgs = "/online /Disable-Feature /FeatureName:Recall /Remove /NoRestart /Quiet /English"
-    $RecallJob = Start-Process "dism.exe" -ArgumentList $DismArgs -PassThru -WindowStyle Hidden
-    
-    # 20-second "Fail-Fast" Timer
-    $Timer = 0
-    while (-not $RecallJob.HasExited -and $Timer -lt 20) {
-        Start-Sleep -Seconds 1
-        $Timer++
-    }
-
-    if (-not $RecallJob.HasExited) {
-        Stop-Process -Id $RecallJob.Id -Force -ErrorAction SilentlyContinue
-        Write-Host "        [!] Recall removal timed out (System Locked). Continuing..." -ForegroundColor DarkYellow
-    }
-}
-# Edge policy hardening
-$EdgePolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
-if (!(Test-Path $EdgePolicy)) { New-Item -Path $EdgePolicy -Force | Out-Null }
-Set-ItemProperty -Path $EdgePolicy -Name "HubsSidebarEnabled"             -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "CopilotPageContext"              -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "EdgeEntraCopilotPageContext"     -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "EdgeSidebarEnabled"              -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "BackgroundModeEnabled"           -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "StartupBoostEnabled"             -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "ShowMicrosoftRewards"            -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "EdgeShoppingAssistantEnabled"    -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "PersonalizationReportingEnabled" -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "EdgeFollowEnabled"               -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "ShowRecommendationsEnabled"      -Value 0 -ErrorAction SilentlyContinue
-Set-ItemProperty -Path $EdgePolicy -Name "DiscoverPageContextEnabled"      -Value 0 -ErrorAction SilentlyContinue
-# Office language pack cleanup (remove non-English stubs)
-$C2RPath = "C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe"
-if (Test-Path $C2RPath) {
-    $RegKeys = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "Microsoft 365*" -and $_.DisplayName -notmatch "en-us" }
-    foreach ($Key in $RegKeys) {
-        if ($Key.DisplayName -match " - ([a-z]{2}-[a-z]{2})") {
-            $c2rProc = Start-Process $C2RPath -ArgumentList "scenario=install scenariosubtype=ARP sourcetype=None productstoremove=O365ProPlusRetail.16_$($Matches[1])_x-none culture=$($Matches[1]) version.16=16.0 DisplayLevel=False" -PassThru -ErrorAction SilentlyContinue
-            if ($c2rProc -and -not $c2rProc.WaitForExit(60000)) {
-                $c2rProc | Stop-Process -Force -ErrorAction SilentlyContinue
-                Get-Process -Name "OfficeClickToRun" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
-}
-# --- Calculate Regional Savings ---
-$CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-$RegionSaved = $CurrentDrive.FreeSpace - $LastRegionSpace
-if ($RegionSaved -gt 0) {
-    $SavedStr = if ($RegionSaved -gt 1GB) { "$([math]::Round($RegionSaved / 1GB, 2)) GB" } else { "$([math]::Round($RegionSaved / 1MB, 2)) MB" }
-    Write-StepUpdate -Success -CustomInfo "(Saved: $SavedStr)"
-} else {
-    Write-StepUpdate -Success
-}
-# Add the raw bytes to the running total
-if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
-$LastRegionSpace = $CurrentDrive.FreeSpace
-#endregion
-
-#region 2. Security: Browser Hardening
-# ============================================================================
-$HardeningStep = "[02/10] Security: Hardening Browsers (uBlock Origin)..."
-Write-StepUpdate $HardeningStep
-# Edge Hardening
-$EdgeRegPath = "HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist"
-$uBlockID = "odfafepnkmbhccpbejgmiehpchacaeak;https://edge.microsoft.com/extensionwebstorebase/v1/crx"
-if (-not (Test-Path $EdgeRegPath)) { New-Item -Path $EdgeRegPath -Force | Out-Null }
-$ExistingEdge = Get-ItemProperty -Path $EdgeRegPath -ErrorAction SilentlyContinue 2>$null
-$NextEdgeIdx = ($ExistingEdge.PSObject.Properties.Name | Where-Object { $_ -match '^\d+$' } | Measure-Object -Maximum).Maximum + 1
-if ($null -eq $NextEdgeIdx) { $NextEdgeIdx = 1 }
-Set-ItemProperty -Path $EdgeRegPath -Name "$NextEdgeIdx" -Value $uBlockID -Force | Out-Null
-# Chrome Hardening (Conditional)
-if (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe") {
-    $ChromeRegPath = "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist"
-    $uBlockChromeID = "ddkjiahejlhfcafbddmgiahcphecmpfh;https://clients2.google.com/service/update2/crx"
-    if (-not (Test-Path $ChromeRegPath)) { New-Item -Path $ChromeRegPath -Force | Out-Null }
-    $ExistingChrome = Get-ItemProperty -Path $ChromeRegPath -ErrorAction SilentlyContinue 2>$null
-    $NextChromeIdx = ($ExistingChrome.PSObject.Properties.Name | Where-Object { $_ -match '^\d+$' } | Measure-Object -Maximum).Maximum + 1
-    if ($null -eq $NextChromeIdx) { $NextChromeIdx = 1 }
-    Set-ItemProperty -Path $ChromeRegPath -Name "$NextChromeIdx" -Value $uBlockChromeID -Force | Out-Null
-}
-# --- Calculate Regional Savings ---
-$CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-$RegionSaved = $CurrentDrive.FreeSpace - $LastRegionSpace
-if ($RegionSaved -gt 0) {
-    $SavedStr = if ($RegionSaved -gt 1GB) { "$([math]::Round($RegionSaved / 1GB, 2)) GB" } else { "$([math]::Round($RegionSaved / 1MB, 2)) MB" }
-    Write-StepUpdate -Success -CustomInfo "(Saved: $SavedStr)"
-} else {
-    Write-StepUpdate -Success
-}
-# Add the raw bytes to the running total
-if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
-# Update the marker for the next region
-$LastRegionSpace = $CurrentDrive.FreeSpace
-#endregion
-
-#region 3. Debloat: System & Software Purge
-# ============================================================================
-$DebloatStep = "[03/10] Executing System Debloat & Software Purge..."
-Write-StepUpdate $DebloatStep
-# --- Phase 1: Universal Appx Strip ---
-$Bloat = @("*BingNews*", "*BingWeather*", "*ZuneVideo*", "*ZuneMusic*", "*Office.OneNote*", "*SkypeApp*", "*YourPhone*", "*WindowsCommunicationsApps*", "*PowerAutomate*", "*Todos*", "*BingSearch*")
-if ($IsCore) { try { Remove-Module Appx -ErrorAction SilentlyContinue 2>$null } catch {} }
-foreach ($App in $Bloat) { 
-    try {
-        $Pkg = Get-AppxPackage -AllUsers -Name $App -ErrorAction SilentlyContinue
-        if ($Pkg) { 
-            # Isolation job to prevent script hang if AppXSVC is deadlocked
-            $Job = Start-Job -ScriptBlock { param($p) $p | Remove-AppxPackage -AllUsers } -ArgumentList $Pkg
-            if (-not ($Job | Wait-Job -Timeout 20)) {
-                Stop-Job $Job
-                Write-Host "        [!] Appx $App timed out. Skipping." -ForegroundColor Yellow
-            }
-        }
-    } catch { break }
-}
-if ($IsCore) { 0..5 | ForEach-Object { Write-Progress -Id $_ -Activity "Done" -Completed } } else { Write-Progress -Activity "Stripping Bloatware" -Completed }
-# --- Phase 2: Aggressive Dell Purge ---
+Write-StepUpdate "[01/08] Purging Snapshots, Installer Cache & Search Index..."
+$RegionEst = [int64]0
+# Dell SupportAssist Remediation snapshot purge
+# SupportAssist OS Recovery stores system-repair snapshots under
+# SARemediation\SystemRepair\{Snapshots,Backup} that can grow to 20-80GB when
+# auto-purge stalls. Stop the service, clear the snapshot payload only (not the
+# whole tree, so the install keeps working), then restart. This removes the local
+# OS-recovery snapshots until SupportAssist rebuilds one.
 if ($Vendor -like "*Dell*" -and -not $IsVM) {
-    # Step 1: Run uninstallers first so they can manage their own services cleanly
-    $DellPatterns = @("*SupportAssist*", "*DellUpdate*", "*DellCommand*", "*PremierColor*", "*DigitalDelivery*", "*Dell Optimizer*", "*DellCoreServices*", "*Alienware*")
-        $UnKeys = @(
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
-        )
-        # Grab all installed software from registry once
-        $Installed = Get-ItemProperty $UnKeys -ErrorAction SilentlyContinue
-        # Combine your patterns into one master search
-        $MasterPurge = $DellPatterns + $PurgeList
-        foreach ($Item in $Installed) {
-            $Name = $Item.DisplayName
-            if ($Name) {
-                # Check if it matches anything in your purge lists
-                $IsTarget = $false
-                foreach ($P in $MasterPurge) { if ($Name -like $P) { $IsTarget = $true; break } }
-                # Safety Check: If it's in your KeepList, skip it
-                foreach ($K in $KeepList) { if ($Name -like $K) { $IsTarget = $false; break } }
-                if ($IsTarget -and $Item.UninstallString) {
-                    Write-Host "        [!] Removing: $Name" -ForegroundColor Cyan
-                    try {
-                        if ($Item.UninstallString -match "msiexec") {
-                            $Guid = ([regex]::Match($Item.UninstallString, '{[A-Z0-9-]+}').Value)
-                            if ($Guid) {
-                                $proc = Start-Process "msiexec.exe" -ArgumentList "/x $Guid /qn /norestart" -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
-                                if ($proc -and -not $proc.WaitForExit(60000)) {
-                                    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
-                                    Write-Host "          [!] Timed out: $Name (MSI)" -ForegroundColor Yellow
-                                }
-                            }
-                        } else {
-                            # Parse UninstallString — path may have embedded args
-                            if ($Item.UninstallString -match '^"([^"]+)"(.*)$') {
-                                $exePath = $Matches[1].Trim()
-                                $exeArgs = $Matches[2].Trim()
-                            } elseif ($Item.UninstallString -match '^(\S+\.exe)(.*)$') {
-                                $exePath = $Matches[1].Trim()
-                                $exeArgs = $Matches[2].Trim()
-                            } else {
-                                $exePath = $Item.UninstallString
-                                $exeArgs = ""
-                            }
-                            $silentArgs = "/S /Silent /Quiet /VERYSILENT /SUPPRESSMSGBOXES /norestart"
-                            $finalArgs  = if ($exeArgs) { "$exeArgs $silentArgs" } else { $silentArgs }
-                            $proc = Start-Process $exePath -ArgumentList $finalArgs -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
-                            if ($proc -and -not $proc.WaitForExit(60000)) {
-                                $proc | Stop-Process -Force -ErrorAction SilentlyContinue
-                                Write-Host "          [!] Timed out: $Name (EXE)" -ForegroundColor Yellow
-                            }
-                        }
-                    } catch {
-                        Write-Host "          [!] Failed to remove: $Name" -ForegroundColor Yellow
-                    }
+    $SARoot = "C:\ProgramData\Dell\SARemediation\SystemRepair"
+    if (Test-Path $SARoot) {
+        if ($DryRun) {
+            foreach ($Sub in @("Snapshots", "Backup")) { $RegionEst += Get-PathSize (Join-Path $SARoot $Sub) }
+        } else {
+            # Stop any Dell SupportAssist / remediation services holding the snapshots open
+            $SASvcs = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "SupportAssist*" -or $_.DisplayName -like "*SupportAssist*" }
+            foreach ($SASvc in $SASvcs) {
+                try { Stop-Service $SASvc.Name -Force -ErrorAction Stop -WarningAction SilentlyContinue } catch { }
+            }
+            foreach ($Sub in @("Snapshots", "Backup")) {
+                $SAPath = Join-Path $SARoot $Sub
+                if (Test-Path $SAPath) {
+                    # Snapshot files are hidden/system/protected: strip attributes, then delete contents (keep the folder)
+                    Start-Process "cmd.exe" -ArgumentList "/c attrib -h -s -r `"$SAPath\*`" /S /D & del /s /f /q `"$SAPath\*`"" -WindowStyle Hidden -Wait
                 }
             }
-        }
-    # Step 2: Mop up any leftover Dell services the uninstallers didn't clean up
-    $DellServices = @("Dell*", "SupportAssist*", "DDV*", "DCF*", "DellHardwareSupport*")
-    foreach ($SvcName in $DellServices) {
-        $TargetSvcs = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
-        foreach ($S in $TargetSvcs) {
-            try { Stop-Service $S.Name -Force -ErrorAction Stop -WarningAction SilentlyContinue } catch { }
-            Set-Service $S.Name -StartupType Disabled -ErrorAction SilentlyContinue
-            & sc.exe delete $S.Name | Out-Null
-        }
-    }
-
-# --- Phase 3: Office Language Pack Purge ---
-    # Target MSI-based Language Packs (Office 2016/2019/Current)
-$MSILangPacks = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-    Where-Object { $_.DisplayName -like "*Microsoft Office*Language Pack*" -and $_.DisplayName -notlike "*English*" }
-if ($MSILangPacks) {
-    Write-Host "        Debloat: Scrubbing foreign Office language packs..." -ForegroundColor Yellow
-}
-foreach ($Pack in $MSILangPacks) {
-    if ($Pack.UninstallString -match "msiexec") {
-        $Guid = ([regex]::Match($Pack.UninstallString, '{[A-Z0-9-]+}').Value)
-        if ($Guid) { 
-            Start-Process "msiexec.exe" -ArgumentList "/x $Guid /qn /norestart" -Wait -WindowStyle Hidden
+            # Restart the services we stopped
+            foreach ($SASvc in $SASvcs) {
+                Start-Service $SASvc.Name -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+            }
         }
     }
 }
-    # Target Modern Office (Appx) Language Components
-    # We keep 1033 (en-US) and remove everything else
-Get-AppxPackage -AllUsers -Name "Microsoft.Office.Desktop.*" | Where-Object { $_.Name -match "Language" -and $_.Name -notmatch "1033" } | 
-    Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-    # Filesystem Scrub
-    $DellFolders = @("C:\ProgramData\Dell", "C:\Program Files\Dell", "C:\Program Files (x86)\Dell", "C:\Windows\System32\Drivers\Dell")
-    foreach ($DF in $DellFolders) {
-        if (Test-Path $DF) { try { Remove-Item $DF -Recurse -Force -ErrorAction SilentlyContinue } catch { } }
-    }
-}
-# --- Phase 3: General Win32 Software Purge ---
-$KeepList = @("*Peripheral Manager*", "*Lenovo Vantage*", "*Quick Access*", "*Power Manager*", "*HP Smart*", "*HP Wolf Security*", "*Brother*", "*Canon*", "*Spotify*", "*Outlook*")
-$PurgeList = @("*Teams Machine-Wide*", "*Microsoft Teams Classic*", "*Adobe Flash*", "*McAfee*", "*Norton*", "*Avast*", "*WildTangent*", "*WebAdvisor*")
-# Standard Vendor Purge (Non-Dell handled here)
-if (-not $IsVM -and $Vendor -notlike "*Dell*") {
-    $PurgeList += switch -Wildcard ($Vendor) {
-        "*HP*"     { @("*HP Support Assistant*", "*HP Support Solutions*", "*HP Wolf Security*") }
-        "*Lenovo*" { @("*LenovoWelcome*", "*LenovoExperience*", "*LenovoSystemUpdate*") }
-        "*Acer*"   { @("*Acer Care Center*", "*Acer Configuration Manager*", "*Acer Quick Access*") }
-        "*ASUS*"   { @("*Armoury Crate*", "*MyASUS*", "*ASUS System Control Interface*") }
-    }
-}
-$UnKeys = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*","HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
-Get-ItemProperty $UnKeys -ErrorAction SilentlyContinue | Where-Object {
-    $Name = $_.DisplayName; $Match = $false
-    if ($Name) {
-        if ($Name -like "*HP Wolf Security*") { return $false } # Essential MSP Safety Check
-        foreach ($P in $PurgeList) { if ($Name -like $P) { $Match = $true } }
-        foreach ($K in $KeepList) { if ($Name -like $K) { $Match = $false } }
-    }
-    $Match -and ($_.UninstallString)
-} | ForEach-Object {
-    if ($_.UninstallString -match "msiexec") {
-        $Guid = ([regex]::Match($_.UninstallString, '{[A-Z0-9-]+}').Value)
-        if ($Guid) { 
-            $Process = Start-Process "msiexec.exe" -ArgumentList "/x $Guid /qn /norestart" -PassThru -WindowStyle Hidden
-            $Process.PriorityClass = 'BelowNormal'
-            $Process | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
-        }
-    }
-}
-# --- Phase 4: Registry Scrub ---
-$RegPaths = @(
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-)
-foreach ($Reg in $RegPaths) {
-    if (Test-Path $Reg) {
-        Get-ChildItem $Reg -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match "Dell|McAfee|WildTangent|Candy|Dropbox|Xbox|Spotify|TikTok" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-# --- Calculate Regional Savings ---
-$CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-$RegionSaved = $CurrentDrive.FreeSpace - $LastRegionSpace
-if ($RegionSaved -gt 0) {
-    $SavedStr = if ($RegionSaved -gt 1GB) { "$([math]::Round($RegionSaved / 1GB, 2)) GB" } else { "$([math]::Round($RegionSaved / 1MB, 2)) MB" }
-    Write-StepUpdate -Success -CustomInfo "(Saved: $SavedStr)"
-} else {
-    Write-StepUpdate -Success
-}
-# Add the raw bytes to the running total
-if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
-# Update the marker for the next region
-$CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-$LastRegionSpace = $CurrentDrive.FreeSpace
-#endregion
-
-#region 4. Snapshot & Storage Purge
-# ============================================================================
-Write-StepUpdate "[04/10] Purging VSS, Installer Cache & Search Index..."
-# VSS & Dell Remediation
-if ($Vendor -like "*Dell*" -and -not $IsVM) {
-    $DellPath = "C:\ProgramData\Dell\SARemediation"
-    if (Test-Path $DellPath) { Remove-Item $DellPath -Recurse -Force -ErrorAction SilentlyContinue | Out-Null }
-}
-& vssadmin.exe delete shadows /all /quiet 2>&1 | Out-Null
 # Delivery Optimization
-if (Test-Path "C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache") {
-    Remove-Item "C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
-}
-
-# --- IMPROVED SEARCH INDEX RESET ---
-$SvcName = "WSearch"
-$Svc = Get-Service $SvcName -ErrorAction SilentlyContinue
-if ($Svc -and $Svc.Status -ne 'Stopped') {
-    Stop-Service $SvcName -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-    $RetryCount = 0
-    while ((Get-Service $SvcName).Status -ne 'Stopped' -and $RetryCount -lt 10) {
-        $dots = '.' * (($RetryCount % 3) + 1)
-        $savedRow = [Console]::CursorTop
-        [Console]::SetCursorPosition(0, $script:StepRow)
-        Write-Host ("$($script:LastStepMessage) [Stopping WSearch$dots]").PadRight($script:Width) -NoNewline -ForegroundColor Cyan
-        [Console]::SetCursorPosition(0, $savedRow)
-        Start-Sleep -Seconds 2
-        $RetryCount++
-    }
-    # Restore clean step line (strip the "[Stopping WSearch...]" suffix)
-    [Console]::SetCursorPosition(0, $script:StepRow)
-    Write-Host $script:LastStepMessage.PadRight($script:Width) -NoNewline -ForegroundColor Cyan
-    [Console]::SetCursorPosition(0, $script:StepRow + 1)
-    if ((Get-Service $SvcName).Status -ne 'Stopped') {
-        Get-Process "SearchIndexer" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+$DOCache = "C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"
+if (Test-Path $DOCache) {
+    if ($DryRun) {
+        $RegionEst += Get-PathSize $DOCache
+    } else {
+        Remove-Item "$DOCache\*" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
     }
 }
 
+# --- SEARCH INDEX RESET ---
 $SearchPath = "C:\ProgramData\Microsoft\Search\Data\Applications\Windows"
-if (Test-Path $SearchPath) { 
-    # FIX: Using cmd /c del bypasses the PowerShell ArgumentException 
-    # if files disappear during the recursive delete.
-    Start-Process "cmd.exe" -ArgumentList "/c del /s /f /q `"$SearchPath\*`"" -WindowStyle Hidden -Wait
-}
-Start-Service $SvcName -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+if ($DryRun) {
+    if (Test-Path $SearchPath) { $RegionEst += Get-PathSize $SearchPath }
+} else {
+    $SvcName = "WSearch"
+    $Svc = Get-Service $SvcName -ErrorAction SilentlyContinue
+    if ($Svc -and $Svc.Status -ne 'Stopped') {
+        Stop-Service $SvcName -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+        $RetryCount = 0
+        while ((Get-Service $SvcName).Status -ne 'Stopped' -and $RetryCount -lt 10) {
+            $dots = '.' * (($RetryCount % 3) + 1)
+            $savedRow = [Console]::CursorTop
+            [Console]::SetCursorPosition(0, $script:StepRow)
+            Write-Host ("$($script:LastStepMessage) [Stopping WSearch$dots]").PadRight($script:Width) -NoNewline -ForegroundColor Cyan
+            [Console]::SetCursorPosition(0, $savedRow)
+            Start-Sleep -Seconds 2
+            $RetryCount++
+        }
+        # Restore clean step line (strip the "[Stopping WSearch...]" suffix)
+        [Console]::SetCursorPosition(0, $script:StepRow)
+        Write-Host $script:LastStepMessage.PadRight($script:Width) -NoNewline -ForegroundColor Cyan
+        [Console]::SetCursorPosition(0, $script:StepRow + 1)
+        if ((Get-Service $SvcName).Status -ne 'Stopped') {
+            Get-Process "SearchIndexer" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        }
+    }
 
-# Windows Installer Cache
+    if (Test-Path $SearchPath) { 
+        # FIX: Using cmd /c del bypasses the PowerShell ArgumentException 
+        # if files disappear during the recursive delete.
+        Start-Process "cmd.exe" -ArgumentList "/c del /s /f /q `"$SearchPath\*`"" -WindowStyle Hidden -Wait
+    }
+    Start-Service $SvcName -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+}
+
+# Windows Installer Cache (orphaned packages older than 90 days)
 $InstallerPath = "C:\Windows\Installer"
 if (Test-Path $InstallerPath) {
     $InstalledProducts = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.LocalPackage } | Select-Object -ExpandProperty LocalPackage
-    Get-ChildItem $InstallerPath -Filter "*.ms[ip]" -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notin $InstalledProducts -and $_.LastWriteTime -lt (Get-Date).AddDays(-90) } | Remove-Item -Force -ErrorAction SilentlyContinue
+    $OrphanPkgs = Get-ChildItem $InstallerPath -Filter "*.ms[ip]" -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notin $InstalledProducts -and $_.LastWriteTime -lt (Get-Date).AddDays(-90) }
+    if ($DryRun) {
+        $OrphanSum = ($OrphanPkgs | Measure-Object -Property Length -Sum).Sum
+        if ($OrphanSum) { $RegionEst += [int64]$OrphanSum }
+    } else {
+        $OrphanPkgs | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
 }
 
-# --- Windows.old cleanup ---
+# --- Windows.old cleanup (age-gated) ---
+# Only remove once the feature-update rollback window has closed, so we never kill
+# a live rollback path. Read the real window via DISM; fall back to 14 days.
 if (Test-Path "C:\Windows.old") {
-    # Strip the previous-installation protection so Windows.old is deletable.
-    & DISM.exe /Online /Remove-OSUninstall /NoRestart *>&1 | Out-Null
+    $OldAgeDays = ((Get-Date) - (Get-Item "C:\Windows.old").LastWriteTime).TotalDays
+    $UninstallWindow = 14
+    try {
+        $DismWin = & DISM.exe /Online /Get-OSUninstallWindow 2>$null
+        $WinLine = $DismWin | Select-String -Pattern 'Uninstall Window\D+(\d+)'
+        if ($WinLine) { $UninstallWindow = [int]$WinLine.Matches[0].Groups[1].Value }
+    } catch { }
 
-    # cleanmgr is skipped entirely: it ignores -WindowStyle Hidden (spawns an uncontrolled
-    # child process), shows its UI in interactive sessions, and silently fails under
-    # SYSTEM/LiveConnect where there is no desktop. rd /s /q is an order of magnitude
-    # faster than Remove-Item -Recurse for deep trees (minutes vs hours).
-    $rdProc = Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
-    if ($rdProc) {
-        $rdProc | Wait-Process -Timeout 1800 -ErrorAction SilentlyContinue
-        if (-not $rdProc.HasExited) { $rdProc | Stop-Process -Force -ErrorAction SilentlyContinue }
-    }
+    if ($OldAgeDays -gt $UninstallWindow) {
+        if ($DryRun) {
+            $RegionEst += Get-PathSize "C:\Windows.old"
+        } else {
+            # Strip the previous-installation protection so Windows.old is deletable.
+            & DISM.exe /Online /Remove-OSUninstall /NoRestart *>&1 | Out-Null
 
-    # Fallback: if rd hit locked files, take ownership and retry once
-    if (Test-Path "C:\Windows.old") {
-        & takeown /F "C:\Windows.old" /R /A /D Y 2>$null | Out-Null
-        & icacls "C:\Windows.old" /grant Administrators:F /T /C /Q 2>$null | Out-Null
-        Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+            # cleanmgr is skipped entirely: it ignores -WindowStyle Hidden (spawns an uncontrolled
+            # child process), shows its UI in interactive sessions, and silently fails under
+            # SYSTEM/LiveConnect where there is no desktop. rd /s /q is an order of magnitude
+            # faster than Remove-Item -Recurse for deep trees (minutes vs hours).
+            $rdProc = Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+            if ($rdProc) {
+                $rdProc | Wait-Process -Timeout 1800 -ErrorAction SilentlyContinue
+                if (-not $rdProc.HasExited) { $rdProc | Stop-Process -Force -ErrorAction SilentlyContinue }
+            }
+
+            # Fallback: if rd hit locked files, take ownership and retry once
+            if (Test-Path "C:\Windows.old") {
+                & takeown /F "C:\Windows.old" /R /A /D Y 2>$null | Out-Null
+                & icacls "C:\Windows.old" /grant Administrators:F /T /C /Q 2>$null | Out-Null
+                Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+            }
+        }
     }
 }
 
-# --- Region 4: finalize and accumulate (robust) ---
-# Get current free space once and compute bytes delta
-$CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-$CurrentSpace = [int64]$CurrentDrive.FreeSpace
-
-# Defensive: ensure $LastRegionSpace exists and is numeric
-if ($null -eq $LastRegionSpace) { $LastRegionSpace = $CurrentSpace }
-
-$RegionSavedBytes = [int64]($CurrentSpace - $LastRegionSpace)
-
-# Format for display (no rounding for accumulator)
-if ($RegionSavedBytes -gt 0) {
-    $SavedStr = if ($RegionSavedBytes -ge 1GB) { "{0:N2} GB" -f ($RegionSavedBytes / 1GB) } else { "{0:N2} MB" -f ($RegionSavedBytes / 1MB) }
-    Write-StepUpdate -Success -CustomInfo "(Saved: $SavedStr)"
+# --- Region 1: finalize and accumulate ---
+if ($DryRun) {
+    Write-DryEstimate $RegionEst
 } else {
-    Write-StepUpdate -Success -CustomInfo "Saved: 0 MB"
-    $RegionSavedBytes = 0
+    $CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+    $CurrentSpace = [int64]$CurrentDrive.FreeSpace
+    if ($null -eq $LastRegionSpace) { $LastRegionSpace = $CurrentSpace }
+    $RegionSavedBytes = [int64]($CurrentSpace - $LastRegionSpace)
+    if ($RegionSavedBytes -gt 0) {
+        $SavedStr = if ($RegionSavedBytes -ge 1GB) { "{0:N2} GB" -f ($RegionSavedBytes / 1GB) } else { "{0:N2} MB" -f ($RegionSavedBytes / 1MB) }
+        Write-StepUpdate -Success -CustomInfo "(Saved: $SavedStr)"
+    } else {
+        Write-StepUpdate -Success -CustomInfo "Saved: 0 MB"
+        $RegionSavedBytes = 0
+    }
+    if (-not $script:TotalYieldBytes) { $script:TotalYieldBytes = 0 }
+    $script:TotalYieldBytes = [int64]$script:TotalYieldBytes
+    if ($RegionSavedBytes -gt 0) { $script:TotalYieldBytes += $RegionSavedBytes }
+    if (-not $script:RegionHistory) { $script:RegionHistory = @() }
+    $script:RegionHistory += [pscustomobject]@{ Region = 'Region1'; Bytes = $RegionSavedBytes; Time = (Get-Date) }
+    $LastRegionSpace = $CurrentSpace
 }
-
-# Ensure accumulator exists in script scope and add only positive gains
-if (-not $script:TotalYieldBytes) { $script:TotalYieldBytes = 0 }
-$script:TotalYieldBytes = [int64]$script:TotalYieldBytes
-if ($RegionSavedBytes -gt 0) { $script:TotalYieldBytes += $RegionSavedBytes }
-
-# Keep a small history for debugging
-if (-not $script:RegionHistory) { $script:RegionHistory = @() }
-$script:RegionHistory += [pscustomobject]@{ Region = 'Region4'; Bytes = $RegionSavedBytes; Time = (Get-Date) }
-
-# Update rolling baseline after accumulation
-$LastRegionSpace = $CurrentSpace
 #endregion
 
-#region 5. Deep Cache Purge
+#region 2. Deep Cache Purge
 # ============================================================================
-Write-StepUpdate "[05/10] Purging Browser, Office, and GPU Caches..."
+Write-StepUpdate "[02/08] Purging Browser, Office, and GPU Caches..."
+$RegionEst = [int64]0
 $GlobalCaches = @("C:\Windows\Temp\*", "C:\Windows\Prefetch\*", "C:\Windows\SystemTemp\*")
-foreach ($P in $GlobalCaches) { if (Test-Path $P) { Remove-Item $P -Recurse -Force -ErrorAction SilentlyContinue | Out-Null } }
+foreach ($P in $GlobalCaches) {
+    if (Test-Path $P) {
+        if ($DryRun) { $RegionEst += Get-PathSize $P }
+        else { Remove-Item $P -Recurse -Force -ErrorAction SilentlyContinue | Out-Null }
+    }
+}
 Get-ChildItem "C:\Users" -Directory | ForEach-Object {
     $UP = $_.FullName
     $ShaderPaths = @("$UP\AppData\Local\D3DSCache", "$UP\AppData\Local\AMD\DxCache", "$UP\AppData\Local\NVIDIA\GLCache")
@@ -718,45 +452,84 @@ Get-ChildItem "C:\Users" -Directory | ForEach-Object {
         "$UP\AppData\Local\Opera Software\Opera Stable\Cache\*",
         "$UP\AppData\Local\Temp\*"
     )
-    # Office & Outlook (NST) Cleanup
-    foreach ($OP in $OffPaths) { if (Test-Path $OP) { Remove-Item $OP -Recurse -Force -ErrorAction SilentlyContinue } }
-    # Outlook NST (Search Index) files
     $OutlookPath = "$UP\AppData\Local\Microsoft\Outlook"
-    if (Test-Path $OutlookPath) {
-        Get-ChildItem $OutlookPath -Filter "*.nst" -Force | Remove-Item -Force -ErrorAction SilentlyContinue
-    }
-    # GPU Shader Caches
-    foreach ($SP in $ShaderPaths) { if (Test-Path $SP) { Remove-Item "$SP\*" -Recurse -Force -ErrorAction SilentlyContinue } }
-    foreach ($T in $TargetDirs) { 
-        if (Test-Path $T) { 
-            try {
-                Remove-Item $T -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable DeleteError
-                # VSA STABILITY: Brief pause to allow RMM heartbeat and disk breathing
-                Start-Sleep -Milliseconds 50
-            } catch {
-                continue
-            }
-        } 
+    if ($DryRun) {
+        foreach ($OP in $OffPaths) { $RegionEst += Get-PathSize $OP }
+        if (Test-Path $OutlookPath) {
+            $NstSum = (Get-ChildItem $OutlookPath -Filter "*.nst" -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($NstSum) { $RegionEst += [int64]$NstSum }
+        }
+        foreach ($SP in $ShaderPaths) { $RegionEst += Get-PathSize $SP }
+        foreach ($T in $TargetDirs) { $RegionEst += Get-PathSize $T }
+    } else {
+        # Office & Outlook (NST) Cleanup
+        foreach ($OP in $OffPaths) { if (Test-Path $OP) { Remove-Item $OP -Recurse -Force -ErrorAction SilentlyContinue } }
+        # Outlook NST (Search Index) files
+        if (Test-Path $OutlookPath) {
+            Get-ChildItem $OutlookPath -Filter "*.nst" -Force | Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+        # GPU Shader Caches
+        foreach ($SP in $ShaderPaths) { if (Test-Path $SP) { Remove-Item "$SP\*" -Recurse -Force -ErrorAction SilentlyContinue } }
+        foreach ($T in $TargetDirs) { 
+            if (Test-Path $T) { 
+                try {
+                    Remove-Item $T -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable DeleteError
+                    # VSA STABILITY: Brief pause to allow RMM heartbeat and disk breathing
+                    Start-Sleep -Milliseconds 50
+                } catch {
+                    continue
+                }
+            } 
+        }
     }
 }
-# --- Calculate Regional Savings ---
-$CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-$RegionSaved = $CurrentDrive.FreeSpace - $LastRegionSpace
-if ($RegionSaved -gt 0) {
-    $SavedStr = if ($RegionSaved -gt 1GB) { "$([math]::Round($RegionSaved / 1GB, 2)) GB" } else { "$([math]::Round($RegionSaved / 1MB, 2)) MB" }
-    Write-StepUpdate -Success -CustomInfo "(Saved: $SavedStr)"
+# --- Region 2: finalize ---
+if ($DryRun) {
+    Write-DryEstimate $RegionEst
 } else {
-    Write-StepUpdate -Success
+    $CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+    $RegionSaved = $CurrentDrive.FreeSpace - $LastRegionSpace
+    if ($RegionSaved -gt 0) {
+        $SavedStr = if ($RegionSaved -gt 1GB) { "$([math]::Round($RegionSaved / 1GB, 2)) GB" } else { "$([math]::Round($RegionSaved / 1MB, 2)) MB" }
+        Write-StepUpdate -Success -CustomInfo "(Saved: $SavedStr)"
+    } else {
+        Write-StepUpdate -Success
+    }
+    if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
+    $LastRegionSpace = $CurrentDrive.FreeSpace
 }
-# Add the raw bytes to the running total
-if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
-# Update the marker for the next region
-$LastRegionSpace = $CurrentDrive.FreeSpace
 #endregion
 
-#region 6. Windows Update Database Reset
+#region 3. Recycle Bin Purge
 # ============================================================================
-Write-StepUpdate "[06/10] Resetting Windows Update Database..."
+Write-StepUpdate "[03/08] Emptying Recycle Bin (all users)..."
+# rd on the per-volume store clears every user's Recycle Bin. Clear-RecycleBin only
+# empties the current identity's bin, which under SYSTEM/LiveConnect misses the
+# logged-in user's deleted files (often the biggest quick win on a disk alert).
+# Windows recreates the folder automatically.
+if ($DryRun) {
+    $RegionEst = Get-PathSize "C:\`$Recycle.Bin"
+    Write-DryEstimate $RegionEst
+} else {
+    if (Test-Path "C:\`$Recycle.Bin") {
+        Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\`$Recycle.Bin`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+    }
+    $CurrentDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+    $RegionSaved = $CurrentDrive.FreeSpace - $LastRegionSpace
+    if ($RegionSaved -gt 0) {
+        $SavedStr = if ($RegionSaved -gt 1GB) { "$([math]::Round($RegionSaved / 1GB, 2)) GB" } else { "$([math]::Round($RegionSaved / 1MB, 2)) MB" }
+        Write-StepUpdate -Success -CustomInfo "(Saved: $SavedStr)"
+    } else {
+        Write-StepUpdate -Success
+    }
+    if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
+    $LastRegionSpace = $CurrentDrive.FreeSpace
+}
+#endregion
+
+#region 4. Windows Update Database Reset
+# ============================================================================
+Write-StepUpdate "[04/08] Resetting Windows Update Database..."
 # CHECK: If a reboot is pending, SoftwareDistribution is likely locked. 
 # Skip to prevent the script from hanging.
 $PendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
@@ -764,6 +537,9 @@ $PendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Comp
 if ($PendingReboot) {
     Write-StepUpdate -CustomInfo "[SKIPPED]"
     Write-Host "        (Reboot pending - SoftwareDistribution locked)" -ForegroundColor DarkYellow
+} elseif ($DryRun) {
+    $RegionEst = Get-PathSize "C:\Windows\SoftwareDistribution"
+    Write-DryEstimate $RegionEst
 } else {
     # REMOVED "Bits" from this list to prevent VSA disconnects
     $Svcs = @("Wuauserv", "CryptSvc", "Msiserver")
@@ -787,31 +563,36 @@ if ($PendingReboot) {
     } else {
         Write-StepUpdate -Success
     }
-    # Add the raw bytes to the running total
     if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
-    # Update the marker for the next region
     $LastRegionSpace = $CurrentDrive.FreeSpace
 }
 #endregion
 
-#region 7. Repair & Integrity
+#region 5. Repair & Integrity
 # ============================================================================
 if ($IsVM) { [System.GC]::Collect() }
 Write-Progress -Activity "Cleaning up" -Completed
 
-# Pre-repair: stability check - warn only, never skip (PendingFileRenameOperations
-# is routinely re-created by Windows/installers and does not block DISM or SFC)
+# Pre-repair: stability check - warn only, never skip on PendingRename alone
+# (PendingFileRenameOperations is routinely re-created by Windows/installers and
+# does not block DISM or SFC). Dry run, active servicing, and a pending reboot DO skip.
 $SkipRepair = $false
 $PendingRename = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
 $HasPendingRename = $null -ne $PendingRename
-if ($PendingReboot) {
+if ($DryRun) {
+    Write-Host "        [i] Dry run - DISM and SFC repair steps skipped (no changes)." -ForegroundColor Magenta
+}
+elseif ($PendingReboot) {
     Write-Host "        [!] Reboot pending - DISM and SFC repair steps will be skipped." -ForegroundColor DarkYellow
+}
+elseif ($ServicingActive) {
+    Write-Host "        [!] Windows servicing active (TiWorker/DISM running) - DISM and SFC repair steps will be skipped." -ForegroundColor DarkYellow
 }
 elseif ($HasPendingRename) {
     Write-Host "        [!] PendingFileRenameOperations found - skipping repair steps." -ForegroundColor DarkYellow
 }
 # Ensure TrustedInstaller is available (prevents DISM Error 87 / SFC failures)
-if (-not $SkipRepair) {
+if (-not $SkipRepair -and -not $DryRun) {
     $TI = Get-Service -Name "TrustedInstaller" -ErrorAction SilentlyContinue
     if ($TI.StartType -eq 'Disabled') { Set-Service -Name "TrustedInstaller" -StartupType Manual }
     if ($TI.Status -ne 'Running') { Start-Service -Name "TrustedInstaller" -ErrorAction SilentlyContinue }
@@ -872,13 +653,13 @@ if (-not $SkipRepair) {
             Start-Sleep -Milliseconds 300
         }
     }
-# --- PHASE 7: RestoreHealth ---
+# --- STEP 5: RestoreHealth ---
             Clear-InputBuffer
-            $S72 = "[07/10] DISM RestoreHealth..."
+            $S72 = "[05/08] DISM RestoreHealth..."
             Write-StepUpdate $S72 -CustomInfo "[Press ESC to Skip]"
             $Row72 = try { [Console]::CursorTop - 1 } catch { -1 }
 
-            if ($PendingReboot -or $HasPendingRename) {
+            if ($DryRun -or $PendingReboot -or $HasPendingRename -or $ServicingActive) {
                 Clear-AndReprintStep -StartRow $Row72 -Message $S72 -CustomInfo "[SKIPPED]"
             }
             else {
@@ -947,12 +728,12 @@ if (-not $SkipRepair) {
                 }
             }
 
-# --- STEP 8: DISM ComponentCleanup ---
-            $S73 = "[08/10] DISM ComponentCleanup..."
+# --- STEP 6: DISM ComponentCleanup ---
+            $S73 = "[06/08] DISM ComponentCleanup..."
             Write-StepUpdate $S73 -CustomInfo "[Press ESC to Skip]"
             $Row73 = try { [Console]::CursorTop - 1 } catch { -1 }
 
-            if ($PendingReboot -or $HasPendingRename) {
+            if ($DryRun -or $PendingReboot -or $HasPendingRename -or $ServicingActive) {
                 Clear-AndReprintStep -StartRow $Row73 -Message $S73 -CustomInfo "[SKIPPED]"
             }
             else {
@@ -1029,12 +810,12 @@ if (-not $SkipRepair) {
                 }
             }
 
-# --- STEP 9: SFC /scannow ---
-            $S74 = "[09/10] SFC /scannow..."
+# --- STEP 7: SFC /scannow ---
+            $S74 = "[07/08] SFC /scannow..."
             Write-StepUpdate $S74 -CustomInfo "[Press ESC to Skip]"
             $Row74 = try { [Console]::CursorTop - 1 } catch { -1 }
 
-            if ($PendingReboot -or $HasPendingRename) {
+            if ($DryRun -or $PendingReboot -or $HasPendingRename -or $ServicingActive) {
                 Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[SKIPPED]"
             }
             else {
@@ -1104,32 +885,30 @@ if (-not $SkipRepair) {
                 }
             }
 }
-$CurrentSpace = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'").FreeSpace
-$RegionSaved = $CurrentSpace - $LastRegionSpace
-#if ($RegionSaved -gt 0) {
-#    $SavedStr = if ($RegionSaved -gt 1GB) { "$([math]::Round($RegionSaved / 1GB, 2)) GB" } else { "$([math]::Round($RegionSaved / 1MB, 2)) MB" }
-#    Write-Host "     Repair Yield: $SavedStr" -ForegroundColor Gray
-#}
-# Add the raw bytes to the running total
-if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
-# Update marker for the final Region 8
-$LastRegionSpace = $CurrentSpace
+if (-not $DryRun) {
+    $CurrentSpace = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'").FreeSpace
+    $RegionSaved = $CurrentSpace - $LastRegionSpace
+    if ($RegionSaved -gt 0) { $TotalYieldBytes += [int64]$RegionSaved }
+    $LastRegionSpace = $CurrentSpace
+}
 #endregion
 
-#region 8. Final Optimization
+#region 6. Final Optimization
 # ============================================================================
-Write-StepUpdate "[10/10] Finalizing Network & SSD TRIM..."
-& ipconfig.exe /flushdns | Out-Null
-& powercfg.exe /h off | Out-Null
-# High Performance power plan (AC only)
-$highPerf = Get-CimInstance -Namespace root\cimv2\power -ClassName Win32_PowerPlan -ErrorAction SilentlyContinue | Where-Object { $_.ElementName -eq "High performance" }
-if ($highPerf) { $planGuid = ($highPerf.InstanceId -split '\{' | Select-Object -Last 1).TrimEnd('}'); powercfg /setactive $planGuid }
-& powercfg.exe /change standby-timeout-ac 0  | Out-Null
-& powercfg.exe /change standby-timeout-dc 60 | Out-Null
-& powercfg.exe /change monitor-timeout-ac 60 | Out-Null
-& powercfg.exe /change monitor-timeout-dc 15 | Out-Null
-try { Optimize-Volume -DriveLetter C -ReTrim -ErrorAction SilentlyContinue | Out-Null } catch { }
-Write-StepUpdate -Success
+Write-StepUpdate "[08/08] Finalizing Network, Hibernation & SSD TRIM..."
+if ($DryRun) {
+    # powercfg /h off reclaims hiberfil.sys; estimate its current size
+    $HibBytes = [int64]0
+    if (Test-Path "C:\hiberfil.sys") {
+        try { $HibBytes = [int64](Get-Item "C:\hiberfil.sys" -Force -ErrorAction SilentlyContinue).Length } catch { $HibBytes = 0 }
+    }
+    Write-DryEstimate $HibBytes
+} else {
+    & ipconfig.exe /flushdns | Out-Null
+    & powercfg.exe /h off | Out-Null
+    try { Optimize-Volume -DriveLetter C -ReTrim -ErrorAction SilentlyContinue | Out-Null } catch { }
+    Write-StepUpdate -Success
+}
 
 # --- FINAL SUMMARY ---
 # Ensure disk info and total size are valid
@@ -1137,34 +916,42 @@ $FinalDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
 $TotalSize = [double]$TotalSize
 if ($TotalSize -le 0) { throw "TotalSize is zero or undefined. Aborting final summary." }
 
-# Use script-scoped accumulator (robust across functions/jobs)
 if (-not $script:TotalYieldBytes) { $script:TotalYieldBytes = 0 }
 $script:TotalYieldBytes = [int64]$script:TotalYieldBytes
+if (-not $script:EstYieldBytes) { $script:EstYieldBytes = 0 }
+$script:EstYieldBytes = [int64]$script:EstYieldBytes
 
-# Compute final usage percent
 $FinalFree = [int64]$FinalDrive.FreeSpace
 $FinalUsedPct = [Math]::Round(((($TotalSize - $FinalFree) / $TotalSize) * 100), 2)
-
-# Format recovered total for display
-if ($script:TotalYieldBytes -ge 1GB) {
-    $TotalStr = "{0:N2} GB" -f ($script:TotalYieldBytes / 1GB)
-} else {
-    $TotalStr = "{0:N2} MB" -f ($script:TotalYieldBytes / 1MB)
-}
-
-# Print summary with simple color logic
 $FinalUsedGB = [Math]::Round(($TotalSize - $FinalFree) / 1GB, 2)
 $FinalTotalGB = [Math]::Round($TotalSize / 1GB, 0)
 $FinalColor = if ($FinalUsedPct -ge 90) { "Red" } elseif ($FinalUsedPct -ge 80) { "DarkYellow" } else { "Green" }
+
 Write-HLine -Style dashed
-Write-Host "Final Disk Usage    : " -NoNewline -ForegroundColor $InfoCol
-Write-Host "$FinalUsedGB GB used of $FinalTotalGB GB ($FinalUsedPct%)" -ForegroundColor $FinalColor
-Write-Host "Space Recovered     : " -NoNewline -ForegroundColor $InfoCol
-Write-Host "$TotalStr" -ForegroundColor Yellow
+if ($DryRun) {
+    # Projected free space if the estimated reclaim were applied
+    $ProjFree = [int64]($FinalFree + $script:EstYieldBytes)
+    $ProjUsedPct = [Math]::Round(((($TotalSize - $ProjFree) / $TotalSize) * 100), 2)
+    $ProjColor = if ($ProjUsedPct -ge 90) { "Red" } elseif ($ProjUsedPct -ge 80) { "DarkYellow" } else { "Green" }
+    if ($script:EstYieldBytes -ge 1GB) { $EstStr = "{0:N2} GB" -f ($script:EstYieldBytes / 1GB) } else { $EstStr = "{0:N2} MB" -f ($script:EstYieldBytes / 1MB) }
+
+    Write-Host "Current Disk Usage  : " -NoNewline -ForegroundColor $InfoCol
+    Write-Host "$FinalUsedGB GB used of $FinalTotalGB GB ($FinalUsedPct%)" -ForegroundColor $FinalColor
+    Write-Host "Est. Recoverable    : " -NoNewline -ForegroundColor $InfoCol
+    Write-Host "$EstStr" -ForegroundColor Magenta
+    Write-Host "Projected After Run : " -NoNewline -ForegroundColor $InfoCol
+    Write-Host "$([Math]::Round(($TotalSize - $ProjFree) / 1GB, 2)) GB used of $FinalTotalGB GB ($ProjUsedPct%)" -ForegroundColor $ProjColor
+} else {
+    if ($script:TotalYieldBytes -ge 1GB) { $TotalStr = "{0:N2} GB" -f ($script:TotalYieldBytes / 1GB) } else { $TotalStr = "{0:N2} MB" -f ($script:TotalYieldBytes / 1MB) }
+    Write-Host "Final Disk Usage    : " -NoNewline -ForegroundColor $InfoCol
+    Write-Host "$FinalUsedGB GB used of $FinalTotalGB GB ($FinalUsedPct%)" -ForegroundColor $FinalColor
+    Write-Host "Space Recovered     : " -NoNewline -ForegroundColor $InfoCol
+    Write-Host "$TotalStr" -ForegroundColor Yellow
+}
 # Footer
 $_sfx   = "█"
 $_ffillW = $script:Width - $_artW - 1 - $_sfx.Length
-$_footer = "  MAINTENANCE COMPLETE"
+$_footer = if ($DryRun) { "  DRY RUN COMPLETE" } else { "  MAINTENANCE COMPLETE" }
 $_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $_fver.Length))
 
 Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
