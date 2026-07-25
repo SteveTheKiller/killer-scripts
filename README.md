@@ -13,10 +13,6 @@ A collection of production-ready PowerShell scripts for Windows administration, 
 
 **Compatibility:** PowerShell 5.1, PowerShell 7, and Kaseya LiveConnect. No external dependencies unless noted in the script header. All scripts are tested on Windows 10 and Windows 11.
 
-**Repository:** <https://github.com/SteveTheKiller/killer-scripts>
-
-**Also available at:** <https://killertools.net/killer-scripts>
-
 ---
 
 ## Contents
