@@ -4,8 +4,6 @@
 
 </div>
 
-> Production-ready PowerShell for Windows administration, deployment, repair, and hardening.
-
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/License-GPLv3-blue)
@@ -16,6 +14,8 @@ A collection of production-ready PowerShell scripts for Windows administration, 
 **Compatibility:** PowerShell 5.1, PowerShell 7, and Kaseya LiveConnect. No external dependencies unless noted in the script header. All scripts are tested on Windows 10 and Windows 11.
 
 **Repository:** <https://github.com/SteveTheKiller/killer-scripts>
+
+**Also available at:** <https://killertools.net/killer-scripts>
 
 ---
 
