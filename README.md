@@ -1,4 +1,8 @@
-# killer-scripts
+<div align="center">
+
+![Killer Scripts](header.png)
+
+</div>
 
 > Production-ready PowerShell for Windows administration, deployment, repair, and hardening.
 
