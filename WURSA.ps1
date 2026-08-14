@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.5
-    Developed by Steve the Killer | Updated: 2026-07-16
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.6
+    Developed by Steve the Killer | Updated: 2026-08-14
 .DESCRIPTION
     Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
     (skips in-use apps). Performs unattended feature upgrades to 25H2, dispatched to a
@@ -21,7 +21,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.5"
+$_ver    = "| v2.6"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -70,7 +70,7 @@ function Write-StepUpdate {
 $OS = Get-CimInstance Win32_OperatingSystem
 
 Clear-Host
-$script:Width  = 85
+$script:Width  = 95
 
 $LineCol   = "DarkCyan"
 $MainCol   = "Cyan"
@@ -133,7 +133,7 @@ function Write-HLine {
 $_pfx  = "█  "
 $_art1 = "╦ ╦ ╦ ╦ ╦═╗ ╔═╗ ╔═╗ "
 $_art2 = "║║║ ║ ║ ╠╦╝ ╚═╗ ╠═╣ "
-$_art3 = "╚╩╝ ╚═╝ ╩╚═ ╚═╝ ╩ ╩ "
+$_art3 = "╚╩╝ ╚.╝ ╩╚═ ╚═╝ ╩ ╩ "
 $_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
 $_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
 $_fillW = $script:Width - $_pfx.Length - $_artW
@@ -163,9 +163,10 @@ $_rpDesc    = "WURSA Pre-Update $($env:COMPUTERNAME) $(Get-Date -Format 'yyyy-MM
 $_rpJob = Start-Job -ScriptBlock {
     param($Desc)
     try {
+        $ProgressPreference = 'SilentlyContinue'
         # Ensure System Protection is enabled on C: (often disabled on managed endpoints)
         Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue | Out-Null
-        Checkpoint-Computer -Description $Desc -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+        Checkpoint-Computer -Description $Desc -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop | Out-Null
         "OK"
     } catch {
         "ERR: $($_.Exception.Message)"
@@ -385,7 +386,6 @@ $ThirdParty = @(
     @{ Name = "VLC";             ChocoID = "vlc";              Path = "C:\Program Files\VideoLAN\VLC\vlc.exe";                                             Process = "vlc" },
     @{ Name = "7-Zip";           ChocoID = "7zip";             Path = "C:\Program Files\7-Zip\7z.exe";                                                     Process = "7zFM" },
     @{ Name = "KillerPDF";       ChocoID = "killerpdf";        Path = @("C:\Program Files\KillerPDF\KillerPDF.exe","$env:LOCALAPPDATA\Programs\KillerPDF\KillerPDF.exe"); Process = "KillerPDF" }
-#    @{ Name = "KillerScan";       ChocoID = "killerscan";        Path = @("C:\Program Files\KillerScan\KillerScan.exe","$env:LOCALAPPDATA\Programs\KillerScan\KillerScan.exe"); Process = "KillerPDF" }
 )
 $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
 if (-not $ChocoAvailable) {
@@ -449,15 +449,16 @@ if ($ChocoAvailable -and -not $No3rdParty) {
             }
         }
         $_procs = @($App.Process)
+
         if (-not $_appPath) {
-            Write-Host "      > " -NoNewline -ForegroundColor $DimCol
-            Write-Host "$($App.Name):" -NoNewline -ForegroundColor $DimCol
+            Write-Host "      > " -NoNewline -ForegroundColor Gray
+            Write-Host "$($App.Name): " -NoNewline -ForegroundColor White
             Write-SubResult "[NOT INSTALLED]" DarkGray
         } else {
             $IsRunning = $_procs | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
             if ($IsRunning) {
-                Write-Host "      > " -NoNewline -ForegroundColor $DimCol
-                Write-Host "$($App.Name):" -NoNewline -ForegroundColor $DimCol
+                Write-Host "      > " -NoNewline -ForegroundColor Gray
+                Write-Host "$($App.Name): " -NoNewline -ForegroundColor White
                 Write-SubResult "[IN USE - SKIPPED]" Yellow
             } else {
                 Write-Host "      > " -NoNewline -ForegroundColor Gray
@@ -729,7 +730,7 @@ function Set-WUUpgradeOverrides {
     Set-ItemProperty -Path $auk  -Name AUOptions        -Value 4 -Type DWord -Force
     Set-ItemProperty -Path $polk -Name SetActiveHours   -Value 1 -Type DWord -Force
     Set-ItemProperty -Path $polk -Name ActiveHoursStart -Value $IPU_ActiveHoursStart -Type DWord -Force
-    Set-ItemProperty -Path $polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
+    Set-ItemProperty -Path $polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd -Type DWord -Force
     Write-Output "Cleared NoAutoUpdate, set AUOptions=4, and pinned active hours $IPU_ActiveHoursStart-$IPU_ActiveHoursEnd so WU can deliver and reboot out of hours (originals recorded)."
 }
 
@@ -798,11 +799,20 @@ function Invoke-IPUComponentRepair {
     Write-Output "Component store repair complete."
 }
 function Invoke-IPUEnablementPackage {
-    # 24H2 (26100) -> 25H2 via KB5054156 eKB. Apply, repair+retry once, else WU fallback. x64 only.
-    Write-Output "24H2 detected (build 26100). Applying the 25H2 enablement package (KB5054156)."
+    # 24H2 (26100) -> 25H2 via KB5054156 eKB. Verify servicing baseline, apply, repair+retry once, else WU fallback. x64 only.
+    $ekCV = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $ekBuild = [int]$ekCV.CurrentBuild
+    $ekUBR = [int]$ekCV.UBR
+    if ($ekBuild -eq 26100 -and $ekUBR -lt 5074) {
+        Write-Output "24H2 servicing baseline $ekBuild.$ekUBR is below the 25H2 eKB prerequisite 26100.5074. Handing off to Windows Update."
+        Invoke-IPUWindowsUpdate -Reason "24H2 servicing baseline $ekBuild.$ekUBR below 26100.5074"
+        return
+    }
+
+    Write-Output "24H2 detected (build $ekBuild.$ekUBR). Applying the 25H2 enablement package (KB5054156)."
     try {
         $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
-        if ($bl -and $bl.ProtectionStatus -eq 'On') { Suspend-BitLocker -MountPoint "C:" -RebootCount 2 -ErrorAction Stop; Write-Output "BitLocker suspended for the eKB reboot." }
+        if ($bl -and $bl.ProtectionStatus -eq 'On') { Suspend-BitLocker -MountPoint "C:" -RebootCount 2 -ErrorAction Stop; Write-Output "BitLocker suspension for the eKB reboot." }
     } catch { Write-Output "BitLocker suspension failed: $($_.Exception.Message)" }
 
     Set-Status "DOWNLOADING $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
@@ -826,9 +836,20 @@ function Invoke-IPUEnablementPackage {
             $codes += ("0x{0:X}" -f $ec)
             "wusa exit code: $ec (0x$('{0:X}' -f $ec))" | Out-File -FilePath $IPU_SetupLog -Encoding ASCII
             # 0 = applied; 3010 = applied, reboot required; 0x240006 (2359302) = already installed
-            if ($ec -eq 0 -or $ec -eq 3010 -or $ec -eq 2359302) {
+            if ($ec -eq 0 -or $ec -eq 3010) {
                 Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                 Write-Output "eKB applied (exit $($codes[-1])). Reboot to finish 25H2."
+                return
+            }
+            if ($ec -eq 2359302) {
+                $ekPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or (Test-Path "$env:SystemRoot\WinSxS\pending.xml")
+                if ($ekPending) {
+                    Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                    Write-Output "eKB is already installed and servicing reports a pending reboot. Reboot to finish 25H2."
+                    return
+                }
+                Write-Output "eKB is already installed, but no pending reboot is present and the OS is still 24H2. Handing off to Windows Update."
+                Invoke-IPUWindowsUpdate -Reason "24H2 eKB already installed without pending reboot"
                 return
             }
             if ($t -eq 1) { Write-Output "eKB apply returned $($codes[-1]). Repairing component store and retrying once."; Invoke-IPUComponentRepair }
