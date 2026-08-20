@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.6
-    Developed by Steve the Killer | Updated: 2026-08-14
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.7
+    Developed by Steve the Killer | Updated: 2026-08-20
 .DESCRIPTION
     Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
     (skips in-use apps). Performs unattended feature upgrades to 25H2, dispatched to a
@@ -11,8 +11,9 @@
 .NOTES
     Params: -InplaceUpgrade (auto-confirm, unattended/RMM), -No3rdParty, -NoUpgrade.
     Feature-upgrade result is written to C:\Windows\Temp\25H2IPU\ipu_status.txt; poll it.
-    Status: REBOOT_REQUIRED (staged, reboot to finish), WU_HANDOFF (handed to Windows
-    Update, nothing staged, do NOT reboot), REPAIRING, BLOCK_* (manual), FAILED_*.
+    Status: REBOOT_REQUIRED (staged, reboot to finish), DISPATCHED/RUNNING/DOWNLOADING/
+    REPAIRING/VERIFY_PENDING (upgrade active), VERIFIED (committed), BLOCK_*/FAILED_*/
+    UNEXPECTED (not complete).
     Only REBOOT_REQUIRED should trigger a reboot, always left to the caller.
 #>
 param(
@@ -21,15 +22,17 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.6"
+$_ver    = "| v2.7"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
 
-# Set true in region 3 if Windows Update stages the target feature build, so
-# region 5 skips the redundant in-place upgrade prompt (DisplayVersion does not
-# flip until the pending reboot finalizes).
+# Feature-upgrade state is tracked separately from ordinary Windows Update.
+# A surfaced/downloaded feature update is NOT considered staged. Region 5 owns
+# the deterministic 25H2 upgrade path unless Windows reports a real reboot-ready
+# feature update.
 $script:FeatureUpdateStaged = $false
+$script:FeatureUpgradeState = "UNKNOWN"
 
 #region 0 - Pre-Flight & Helpers
 $script:ExitCode = 0
@@ -133,7 +136,7 @@ function Write-HLine {
 $_pfx  = "█  "
 $_art1 = "╦ ╦ ╦ ╦ ╦═╗ ╔═╗ ╔═╗ "
 $_art2 = "║║║ ║ ║ ╠╦╝ ╚═╗ ╠═╣ "
-$_art3 = "╚╩╝ ╚.╝ ╩╚═ ╚═╝ ╩ ╩ "
+$_art3 = "╚╩╝ ╚═╝ ╩╚═ ╚═╝ ╩ ╩ "
 $_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
 $_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
 $_fillW = $script:Width - $_pfx.Length - $_artW
@@ -199,22 +202,20 @@ try {
 }
 #endregion
 
-#region 1.4 - Open Windows Update for the feature-update path (runs before the scan)
+#region 1.4 - Open Windows Update policy for the update pass
 # ============================================================================
-# The 25H2 feature update rides USO/UUP, which a fleet NoAutoUpdate=1 policy gags.
-# On the managed and re-keyed Enterprise-composition boxes, Windows Update is the
-# ONLY path that upgrades them, so open it here, before the region-2 scan, instead
-# of discovering that too late in region 5 and burning an ISO cycle first. USO then
-# has this whole run (regions 2-4 take minutes) plus the hours after to surface and
-# stage 25H2 as pending. Gated on a real feature gap so Kaseya's policy is left alone
-# on already-current boxes; originals are recorded and Restore-WUUpgradeOverrides puts
-# them back once the box reaches 25H2. This is the confirmed LP27 unblock sequence.
+# Some managed endpoints carry NoAutoUpdate=1, which can prevent the direct Windows
+# Update API from servicing ordinary updates. Open the policy here, but DO NOT kick
+# a USO feature-update scan. Region 5 owns the 25H2 upgrade path. Starting USO here
+# can pre-download 25H2 in parallel and race the deterministic ISO/eKB path. Enterprise
+# and ARM64 fallback paths explicitly start USO later only when Windows Update is the
+# selected upgrade mechanism. Original policy values are recorded for restoration.
 $IPU_WorkDir          = "C:\Windows\Temp\25H2IPU"
 $IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
 $IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
 $IPU_ActiveHoursEnd   = 19
 if (-not $NoUpgrade -and $WinVer -ne $LatestVersion) {
-    Write-Host "[>] Opening Windows Update for the $LatestVersion feature update..." -ForegroundColor $LineCol
+    Write-Host "[>] Opening Windows Update policy for the update pass..." -ForegroundColor $LineCol
     $_polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $_auk  = "$_polk\AU"
     if (-not (Test-Path $_polk)) { New-Item -Path $_polk -Force | Out-Null }
@@ -245,8 +246,7 @@ if (-not $NoUpgrade -and $WinVer -ne $LatestVersion) {
     Set-ItemProperty -Path $_polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
     Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
-    Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartInteractiveScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
-    Write-Host "      WU opened (NoAutoUpdate=0, AUOptions=4); USO scan kicked. Feature update will surface as pending." -ForegroundColor $DimCol
+    Write-Host "      WU opened (NoAutoUpdate=0, AUOptions=4); direct API scan follows. 25H2 is reserved for Region 5." -ForegroundColor $DimCol
 }
 #endregion
 
@@ -275,8 +275,21 @@ try {
     $s1 = $UpdateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0").Updates
     $s2 = $UpdateSearcher.Search("IsInstalled=0 and Type='Driver' and IsHidden=0").Updates
     $UpdateList = New-Object -ComObject Microsoft.Update.UpdateColl
-    foreach ($u in $s1) { $UpdateList.Add($u) | Out-Null }
+    $script:FeatureUpdateOffered = $false
+    foreach ($u in $s1) {
+        # Do not install a feature update through the generic WU loop. A download or
+        # pre-download is not a completed upgrade and used to cause false WU_HANDOFF
+        # success. Region 5 handles 25H2 with a deterministic upgrade mechanism.
+        if ($u.Title -match [regex]::Escape($LatestVersion) -or $u.Title -match 'Feature update to Windows') {
+            $script:FeatureUpdateOffered = $true
+            continue
+        }
+        $UpdateList.Add($u) | Out-Null
+    }
     foreach ($u in $s2) { $UpdateList.Add($u) | Out-Null }
+    if ($script:FeatureUpdateOffered) {
+        Write-Host "      [i] $LatestVersion feature update detected; reserved for the dedicated feature-upgrade path." -ForegroundColor $DimCol
+    }
 } catch {
     Write-StepUpdate -Success -CustomInfo "(Scan Error)"
     Write-Host "      [!] WU search failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -315,7 +328,7 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
             }
             $_chunk = $_rem.Substring(0, $_uAvail)
             $_split = $_chunk.LastIndexOf(' ')
-            if ($_split -le 0) { $_split = $_uAvail }   # no space found — hard break
+            if ($_split -le 0) { $_split = $_uAvail }   # no space found - hard break
             $_uLines += "$_pfx$($_rem.Substring(0, $_split).TrimEnd())"
             $_rem    = $_rem.Substring($_split).TrimStart()
             $_first  = $false
@@ -335,8 +348,6 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
             $Installer.Updates = $UpdatesToInstall
             $Installer.AllowSourcePrompts = $false
             $InstallResult = $Installer.Install()
-            # Flag the target feature update so region 5 skips the redundant IPU prompt
-            if ($Update.Title -match [regex]::Escape($LatestVersion)) { $script:FeatureUpdateStaged = $true }
             $_savedTop = [Console]::CursorTop
             [Console]::SetCursorPosition(0, $_uRow)
             for ($_li = 0; $_li -lt $_uLines.Count; $_li++) {
@@ -510,6 +521,8 @@ $IPU_SetupLog   = Join-Path $IPU_WorkDir "setup_exit.log"
 $IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
 $IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
 $IPU_TaskName   = "WURSA-25H2-IPU"
+$IPU_VerifierPath  = Join-Path $IPU_WorkDir "Verify-25H2.ps1"
+$IPU_VerifyTaskName = "WURSA-25H2-Verify"
 
 # 24H2 (26100) -> 25H2 enablement package (KB5054156). x64 only; host MSU in killer-isos bucket.
 $IPU_EkbName    = "Win11_25H2_eKB_KB5054156_x64.msu"
@@ -547,20 +560,17 @@ function Restore-WUUpgradeOverrides {
     Write-Host "      Restored original Windows Update policy values (auto-update and active hours)." -ForegroundColor $DimCol
 }
 
-function Test-WUFeatureUpdatePending {
-    # True if Windows Update is now servicing the target feature update -- either
-    # offering / downloading it (IsInstalled=0) or holding it staged pending reboot
-    # (RebootRequired=1). Either state means the early ungag worked and WU has the box
-    # on the edition-aware path, so we must NOT race it with local media. Reuses the
-    # region-2 $UpdateSearcher. Regions 2-4 gave USO minutes to surface it since the ungag.
-    foreach ($_crit in @("IsInstalled=0 and IsHidden=0", "RebootRequired=1")) {
-        try {
-            $_res = $UpdateSearcher.Search($_crit).Updates
-            foreach ($_u in $_res) {
-                if ($_u.Title -match [regex]::Escape($LatestVersion) -or $_u.Title -match 'Feature update to Windows') { return $true }
-            }
-        } catch {}
-    }
+function Test-WUFeatureUpdateStaged {
+    # Only a feature update that Windows reports as reboot-required is considered staged.
+    # Offered, downloading, and pre-downloaded updates do not suppress the deterministic
+    # Region 5 upgrade path. This prevents WURSA from declaring a handoff while the box
+    # remains on the old feature release.
+    try {
+        $_res = $UpdateSearcher.Search("RebootRequired=1").Updates
+        foreach ($_u in $_res) {
+            if ($_u.Title -match [regex]::Escape($LatestVersion) -or $_u.Title -match 'Feature update to Windows') { return $true }
+        }
+    } catch {}
     return $false
 }
 
@@ -570,18 +580,16 @@ $InstalledVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\Curre
 Write-Host "      Installed Version : $InstalledVersion" -ForegroundColor Yellow
 Write-Host "      Latest Version    : $LatestVersion"    -ForegroundColor Yellow
 if ($NoUpgrade) {
+    $script:FeatureUpgradeState = "SKIPPED"
     Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
-} elseif ($script:FeatureUpdateStaged) {
-    Write-Host "      > $LatestVersion already staged via Windows Update; pending reboot. In-place upgrade not needed." -ForegroundColor $DimCol
-} elseif ($InstalledVersion -ne $LatestVersion -and (Test-WUFeatureUpdatePending)) {
-    # WU-first: the region-1.4 ungag let USO pick up $LatestVersion and it is now
-    # pending / downloading. This is the edition-aware path and the only one that works
-    # on the managed and Enterprise-composition boxes, so hand off and let USO finish
-    # over the coming hours. Nothing is staged for an immediate reboot; do NOT dispatch
-    # local media (racing WU against the CBS store is what causes 0xC1900101).
-    Write-Host "      > Windows Update is now servicing $LatestVersion (edition-aware path). Handing off; no local media needed." -ForegroundColor $DimCol
+} elseif ($InstalledVersion -ne $LatestVersion -and (Test-WUFeatureUpdateStaged)) {
+    # This is the only Windows Update state that suppresses the dedicated upgrade path.
+    # Windows has actually staged the feature update and is asking for a reboot.
+    $script:FeatureUpdateStaged = $true
+    $script:FeatureUpgradeState = "REBOOT_REQUIRED"
+    Write-Host "      > $LatestVersion is staged by Windows Update and requires a reboot." -ForegroundColor $DimCol
     if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
-    ('WU_HANDOFF ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
+    ('REBOOT_REQUIRED WU ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
 } elseif ($InstalledVersion -ne $LatestVersion) {
     Write-Host "      > Feature update available." -ForegroundColor $WarnCol
     # Battery safety
@@ -593,6 +601,7 @@ if ($NoUpgrade) {
 
     $proceed = $false
     if ($OnBattery) {
+        $script:FeatureUpgradeState = "BLOCKED_BATTERY"
         Write-Host "      [!] Upgrade skipped: device is running on battery power." -ForegroundColor Yellow
     } elseif ($InplaceUpgrade) {
         Write-Host "      [-InplaceUpgrade] Auto-dispatching detached ISO-based upgrade." -ForegroundColor $DimCol
@@ -612,10 +621,56 @@ if ($NoUpgrade) {
         }
     }
 
+    if (-not $OnBattery -and -not $proceed) {
+        $script:FeatureUpgradeState = "NOT_STARTED"
+    }
+
     if (-not $OnBattery -and $proceed) {
         Write-Host "[>] Dispatching detached In-Place Upgrade (survives session disconnect)..." -ForegroundColor $LineCol
 
         if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
+
+        # Build a one-shot post-reboot verifier. It runs as SYSTEM at startup, waits
+        # for normal boot to settle, verifies DisplayVersion, and restores the temporary
+        # Windows Update policy overrides only after 25H2 is actually committed.
+        $VerifierBody = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+Start-Sleep -Seconds 180
+`$cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+`$ver = `$cv.DisplayVersion
+`$build = `$cv.CurrentBuild
+`$ubr = `$cv.UBR
+`$stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+if (`$ver -eq '$LatestVersion') {
+    "VERIFIED $LatestVersion `$build.`$ubr `$stamp" | Out-File -FilePath '$IPU_StatusFile' -Encoding ASCII -Force
+    if (Test-Path '$IPU_AURestoreFile') {
+        `$polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+        `$auk  = "`$polk\AU"
+        `$map  = @{}
+        foreach (`$line in (Get-Content '$IPU_AURestoreFile' -ErrorAction SilentlyContinue)) {
+            if (`$line -match '^([^=]+)=(.+)$') { `$map[`$matches[1]] = `$matches[2] }
+        }
+        `$targets = @{ NoAutoUpdate = `$auk; AUOptions = `$auk; SetActiveHours = `$polk; ActiveHoursStart = `$polk; ActiveHoursEnd = `$polk }
+        foreach (`$name in @(`$targets.Keys)) {
+            `$key = `$targets[`$name]; `$orig = `$map[`$name]
+            if (`$null -eq `$orig -or `$orig -eq 'ABSENT') { Remove-ItemProperty -Path `$key -Name `$name -ErrorAction SilentlyContinue }
+            else { Set-ItemProperty -Path `$key -Name `$name -Value ([int]`$orig) -Type DWord -Force }
+        }
+        Remove-Item '$IPU_AURestoreFile' -Force -ErrorAction SilentlyContinue
+    }
+    schtasks.exe /Delete /TN '$IPU_VerifyTaskName' /F | Out-Null
+    exit 0
+}
+`$setupActive = Test-Path 'HKLM:\SYSTEM\Setup\MoSetup\Volatile'
+if (`$setupActive) {
+    "VERIFY_PENDING VERSION_`$ver BUILD_`$build.`$ubr `$stamp" | Out-File -FilePath '$IPU_StatusFile' -Encoding ASCII -Force
+    exit 0
+}
+"FAILED_POSTREBOOT VERSION_`$ver BUILD_`$build.`$ubr `$stamp" | Out-File -FilePath '$IPU_StatusFile' -Encoding ASCII -Force
+schtasks.exe /Delete /TN '$IPU_VerifyTaskName' /F | Out-Null
+exit 1
+"@
+        $VerifierBody | Out-File -FilePath $IPU_VerifierPath -Encoding ASCII -Force
 
         # --- Build the standalone runner the scheduled task executes as SYSTEM ---
         # Config preamble (double-quoted here-string: values are injected now).
@@ -628,6 +683,8 @@ if ($NoUpgrade) {
 `$IPU_SetupLog   = '$IPU_SetupLog'
 `$IPU_StatusFile = '$IPU_StatusFile'
 `$IPU_TaskName   = '$IPU_TaskName'
+`$IPU_VerifierPath  = '$IPU_VerifierPath'
+`$IPU_VerifyTaskName = '$IPU_VerifyTaskName'
 `$IPU_IsoSha256  = '$IPU_IsoSha256'
 `$IPU_IAUrl     = '$IPU_IAUrl'
 `$IPU_IASha256  = '$IPU_IASha256'
@@ -645,6 +702,16 @@ $ErrorActionPreference = "Continue"
 function Set-Status { param([string]$Text) try { $Text | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force } catch {} }
 $IPU_IAExe  = Join-Path $IPU_WorkDir "Windows11InstallationAssistant.exe"
 $IPU_IAArgs = "/QuietInstall /SkipEULA /auto upgrade /NoReboot"
+function Register-IPUPostRebootVerifier {
+    $verifyCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$IPU_VerifierPath`""
+    $verifyOut = schtasks.exe /Create /TN $IPU_VerifyTaskName /TR $verifyCmd /SC ONSTART /RU SYSTEM /RL HIGHEST /F 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "Post-reboot verifier registered as $IPU_VerifyTaskName."
+        return $true
+    }
+    Write-Output "WARN: post-reboot verifier could not be registered: $verifyOut"
+    return $false
+}
 function Invoke-IPUInstallationAssistant {
     param([string]$Reason)
     Write-Output "Routing to Windows 11 Installation Assistant ($Reason)."
@@ -688,6 +755,7 @@ function Invoke-IPUInstallationAssistant {
         $iaCode = $iaProc.ExitCode
         Write-Output "Installation Assistant exited with code $iaCode."
         if ($iaCode -eq 0 -or $iaCode -eq 3010) {
+            $null = Register-IPUPostRebootVerifier
             Set-Status "REBOOT_REQUIRED IA $iaStamp"
         } else {
             Write-Output "Installation Assistant could not complete (exit $iaCode); falling back to Windows Update."
@@ -787,7 +855,7 @@ function Invoke-IPUWindowsUpdate {
     Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
     Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartInteractiveScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
-    Set-Status "WU_HANDOFF $wuStamp"
+    Set-Status "FAILED_WU_HANDOFF $wuStamp"
 }
 function Invoke-IPUComponentRepair {
     # Repair component store (StartComponentCleanup, RestoreHealth, SFC). Fixes 0xC1900204 / eKB apply failures. Needs internet.
@@ -837,6 +905,7 @@ function Invoke-IPUEnablementPackage {
             "wusa exit code: $ec (0x$('{0:X}' -f $ec))" | Out-File -FilePath $IPU_SetupLog -Encoding ASCII
             # 0 = applied; 3010 = applied, reboot required; 0x240006 (2359302) = already installed
             if ($ec -eq 0 -or $ec -eq 3010) {
+                $null = Register-IPUPostRebootVerifier
                 Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                 Write-Output "eKB applied (exit $($codes[-1])). Reboot to finish 25H2."
                 return
@@ -844,6 +913,7 @@ function Invoke-IPUEnablementPackage {
             if ($ec -eq 2359302) {
                 $ekPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or (Test-Path "$env:SystemRoot\WinSxS\pending.xml")
                 if ($ekPending) {
+                    $null = Register-IPUPostRebootVerifier
                     Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                     Write-Output "eKB is already installed and servicing reports a pending reboot. Reboot to finish 25H2."
                     return
@@ -1026,8 +1096,8 @@ if (-not $cancel) {
 
         $done = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         switch ($IPU_ExitCode) {
-            0           { Set-Status "REBOOT_REQUIRED 3010 $done" }
-            3010        { Set-Status "REBOOT_REQUIRED 3010 $done" }
+            0           { $null = Register-IPUPostRebootVerifier; Set-Status "REBOOT_REQUIRED 3010 $done" }
+            3010        { $null = Register-IPUPostRebootVerifier; Set-Status "REBOOT_REQUIRED 3010 $done" }
             -1047526908 { Invoke-IPUInstallationAssistant -Reason "0xC1900204 persists after store repair" }
             -1047527167 { Set-Status "BLOCK_HARD_COMPAT 0xC1900101 $done" }
             -1047526904 { Set-Status "BLOCK_APP_DRIVER 0xC1900208 $done" }
@@ -1051,18 +1121,24 @@ schtasks.exe /Delete /TN "$IPU_TaskName" /F | Out-Null
         if ($LASTEXITCODE -eq 0) {
             $runOut = schtasks.exe /Run /TN $IPU_TaskName 2>&1
             if ($LASTEXITCODE -eq 0) {
+                $script:FeatureUpgradeState = "DISPATCHED"
                 Write-Host "      > Upgrade dispatched as SYSTEM. It continues after you disconnect." -ForegroundColor Green
                 Write-Host "      > Status file : $IPU_StatusFile" -ForegroundColor $DimCol
                 Write-Host "      > Setup logs  : $IPU_LogDir" -ForegroundColor $DimCol
                 Write-Host "      > A reboot will be required once the detached upgrade completes." -ForegroundColor $WarnCol
             } else {
+                $script:FeatureUpgradeState = "FAILED"
+                ('FAILED TASK_START ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
                 Write-Host "      [!] Task created but failed to start: $runOut" -ForegroundColor Red
             }
         } else {
+            $script:FeatureUpgradeState = "FAILED"
+            ('FAILED TASK_CREATE ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
             Write-Host "      [!] Failed to register scheduled task: $createOut" -ForegroundColor Red
         }
     }
 } else {
+    $script:FeatureUpgradeState = "CURRENT"
     Write-Host "      System is already on the latest feature update." -ForegroundColor Green
     Restore-WUUpgradeOverrides
 }
@@ -1071,19 +1147,70 @@ schtasks.exe /Delete /TN "$IPU_TaskName" /F | Out-Null
 
 #region 6 - Finalization
 # ============================================================================
-# Checking reboot status via direct API to bypass Get-WURebootStatus crash
+# Checking reboot status via direct API to bypass Get-WURebootStatus crash.
 $RebootPending = if ($InstallResult) { $InstallResult.RebootRequired } else { $false }
 if (-not $RebootPending) {
     $RebootPending = $null -ne (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue)
 }
 
-Write-HLine -Style dashed
-if ($RebootPending) {
-    Write-Host "[!] STATUS: REBOOT REQUIRED" -ForegroundColor Red
-} else {
-    Write-Host "STATUS: SYSTEM CURRENT" -ForegroundColor Green
+# Never report SYSTEM CURRENT solely because there is no reboot flag. A feature
+# upgrade is complete only when the installed DisplayVersion actually equals 25H2.
+$_finalCV      = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+$_finalVersion = $_finalCV.DisplayVersion
+$_ipuState     = ""
+if (Test-Path $IPU_StatusFile) {
+    try { $_ipuState = (Get-Content $IPU_StatusFile -ErrorAction Stop | Select-Object -First 1).Trim() } catch {}
 }
-$script:ExitCode = if ($RebootPending) { 3010 } else { 0 }
+
+Write-HLine -Style dashed
+if (-not $NoUpgrade -and $_finalVersion -eq $LatestVersion) {
+    Write-Host "STATUS: SYSTEM CURRENT ($LatestVersion)" -ForegroundColor Green
+    $script:ExitCode = 0
+} elseif ($NoUpgrade) {
+    if ($RebootPending) {
+        Write-Host "[!] STATUS: REBOOT REQUIRED" -ForegroundColor Red
+        $script:ExitCode = 3010
+    } else {
+        Write-Host "STATUS: UPDATE PASS COMPLETE" -ForegroundColor Green
+        $script:ExitCode = 0
+    }
+} elseif ($script:FeatureUpgradeState -eq "REBOOT_REQUIRED") {
+    Write-Host "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" -ForegroundColor Red
+    $script:ExitCode = 3010
+} elseif ($script:FeatureUpgradeState -match '^(FAILED|BLOCKED|NOT_STARTED)') {
+    Write-Host "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" -ForegroundColor Red
+    if ($script:FeatureUpgradeState) { Write-Host "      Upgrade state: $($script:FeatureUpgradeState)" -ForegroundColor $WarnCol }
+    $script:ExitCode = 1
+} elseif ($script:FeatureUpgradeState -eq "DISPATCHED") {
+    if ($_ipuState -match '^REBOOT_REQUIRED') {
+        Write-Host "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" -ForegroundColor Red
+        Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol
+        $script:ExitCode = 3010
+    } elseif ($_ipuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
+        Write-Host "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" -ForegroundColor Red
+        Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $WarnCol
+        $script:ExitCode = 1
+    } else {
+        Write-Host "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" -ForegroundColor $WarnCol
+        if ($_ipuState) { Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol }
+        $script:ExitCode = 0
+    }
+} elseif ($_ipuState -match '^REBOOT_REQUIRED') {
+    Write-Host "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" -ForegroundColor Red
+    Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol
+    $script:ExitCode = 3010
+} elseif ($_ipuState -match '^(DISPATCHED|RUNNING|DOWNLOADING|REPAIRING|VERIFY_PENDING)') {
+    Write-Host "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" -ForegroundColor $WarnCol
+    Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol
+    $script:ExitCode = 0
+} elseif ($_ipuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
+    Write-Host "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" -ForegroundColor Red
+    Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $WarnCol
+    $script:ExitCode = 1
+} else {
+    Write-Host "[!] STATUS: FEATURE UPGRADE NOT COMPLETE (still $_finalVersion)" -ForegroundColor Red
+    $script:ExitCode = 1
+}
 # Footer
 $_sfx    = "█"
 $_ftrW   = $_artW + 1
