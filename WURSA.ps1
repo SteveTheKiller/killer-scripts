@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.7
-    Developed by Steve the Killer | Updated: 2026-08-20
+    Developed by Steve the Killer | Updated: 2026-08-25
 .DESCRIPTION
     Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
     (skips in-use apps). Performs unattended feature upgrades to 25H2, dispatched to a
@@ -246,7 +246,7 @@ if (-not $NoUpgrade -and $WinVer -ne $LatestVersion) {
     Set-ItemProperty -Path $_polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
     Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
-    Write-Host "      WU opened (NoAutoUpdate=0, AUOptions=4); direct API scan follows. 25H2 is reserved for Region 5." -ForegroundColor $DimCol
+    Write-Host "      WU opened (NoAutoUpdate=0, AUOptions=4); direct API scan follows." -ForegroundColor $DimCol
 }
 #endregion
 
@@ -288,7 +288,7 @@ try {
     }
     foreach ($u in $s2) { $UpdateList.Add($u) | Out-Null }
     if ($script:FeatureUpdateOffered) {
-        Write-Host "      [i] $LatestVersion feature update detected; reserved for the dedicated feature-upgrade path." -ForegroundColor $DimCol
+        Write-Host "      [i] $LatestVersion detected; reserved for the upgrade path." -ForegroundColor $DimCol    
     }
 } catch {
     Write-StepUpdate -Success -CustomInfo "(Scan Error)"
