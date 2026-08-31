@@ -136,7 +136,7 @@ function Write-HLine {
 $_pfx  = "█  "
 $_art1 = "╦ ╦ ╦ ╦ ╦═╗ ╔═╗ ╔═╗ "
 $_art2 = "║║║ ║ ║ ╠╦╝ ╚═╗ ╠═╣ "
-$_art3 = "╚╩╝ ╚═╝ ╩╚═ ╚═╝ ╩ ╩ "
+$_art3 = "╚╩╝ ╚.╝ ╩╚═ ╚═╝ ╩ ╩ "
 $_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
 $_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
 $_fillW = $script:Width - $_pfx.Length - $_artW
@@ -288,7 +288,7 @@ try {
     }
     foreach ($u in $s2) { $UpdateList.Add($u) | Out-Null }
     if ($script:FeatureUpdateOffered) {
-        Write-Host "      [i] $LatestVersion detected; reserved for the upgrade path." -ForegroundColor $DimCol    
+        Write-Host "      [i] $LatestVersion detected; reserved for the upgrade path." -ForegroundColor $DimCol
     }
 } catch {
     Write-StepUpdate -Success -CustomInfo "(Scan Error)"
@@ -577,8 +577,21 @@ function Test-WUFeatureUpdateStaged {
 Write-HLine -Style dashed
 Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
 $InstalledVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
+# Detect the native machine architecture from CIM instead of the PowerShell process
+# environment. Snapdragon/ARM64 devices can run x64-emulated management processes,
+# where PROCESSOR_ARCHITECTURE may report AMD64 and incorrectly route to x64 media.
+$IPU_ProcArch = $null
+$IPU_OSArch   = $null
+try { $IPU_ProcArch = [int](Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Architecture) } catch {}
+try { $IPU_OSArch   = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture } catch {}
+$IPU_IsArm64 = ($IPU_ProcArch -in @(5,12)) -or ($IPU_OSArch -match 'ARM')
+if (-not $IPU_IsArm64 -and $null -eq $IPU_ProcArch -and -not $IPU_OSArch) {
+    # Last-resort fallback only when CIM is unavailable.
+    $IPU_IsArm64 = ($env:PROCESSOR_ARCHITECTURE -match 'ARM') -or ($env:PROCESSOR_ARCHITEW6432 -match 'ARM')
+}
 Write-Host "      Installed Version : $InstalledVersion" -ForegroundColor Yellow
 Write-Host "      Latest Version    : $LatestVersion"    -ForegroundColor Yellow
+if ($IPU_IsArm64) { Write-Host "      Architecture      : ARM64" -ForegroundColor $AccentCol }
 if ($NoUpgrade) {
     $script:FeatureUpgradeState = "SKIPPED"
     Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
@@ -604,13 +617,21 @@ if ($NoUpgrade) {
         $script:FeatureUpgradeState = "BLOCKED_BATTERY"
         Write-Host "      [!] Upgrade skipped: device is running on battery power." -ForegroundColor Yellow
     } elseif ($InplaceUpgrade) {
-        Write-Host "      [-InplaceUpgrade] Auto-dispatching detached ISO-based upgrade." -ForegroundColor $DimCol
+        if ($IPU_IsArm64) {
+            Write-Host "      [-InplaceUpgrade] ARM64 detected; auto-dispatching Windows Update feature-upgrade handoff." -ForegroundColor $DimCol
+        } else {
+            Write-Host "      [-InplaceUpgrade] Auto-dispatching detached feature-upgrade workflow." -ForegroundColor $DimCol
+        }
         $proceed = $true
     } else {
         # Flush buffered keystrokes; guarded so redirected (RMM) consoles do not throw
         try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
         try {
-            Write-Host "Would you like to perform an in-place upgrade to $($LatestVersion)? (Y/N): " -NoNewline -ForegroundColor $WarnCol
+            if ($IPU_IsArm64) {
+                Write-Host "Would you like to hand off the $($LatestVersion) upgrade to Windows Update? (Y/N): " -NoNewline -ForegroundColor $WarnCol
+            } else {
+                Write-Host "Would you like to perform an in-place upgrade to $($LatestVersion)? (Y/N): " -NoNewline -ForegroundColor $WarnCol
+            }
             $key    = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
             $choice = $key.Character
             if ($choice -ne "`n" -and $choice -ne "`r") { Write-Host $choice -NoNewline }
@@ -626,7 +647,11 @@ if ($NoUpgrade) {
     }
 
     if (-not $OnBattery -and $proceed) {
-        Write-Host "[>] Dispatching detached In-Place Upgrade (survives session disconnect)..." -ForegroundColor $LineCol
+        if ($IPU_IsArm64) {
+            Write-Host "[>] Dispatching detached ARM64 Windows Update handoff (survives session disconnect)..." -ForegroundColor $LineCol
+        } else {
+            Write-Host "[>] Dispatching detached feature-upgrade workflow (survives session disconnect)..." -ForegroundColor $LineCol
+        }
 
         if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
 
@@ -961,7 +986,16 @@ $IPU_EdId    = $IPU_CV.EditionID
 $IPU_Prod    = $IPU_CV.ProductName
 $IPU_Build   = [int]$IPU_CV.CurrentBuild
 $IPU_RunLang = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction SilentlyContinue).InstallLanguage
-$IPU_IsArm   = ($env:PROCESSOR_ARCHITECTURE -match 'ARM') -or ($env:PROCESSOR_ARCHITEW6432 -match 'ARM')
+# Detect native hardware/OS architecture. Environment variables can describe the
+# emulated PowerShell process instead of the Snapdragon/ARM64 machine underneath it.
+$IPU_ProcArch = $null
+$IPU_OSArch   = $null
+try { $IPU_ProcArch = [int](Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Architecture) } catch {}
+try { $IPU_OSArch   = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture } catch {}
+$IPU_IsArm = ($IPU_ProcArch -in @(5,12)) -or ($IPU_OSArch -match 'ARM')
+if (-not $IPU_IsArm -and $null -eq $IPU_ProcArch -and -not $IPU_OSArch) {
+    $IPU_IsArm = ($env:PROCESSOR_ARCHITECTURE -match 'ARM') -or ($env:PROCESSOR_ARCHITEW6432 -match 'ARM')
+}
 $IPU_IsLtsc  = ($IPU_EdId -match 'EnterpriseS|IoTEnterpriseS') -or ($IPU_Prod -match 'LTSC|LTSB')
 $IPU_Hosted  = ($IPU_RunLang -eq '0409' -or $IPU_RunLang -eq '0809')
 
