@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.7
-    Developed by Steve the Killer | Updated: 2026-08-25
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.8
+    Developed by Steve the Killer | Updated: 2026-09-11
 .DESCRIPTION
     Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
     (skips in-use apps). Performs unattended feature upgrades to 25H2, dispatched to a
@@ -12,7 +12,7 @@
     Params: -InplaceUpgrade (auto-confirm, unattended/RMM), -No3rdParty, -NoUpgrade.
     Feature-upgrade result is written to C:\Windows\Temp\25H2IPU\ipu_status.txt; poll it.
     Status: REBOOT_REQUIRED (staged, reboot to finish), DISPATCHED/RUNNING/DOWNLOADING/
-    REPAIRING/VERIFY_PENDING (upgrade active), VERIFIED (committed), BLOCK_*/FAILED_*/
+    REPAIRING/VERIFY_PENDING/WU_HANDOFF (upgrade active), VERIFIED (committed), BLOCK_*/FAILED_*/
     UNEXPECTED (not complete).
     Only REBOOT_REQUIRED should trigger a reboot, always left to the caller.
 #>
@@ -22,7 +22,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.7"
+$_ver    = "| v2.8"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
@@ -880,7 +880,7 @@ function Invoke-IPUWindowsUpdate {
     Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
     Start-Process -FilePath "$env:SystemRoot\System32\UsoClient.exe" -ArgumentList "StartInteractiveScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
-    Set-Status "FAILED_WU_HANDOFF $wuStamp"
+    Set-Status "WU_HANDOFF $wuStamp"
 }
 function Invoke-IPUComponentRepair {
     # Repair component store (StartComponentCleanup, RestoreHealth, SFC). Fixes 0xC1900204 / eKB apply failures. Needs internet.
@@ -1034,7 +1034,7 @@ if (Test-Path $IPU_IsoPath) {
     else { Remove-Item $IPU_IsoPath -Force -ErrorAction SilentlyContinue }
 }
 
-if ($NeedDownload) {
+if (-not $cancel -and $NeedDownload) {
     try {
         $HeadResponse = Invoke-WebRequest -Uri $IPU_IsoUrl -Method Head -UseBasicParsing -TimeoutSec 30
         Write-Output "URL OK (HTTP $($HeadResponse.StatusCode))."
@@ -1233,7 +1233,7 @@ if (-not $NoUpgrade -and $_finalVersion -eq $LatestVersion) {
     Write-Host "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" -ForegroundColor Red
     Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol
     $script:ExitCode = 3010
-} elseif ($_ipuState -match '^(DISPATCHED|RUNNING|DOWNLOADING|REPAIRING|VERIFY_PENDING)') {
+} elseif ($_ipuState -match '^(DISPATCHED|RUNNING|DOWNLOADING|REPAIRING|VERIFY_PENDING|WU_HANDOFF)') {
     Write-Host "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" -ForegroundColor $WarnCol
     Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol
     $script:ExitCode = 0
