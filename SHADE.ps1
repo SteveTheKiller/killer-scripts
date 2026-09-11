@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     System Hardening Against Data Exposure (SHADE) v1.0
     Developed by Steve the Killer | Updated: 2026-03-30
