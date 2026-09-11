@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Profile Removal Utility for Neglected Entries (PRUNE) v1.0
     Developed by SteveTheKiller | Updated: 2026-03-20
