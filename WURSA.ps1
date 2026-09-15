@@ -17,8 +17,9 @@
     Only REBOOT_REQUIRED should trigger a reboot, always left to the caller.
 #>
 param(
-    [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt
-    [switch]$No3rdParty,       # Skip Chocolatey / third-party app updates
+    [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt (implies -Update3rdParty)
+    [switch]$Update3rdParty,   # Auto-confirm the third-party update prompt (unattended)
+    [switch]$No3rdParty,       # Skip Chocolatey / third-party app updates entirely
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
@@ -36,6 +37,7 @@ $script:FeatureUpgradeState = "UNKNOWN"
 
 #region 0 - Pre-Flight & Helpers
 $script:ExitCode = 0
+$ProgressPreference = 'SilentlyContinue'   # suppress console-wide progress overlays (VSS/BITS/Invoke-WebRequest)
 trap { Write-Host "[!] Fatal: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
     Write-Warning "Elevation Required: Please run as Administrator."
@@ -168,9 +170,14 @@ $_rpJob = Start-Job -ScriptBlock {
     try {
         $ProgressPreference = 'SilentlyContinue'
         # Ensure System Protection is enabled on C: (often disabled on managed endpoints)
-        Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue | Out-Null
-        Checkpoint-Computer -Description $Desc -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop | Out-Null
-        "OK"
+        Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue *>$null
+        # Call the SystemRestore WMI method directly. Checkpoint-Computer wraps the
+        # same call but also emits a native progress bar that ignores $ProgressPreference
+        # (it comes from SrClient/VSS, not Write-Progress) and paints past the shell
+        # width. The WMI call is silent. 12 = MODIFY_SETTINGS, 100 = BEGIN_SYSTEM_CHANGE.
+        $sr = [wmiclass]"\\.\root\default:SystemRestore"
+        $r  = $sr.CreateRestorePoint($Desc, 12, 100)
+        if ($r.ReturnValue -eq 0) { "OK" } else { "ERR: CreateRestorePoint returned $($r.ReturnValue)" }
     } catch {
         "ERR: $($_.Exception.Message)"
     }
@@ -253,6 +260,27 @@ if (-not $NoUpgrade -and $WinVer -ne $LatestVersion) {
 #region 2 - Discovery
 # ============================================================================
 Write-StepUpdate "[3/5] Scanning for Drivers & OS Patches..."
+# A pending reboot from prior updates means Windows won't commit any further
+# updates until the boot happens. Attempting install on a pending-reboot box
+# either returns WU_E_UH_POSTREBOOTREQUIRED (0x80242014) again or leaves an
+# already-staged KB re-staged - which is why the same KB reappeared on every run.
+# Detect it, skip cleanly to the rest of the script, and let the caller decide
+# when to reboot. Feature-upgrade check still runs.
+$_rebootPending = $false
+foreach ($_rp in @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting'
+)) { if (Test-Path $_rp) { $_rebootPending = $true; break } }
+if (-not $_rebootPending) {
+    $_pfro = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+    if ($_pfro -and $_pfro.PendingFileRenameOperations) { $_rebootPending = $true }
+}
+if ($_rebootPending) {
+    Write-StepUpdate -Success -CustomInfo "(Deferred - Reboot Pending)"
+    Write-Host "[4/5] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
+    Write-SubResult "[DEFERRED]" $WarnCol
+} else {
 # Resume Windows Update if it is paused. While paused, WU returns nothing, so an
 # update run would silently find zero updates and the feature upgrade is never
 # offered. Clears the local "Pause updates" values (UX\Settings); leaves any
@@ -272,8 +300,12 @@ if (Test-Path $_uxk) {
 $UpdateSession = New-Object -ComObject Microsoft.Update.Session
 $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
 try {
-    $s1 = $UpdateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0").Updates
-    $s2 = $UpdateSearcher.Search("IsInstalled=0 and Type='Driver' and IsHidden=0").Updates
+    # IsPresent=0 excludes updates that are already staged on disk and only pending
+    # a reboot to commit. Without it, IsInstalled=0 alone returns the SAME KBs on
+    # every run until reboot, causing WURSA to re-download and re-stage the same
+    # payload three or more times in a row.
+    $s1 = $UpdateSearcher.Search("IsInstalled=0 and IsPresent=0 and Type='Software' and IsHidden=0").Updates
+    $s2 = $UpdateSearcher.Search("IsInstalled=0 and IsPresent=0 and Type='Driver' and IsHidden=0").Updates
     $UpdateList = New-Object -ComObject Microsoft.Update.UpdateColl
     $script:FeatureUpdateOffered = $false
     foreach ($u in $s1) {
@@ -348,13 +380,31 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
             $Installer.Updates = $UpdatesToInstall
             $Installer.AllowSourcePrompts = $false
             $InstallResult = $Installer.Install()
+            # IUpdateInstaller.Install always returns; success is decided by ResultCode
+            # (2=Succeeded, 3=SucceededWithErrors) and HResult (0=clean; 0x80242014 =
+            # WU_E_UH_POSTREBOOTREQUIRED, install genuinely pending a boot). Previous
+            # code wrote [SUCCESS] for any non-throwing call, hiding failures and
+            # letting the same KB re-install every WURSA run.
+            $_rc = $InstallResult.ResultCode
+            $_hr = $InstallResult.HResult
+            if ($_rc -eq 2 -and $_hr -eq 0) {
+                $_tag = "[SUCCESS]"; $_col = $OkCol
+                if ($InstallResult.RebootRequired) { $_tag = "[REBOOT REQ]"; $_col = $WarnCol; $script:_rebootRequired = $true }
+            } elseif ($_hr -eq -2145116140 -or $_hr -eq 0x80242014) {   # WU_E_UH_POSTREBOOTREQUIRED
+                $_tag = "[REBOOT REQ]"; $_col = $WarnCol
+                $script:_rebootRequired = $true
+            } elseif ($_rc -eq 3) {
+                $_tag = "[SUCCESS*]"; $_col = $WarnCol   # succeeded with errors
+            } else {
+                $_tag = "[FAILED 0x$('{0:X8}' -f $_hr)]"; $_col = "Red"
+            }
             $_savedTop = [Console]::CursorTop
             [Console]::SetCursorPosition(0, $_uRow)
             for ($_li = 0; $_li -lt $_uLines.Count; $_li++) {
                 if ($_li -eq $_uLines.Count - 1) {
-                    $_pad = " " * [math]::Max(1, $script:Width - $_uLines[$_li].Length - "[SUCCESS]".Length)
+                    $_pad = " " * [math]::Max(1, $script:Width - $_uLines[$_li].Length - $_tag.Length)
                     Write-Host "$($_uLines[$_li])$_pad" -NoNewline -ForegroundColor $DimCol
-                    Write-Host "[SUCCESS]" -ForegroundColor $OkCol
+                    Write-Host $_tag -ForegroundColor $_col
                 } else {
                     Write-Host $_uLines[$_li] -ForegroundColor $DimCol
                 }
@@ -378,64 +428,106 @@ if (-not $UpdateList -or $UpdateList.Count -eq 0) {
     Write-Progress -Activity "W.U.R.S.A.: Deploying Updates" -Completed
     Write-StepUpdate "[4/5] Windows Updates" -Success
 }
+}   # end reboot-pending else
 #endregion
 
 #region 4 - Third-Party Software Updates
 # ============================================================================
+# Install detection uses Chocolatey's own local package DB rather than probing
+# filesystem paths. A package known to Chocolatey is a package it can upgrade,
+# whatever install shape the package uses (Program Files, LOCALAPPDATA, portable
+# under $env:ProgramData\chocolatey\lib\<id>\tools). ChocoID may carry install
+# args after the package id; the id itself is the first token.
 $ThirdParty = @(
-    @{ Name = "Google Chrome";   ChocoID = "googlechrome --install-arguments='--system-level' --ignore-checksums"; Path = "C:\Program Files\Google\Chrome\Application\chrome.exe";                    Process = "chrome" },
-    @{ Name = "Microsoft Edge";  ChocoID = "microsoft-edge";   Path = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";                     Process = "msedge" },
-    @{ Name = "Mozilla Firefox"; ChocoID = "firefox";          Path = "C:\Program Files\Mozilla Firefox\firefox.exe";                                      Process = "firefox" },
-    @{ Name = "Brave";           ChocoID = "brave";            Path = "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe";                Process = "brave" },
-    @{ Name = "Adobe Acrobat";   ChocoID = "adobereader";      Path = @("C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe","C:\Program Files (x86)\Adobe\Acrobat DC\Acrobat\Acrobat.exe","C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe","C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe"); Process = @("Acrobat","AcroRd32") },
-    @{ Name = "Zoom";            ChocoID = "zoom --install-arguments='/quiet /norestart'"; Path = @("C:\Program Files\Zoom\bin\Zoom.exe","C:\Program Files (x86)\Zoom\bin\Zoom.exe","$env:APPDATA\Zoom\bin\Zoom.exe","$env:LOCALAPPDATA\Zoom\bin\Zoom.exe"); Process = "Zoom" },
-    @{ Name = "Microsoft Teams"; ChocoID = "microsoft-teams";  Path = @("C:\Program Files\Microsoft\Teams\current\Teams.exe","C:\Program Files (x86)\Microsoft\Teams\current\Teams.exe","C:\Program Files\WindowsApps\MSTeams_*\ms-teams.exe"); Process = @("Teams","ms-teams") },
-    @{ Name = "Webex";           ChocoID = "webex";            Path = "C:\Program Files\Webex\bin\CiscoCollabHost.exe";                                    Process = "CiscoCollabHost" },
-    @{ Name = "Slack";           ChocoID = "slack";            Path = "C:\Program Files\Slack\slack.exe";                                                  Process = "slack" },
-    @{ Name = "RingCentral";     ChocoID = "ringcentral";      Path = "C:\Program Files\RingCentral\RingCentral.exe";                                      Process = "RingCentral" },
-    @{ Name = "Notepad++";       ChocoID = "notepadplusplus";  Path = "C:\Program Files\Notepad++\notepad++.exe";                                          Process = "notepad++" },
-    @{ Name = "VLC";             ChocoID = "vlc";              Path = "C:\Program Files\VideoLAN\VLC\vlc.exe";                                             Process = "vlc" },
-    @{ Name = "7-Zip";           ChocoID = "7zip";             Path = "C:\Program Files\7-Zip\7z.exe";                                                     Process = "7zFM" },
-    @{ Name = "KillerPDF";       ChocoID = "killerpdf";        Path = @("C:\Program Files\KillerPDF\KillerPDF.exe","$env:LOCALAPPDATA\Programs\KillerPDF\KillerPDF.exe"); Process = "KillerPDF" }
+    @{ Name = "Google Chrome";   ChocoID = "googlechrome --install-arguments='--system-level' --ignore-checksums"; Process = "chrome" },
+    @{ Name = "Microsoft Edge";  ChocoID = "microsoft-edge";  Process = "msedge" },
+    @{ Name = "Mozilla Firefox"; ChocoID = "firefox";         Process = "firefox" },
+    @{ Name = "Brave";           ChocoID = "brave";           Process = "brave" },
+    @{ Name = "Adobe Acrobat";   ChocoID = "adobereader";     Process = @("Acrobat","AcroRd32") },
+    @{ Name = "Zoom";            ChocoID = "zoom --install-arguments='/quiet /norestart'"; Process = "Zoom" },
+    @{ Name = "Microsoft Teams"; ChocoID = "microsoft-teams"; Process = @("Teams","ms-teams") },
+    @{ Name = "Webex";           ChocoID = "webex";           Process = "CiscoCollabHost" },
+    @{ Name = "Slack";           ChocoID = "slack";           Process = "slack" },
+    @{ Name = "RingCentral";     ChocoID = "ringcentral";     Process = "RingCentral" },
+    @{ Name = "Notepad++";       ChocoID = "notepadplusplus"; Process = "notepad++" },
+    @{ Name = "VLC";             ChocoID = "vlc";             Process = "vlc" },
+    @{ Name = "7-Zip";           ChocoID = "7zip";            Process = "7zFM" },
+    @{ Name = "KillerPDF";       ChocoID = "killerpdf";       Process = "KillerPDF" },
+    @{ Name = "KillerNotes";     ChocoID = "killernotes";     Process = "KillerNotes" },
+    @{ Name = "KillerScan";      ChocoID = "killerscan";      Process = "KillerScan" },
+    @{ Name = "KillerShell";     ChocoID = "killershell";     Process = "KillerShell" },
+    @{ Name = "Killendar";       ChocoID = "killendar";       Process = "Killendar" }
 )
-$ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
-if (-not $ChocoAvailable) {
-    Write-Host "`n[!] Chocolatey not found - Installing..." -ForegroundColor Yellow
+
+# Gate the section behind a Y/N prompt. -No3rdParty skips outright,
+# -Update3rdParty and -InplaceUpgrade auto-confirm (unattended/RMM), and a
+# non-interactive console defaults to skip - same shape as the feature-upgrade
+# prompt in region 5.
+$run3rdParty = $false
+if ($No3rdParty) {
+    Write-Host "[i] Third-party updates skipped (-No3rdParty)." -ForegroundColor $DimCol
+} elseif ($Update3rdParty -or $InplaceUpgrade) {
+    $flag = if ($Update3rdParty) { "-Update3rdParty" } else { "-InplaceUpgrade" }
+    Write-Host "      [$flag] Auto-confirming third-party updates." -ForegroundColor $DimCol
+    $run3rdParty = $true
+} else {
+    try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
     try {
-        Set-ExecutionPolicy Bypass -Scope Process -Force
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-        $ChocoInstallDir = "$env:ProgramData\chocolatey"
-        $ZipPath = "$env:TEMP\chocolatey.zip"
-        $ExtractPath = "$env:TEMP\chocoInstall"
-        # Download the zip directly
-        (New-Object System.Net.WebClient).DownloadFile(
-            "https://community.chocolatey.org/api/v2/package/chocolatey",
-            $ZipPath
-        )
-        # Extract using pure .NET - bypasses Microsoft.PowerShell.Archive entirely
-        # Clear any leftover extraction folder from a previous failed attempt
-        if (Test-Path $ExtractPath) { Remove-Item $ExtractPath -Recurse -Force }
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractPath)
-        # Run the embedded install script directly
-        $ChocoInstallScript = Get-ChildItem "$ExtractPath" -Recurse -Filter "chocolateyInstall.ps1" | Select-Object -First 1
-        if ($ChocoInstallScript) {
-            $env:ChocolateyInstall = $ChocoInstallDir
-            & $ChocoInstallScript.FullName *>&1 | Out-Null
-        }
-        # Refresh PATH
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-        $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
-        if ($ChocoAvailable) {
-            Write-Host "      Chocolatey installed successfully." -ForegroundColor Green
-        } else {
-            Write-Host "      [!] Chocolatey install failed - skipping third-party updates." -ForegroundColor Red
-        }
+        Write-Host "Would you like to update installed third-party software via Chocolatey? (Y/N): " -NoNewline -ForegroundColor $WarnCol
+        $key    = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $choice = $key.Character
+        if ($choice -ne "`n" -and $choice -ne "`r") { Write-Host $choice -NoNewline }
+        Write-Host ""
+        if ($choice -in @('Y','y')) { $run3rdParty = $true }
     } catch {
-        Write-Host "      [!] Chocolatey install failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "      [i] Non-interactive - defaulting to NO. Use -Update3rdParty for unattended runs." -ForegroundColor $DimCol
     }
 }
-if ($ChocoAvailable -and -not $No3rdParty) {
+
+# Chocolatey install-if-missing runs only after the user (or a switch) has said
+# yes, so a decline is never paid for with a Chocolatey install.
+$ChocoAvailable = $null
+if ($run3rdParty) {
+    $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
+    if (-not $ChocoAvailable) {
+        Write-Host "`n[!] Chocolatey not found - Installing..." -ForegroundColor Yellow
+        try {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            $ChocoInstallDir = "$env:ProgramData\chocolatey"
+            $ZipPath = "$env:TEMP\chocolatey.zip"
+            $ExtractPath = "$env:TEMP\chocoInstall"
+            # Download the zip directly
+            (New-Object System.Net.WebClient).DownloadFile(
+                "https://community.chocolatey.org/api/v2/package/chocolatey",
+                $ZipPath
+            )
+            # Extract using pure .NET - bypasses Microsoft.PowerShell.Archive entirely
+            # Clear any leftover extraction folder from a previous failed attempt
+            if (Test-Path $ExtractPath) { Remove-Item $ExtractPath -Recurse -Force }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractPath)
+            # Run the embedded install script directly
+            $ChocoInstallScript = Get-ChildItem "$ExtractPath" -Recurse -Filter "chocolateyInstall.ps1" | Select-Object -First 1
+            if ($ChocoInstallScript) {
+                $env:ChocolateyInstall = $ChocoInstallDir
+                & $ChocoInstallScript.FullName *>&1 | Out-Null
+            }
+            # Refresh PATH
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+            $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
+            if ($ChocoAvailable) {
+                Write-Host "      Chocolatey installed successfully." -ForegroundColor Green
+            } else {
+                Write-Host "      [!] Chocolatey install failed - skipping third-party updates." -ForegroundColor Red
+            }
+        } catch {
+            Write-Host "      [!] Chocolatey install failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+}
+
+if ($run3rdParty -and $ChocoAvailable) {
     Write-StepUpdate "[5/5] Updating Installed Third-Party Software..."
     # Update Chocolatey itself first
     Write-Host "      > " -NoNewline -ForegroundColor $DimCol
@@ -448,47 +540,71 @@ if ($ChocoAvailable -and -not $No3rdParty) {
     } else {
         Write-SubResult "[ALREADY UPDATED]" Cyan
     }
-    foreach ($App in $ThirdParty) {
-        # Resolve first valid path - supports arrays and wildcard paths (e.g. WindowsApps\MSTeams_*)
-        $_appPath = $null
-        foreach ($_candidate in @($App.Path)) {
-            if ($_candidate -match '\*') {
-                $_resolved = Get-Item $_candidate -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($_resolved) { $_appPath = $_resolved.FullName; break }
-            } elseif (Test-Path $_candidate) {
-                $_appPath = $_candidate; break
-            }
+    # Cache Chocolatey's local package list once. One shell-out per run beats one
+    # per app, and the emitted format id|version is stable across choco v1 and v2.
+    $ChocoLocal = @{}
+    try {
+        $localList = choco list --limit-output 2>&1
+        foreach ($line in $localList) {
+            if ($line -match '^([^|]+)\|') { $ChocoLocal[$Matches[1].ToLower()] = $true }
         }
+    } catch {}
+    # Cache Add/Remove Programs display names once. If an app is installed outside
+    # Chocolatey (MSI, the app's own installer) we still want to upgrade it - the
+    # per-app installer's own /silent handler is idempotent, so choco upgrade will
+    # refresh the existing install in place rather than orphan it.
+    $ArpNames = New-Object System.Collections.Generic.List[string]
+    foreach ($_arpRoot in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )) {
+        try {
+            Get-ItemProperty $_arpRoot -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName } |
+                ForEach-Object { $ArpNames.Add($_.DisplayName) }
+        } catch {}
+    }
+    foreach ($App in $ThirdParty) {
+        # The choco package id is the first whitespace-separated token in ChocoID;
+        # anything after is install/upgrade arguments passed straight to choco.
+        $_pkgId = ($App.ChocoID -split '\s+', 2)[0].ToLower()
         $_procs = @($App.Process)
 
-        if (-not $_appPath) {
-            Write-Host "      > " -NoNewline -ForegroundColor Gray
-            Write-Host "$($App.Name): " -NoNewline -ForegroundColor White
+        Write-Host "      > " -NoNewline -ForegroundColor Gray
+        Write-Host "$($App.Name): " -NoNewline -ForegroundColor White
+
+        # Two ways an app counts as installed on this box: Chocolatey knows about
+        # it OR Add/Remove Programs shows it. Either one is enough to run choco
+        # upgrade; choco will install-if-missing-and-adopt the manual copy, or
+        # upgrade the choco-managed copy. Nothing in either list means the app is
+        # not on this machine and we do not install it fresh.
+        $_inChoco = $ChocoLocal.ContainsKey($_pkgId)
+        $_inArp   = ($ArpNames | Where-Object { $_ -like "*$($App.Name)*" } | Select-Object -First 1) -ne $null
+        if (-not $_inChoco -and -not $_inArp) {
             Write-SubResult "[NOT INSTALLED]" DarkGray
-        } else {
-            $IsRunning = $_procs | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
-            if ($IsRunning) {
-                Write-Host "      > " -NoNewline -ForegroundColor Gray
-                Write-Host "$($App.Name): " -NoNewline -ForegroundColor White
-                Write-SubResult "[IN USE - SKIPPED]" Yellow
-            } else {
-                Write-Host "      > " -NoNewline -ForegroundColor Gray
-                Write-Host "$($App.Name): " -NoNewline -ForegroundColor White
-                $chocoOut = choco upgrade $App.ChocoID -y --no-progress 2>&1
-                if ($App.Name -eq "Google Chrome") {
-                    $GUpdate = "C:\Program Files (x86)\Google\Update\GoogleUpdate.exe"
-                    if (Test-Path $GUpdate) {
-                        & $GUpdate /ua /installsource scheduler 2>&1 | Out-Null
-                    }
-                }
-                $upgradeMatch = $chocoOut | Select-String -Pattern 'upgraded (\d+)/'
-                $upgradeCount = if ($upgradeMatch) { [int]$upgradeMatch.Matches[0].Groups[1].Value } else { 0 }
-                if ($upgradeCount -gt 0) {
-                    Write-SubResult "[UPDATED]" Green
-                } else {
-                    Write-SubResult "[ALREADY UPDATED]" Cyan
-                }
+            continue
+        }
+        $IsRunning = $_procs | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+        if ($IsRunning) {
+            Write-SubResult "[IN USE - SKIPPED]" Yellow
+            continue
+        }
+        $chocoOut = choco upgrade $App.ChocoID -y --no-progress 2>&1
+        if ($App.Name -eq "Google Chrome") {
+            $GUpdate = "C:\Program Files (x86)\Google\Update\GoogleUpdate.exe"
+            if (Test-Path $GUpdate) {
+                & $GUpdate /ua /installsource scheduler 2>&1 | Out-Null
             }
+        }
+        $upgradeMatch = $chocoOut | Select-String -Pattern 'upgraded (\d+)/'
+        $upgradeCount = if ($upgradeMatch) { [int]$upgradeMatch.Matches[0].Groups[1].Value } else { 0 }
+        if ($upgradeCount -gt 0) {
+            Write-SubResult "[UPDATED]" Green
+        } elseif (-not $_inChoco -and $_inArp) {
+            Write-SubResult "[ADOPTED]" Green
+        } else {
+            Write-SubResult "[ALREADY UPDATED]" Cyan
         }
     }
     Write-StepUpdate "[5/5] Third-Party Updates" -Success
