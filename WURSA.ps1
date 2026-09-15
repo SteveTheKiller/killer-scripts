@@ -136,7 +136,7 @@ function Write-HLine {
 $_pfx  = "█  "
 $_art1 = "╦ ╦ ╦ ╦ ╦═╗ ╔═╗ ╔═╗ "
 $_art2 = "║║║ ║ ║ ╠╦╝ ╚═╗ ╠═╣ "
-$_art3 = "╚╩╝ ╚.╝ ╩╚═ ╚═╝ ╩ ╩ "
+$_art3 = "╚╩╝ ╚═╝ ╩╚═ ╚═╝ ╩ ╩ "
 $_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
 $_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
 $_fillW = $script:Width - $_pfx.Length - $_artW
