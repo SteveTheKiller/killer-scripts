@@ -39,6 +39,10 @@
     "name": "Outlook Reset & Configuration Assistant",
     "description": "Resets broken Outlook installations for one or all user profiles, classic or new."
   },
+  "PEEK.ps1": {
+    "name": "Patch & Event Examination Kit",
+    "description": "Read-only live monitor for Windows Update and Setup servicing activity."
+  },
   "PRINT.ps1": {
     "name": "Printer Response & Interface Network Tool",
     "description": "Printer management utility with network scanner, driver matching, and UNC path support."

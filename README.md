@@ -7,7 +7,7 @@
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/License-GPLv3-blue)
-![Scripts](https://img.shields.io/badge/Scripts-18-brightgreen)
+![Scripts](https://img.shields.io/badge/Scripts-19-brightgreen)
 
 A collection of production-ready PowerShell scripts for Windows administration, deployment, repair, and hardening. Most scripts require an elevated PowerShell session to function correctly. Scripts that enforce this automatically are noted in their headers. Most are compatible with RMM platforms for unattended execution.
 
@@ -29,6 +29,7 @@ A collection of production-ready PowerShell scripts for Windows administration, 
 | [MACE](#maceps1) | Full removal of OneDrive, New Outlook, Office, M365, Project, and Teams |
 | [ODD](#oddps1) | Audio device inventory with categorization and driver reporting |
 | [ORCA](#orcaps1) | Outlook repair for New (Store) and Classic (Office / M365) editions |
+| [PEEK](#peekps1) | Live read-only monitor for Windows Update and Setup servicing activity |
 | [PRINT](#printps1) | Printer management, network discovery, and driver installation |
 | [PRUNE](#pruneps1) | User profile staleness analyzer and orphaned profile detector |
 | [SHADE](#shadeps1) | Privacy hardening removing telemetry, tracking, and advertising |
@@ -173,6 +174,18 @@ Interactive wizard with repair scope selection. Resets New Outlook (Microsoft St
 Function Invoke-OutlookReset is the core repair engine. Includes OST file backup before deletion. Clears COM add-ins and mail client associations to remove corrupt extensions.
 
 RMM/Unattended support requires pre-configuration. Interactive UI otherwise. Exit code 0 on completion.
+
+---
+
+## PEEK.ps1
+
+### Patch & Event Examination Kit
+
+Read-only live monitor for Windows Update and Windows Setup servicing activity, built for remote support triage.
+
+Correlates WindowsUpdateClient event log entries, active servicing processes (TiWorker, TrustedInstaller, SetupHost, WaaSMedic), Panther setup activity, compatibility blocks, reboot indicators, service state, disk space, power state, and recent update history into a single continuously refreshing console view. Refresh interval is configurable via -RefreshSeconds (1 to 60, default 3); -Once renders a single snapshot instead of looping. Press Q or ESC to exit cleanly.
+
+Makes no registry changes, starts no updates, opens no UI, and never reboots. Requires elevation. Compatible with Windows PowerShell 5.1, PowerShell 7, and Kaseya LiveConnect / SYSTEM execution. Intended for interactive technician use, not unattended RMM execution.
 
 ---
 
