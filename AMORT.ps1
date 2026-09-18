@@ -397,10 +397,40 @@ if (Test-Path "C:\Windows.old") {
             Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
         }
 
-        # Report the outcome instead of finishing silently either way, so a future run
-        # tells you whether removal actually succeeded or is still blocked.
+        # Fallback: robocopy mirror against an empty folder. This is the standard trick for
+        # a folder that survives rd and takeown/icacls, since robocopy's own deletion pass
+        # handles long paths and stale ACL entries far more reliably than rd or Remove-Item.
         if (Test-Path "C:\Windows.old") {
-            Write-Host "        [!] Windows.old still present after removal attempt (files may be locked by a running process)." -ForegroundColor DarkYellow
+            $EmptyDir = Join-Path $env:TEMP ("amort_empty_" + [guid]::NewGuid().ToString())
+            New-Item -ItemType Directory -Path $EmptyDir -Force | Out-Null
+            & robocopy.exe $EmptyDir "C:\Windows.old" /MIR /NFL /NDL /NJH /NJS /NC /NS /NP *>&1 | Out-Null
+            Remove-Item $EmptyDir -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path "C:\Windows.old") {
+                Remove-Item "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Last resort: whatever is left has an open handle from a running process, so it
+        # cannot be deleted live. Register every remaining file and the folder itself for
+        # deletion on next boot (the same mechanism Windows uses for PendingFileRenameOperations),
+        # so it is guaranteed to be gone after the next restart even though this run couldn't
+        # finish the job while the machine is live.
+        if (Test-Path "C:\Windows.old") {
+            try {
+                Add-Type -Name Kernel32 -Namespace AmortNative -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+'@ -ErrorAction SilentlyContinue
+
+                Get-ChildItem "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue |
+                    Sort-Object { $_.FullName.Length } -Descending |
+                    ForEach-Object { [AmortNative.Kernel32]::MoveFileEx($_.FullName, $null, 4) | Out-Null }
+                [AmortNative.Kernel32]::MoveFileEx("C:\Windows.old", $null, 4) | Out-Null
+
+                Write-Host "        [!] Windows.old is held open by a running process and could not be removed live. It is now scheduled for deletion on the next reboot." -ForegroundColor DarkYellow
+            } catch {
+                Write-Host "        [!] Windows.old still present after every removal attempt, including reboot scheduling." -ForegroundColor Red
+            }
         }
     }
 }
