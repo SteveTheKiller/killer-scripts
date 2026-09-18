@@ -366,41 +366,41 @@ if (Test-Path $InstallerPath) {
     }
 }
 
-# --- Windows.old cleanup (age-gated) ---
-# Only remove once the feature-update rollback window has closed, so we never kill
-# a live rollback path. Read the real window via DISM; fall back to 14 days.
+# --- Windows.old cleanup (no age gate) ---
+# v16.1 change: the age gate was removed at Steve's request. This now removes
+# Windows.old as soon as it is found, regardless of how old it is. That means the
+# "Go back to a previous version of Windows" rollback option is closed off the moment
+# this step runs, even if the feature update happened minutes ago. This is an
+# intentional tradeoff, not an oversight; if that rollback path ever needs to be
+# preserved on a specific machine, skip this run or exclude that machine.
 if (Test-Path "C:\Windows.old") {
-    $OldAgeDays = ((Get-Date) - (Get-Item "C:\Windows.old").LastWriteTime).TotalDays
-    $UninstallWindow = 14
-    try {
-        $DismWin = & DISM.exe /Online /Get-OSUninstallWindow 2>$null
-        $WinLine = $DismWin | Select-String -Pattern 'Uninstall Window\D+(\d+)'
-        if ($WinLine) { $UninstallWindow = [int]$WinLine.Matches[0].Groups[1].Value }
-    } catch { }
+    if ($DryRun) {
+        $RegionEst += Get-PathSize "C:\Windows.old"
+    } else {
+        # Strip the previous-installation protection so Windows.old is deletable.
+        & DISM.exe /Online /Remove-OSUninstall /NoRestart *>&1 | Out-Null
 
-    if ($OldAgeDays -gt $UninstallWindow) {
-        if ($DryRun) {
-            $RegionEst += Get-PathSize "C:\Windows.old"
-        } else {
-            # Strip the previous-installation protection so Windows.old is deletable.
-            & DISM.exe /Online /Remove-OSUninstall /NoRestart *>&1 | Out-Null
+        # cleanmgr is skipped entirely: it ignores -WindowStyle Hidden (spawns an uncontrolled
+        # child process), shows its UI in interactive sessions, and silently fails under
+        # SYSTEM/LiveConnect where there is no desktop. rd /s /q is an order of magnitude
+        # faster than Remove-Item -Recurse for deep trees (minutes vs hours).
+        $rdProc = Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+        if ($rdProc) {
+            $rdProc | Wait-Process -Timeout 1800 -ErrorAction SilentlyContinue
+            if (-not $rdProc.HasExited) { $rdProc | Stop-Process -Force -ErrorAction SilentlyContinue }
+        }
 
-            # cleanmgr is skipped entirely: it ignores -WindowStyle Hidden (spawns an uncontrolled
-            # child process), shows its UI in interactive sessions, and silently fails under
-            # SYSTEM/LiveConnect where there is no desktop. rd /s /q is an order of magnitude
-            # faster than Remove-Item -Recurse for deep trees (minutes vs hours).
-            $rdProc = Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
-            if ($rdProc) {
-                $rdProc | Wait-Process -Timeout 1800 -ErrorAction SilentlyContinue
-                if (-not $rdProc.HasExited) { $rdProc | Stop-Process -Force -ErrorAction SilentlyContinue }
-            }
+        # Fallback: if rd hit locked files, take ownership and retry once
+        if (Test-Path "C:\Windows.old") {
+            & takeown /F "C:\Windows.old" /R /A /D Y 2>$null | Out-Null
+            & icacls "C:\Windows.old" /grant Administrators:F /T /C /Q 2>$null | Out-Null
+            Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+        }
 
-            # Fallback: if rd hit locked files, take ownership and retry once
-            if (Test-Path "C:\Windows.old") {
-                & takeown /F "C:\Windows.old" /R /A /D Y 2>$null | Out-Null
-                & icacls "C:\Windows.old" /grant Administrators:F /T /C /Q 2>$null | Out-Null
-                Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
-            }
+        # Report the outcome instead of finishing silently either way, so a future run
+        # tells you whether removal actually succeeded or is still blocked.
+        if (Test-Path "C:\Windows.old") {
+            Write-Host "        [!] Windows.old still present after removal attempt (files may be locked by a running process)." -ForegroundColor DarkYellow
         }
     }
 }
