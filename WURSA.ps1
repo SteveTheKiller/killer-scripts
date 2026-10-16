@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v2.8
-    Developed by Steve the Killer | Updated: 2026-09-11
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v3.0
+    Developed by Steve the Killer | Updated: 2026-10-16
 .DESCRIPTION
     Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
     (skips in-use apps). Performs unattended feature upgrades to 25H2, dispatched to a
@@ -23,7 +23,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v2.8"
+$_ver    = "| v3.0"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
