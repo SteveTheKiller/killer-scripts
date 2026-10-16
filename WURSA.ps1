@@ -4,9 +4,9 @@
     Developed by Steve the Killer | Updated: 2026-10-16
 .DESCRIPTION
     Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
-    (skips in-use apps). Performs unattended feature upgrades to 25H2, dispatched to a
-    detached SYSTEM task so it survives RMM / LiveConnect disconnects: 24H2 takes the
-    KB5054156 eKB, Windows 10 and older Windows 11 take the ISO. Reboot is deferred to
+    (skips in-use apps). Performs unattended feature upgrades to 26H2, dispatched to a
+    detached SYSTEM task so it survives RMM / LiveConnect disconnects: 24H2 and 25H2 take
+    the KB5121794 eKB, Windows 10 and older Windows 11 take the ISO. Reboot is deferred to
     the caller.
 .NOTES
     Params: -InplaceUpgrade (auto-confirm, unattended/RMM), -No3rdParty, -NoUpgrade.
@@ -26,14 +26,14 @@ param(
 $_ver    = "| v3.0"
 
 # Define the latest known Windows release
-$LatestVersion = "25H2"
+$LatestVersion = "26H2"
 # Build of the target release. CurrentBuild at or above this is current or newer
-# (25H2 = 26200, 26H2 = 26300), so the upgrade is never offered as a downgrade.
-$LatestBuild   = 26200
+# (24H2 = 26100, 25H2 = 26200, 26H2 = 26300), so the upgrade is never offered as a downgrade.
+$LatestBuild   = 26300
 
 # Feature-upgrade state is tracked separately from ordinary Windows Update.
 # A surfaced/downloaded feature update is NOT considered staged. Region 5 owns
-# the deterministic 25H2 upgrade path unless Windows reports a real reboot-ready
+# the deterministic feature upgrade path unless Windows reports a real reboot-ready
 # feature update.
 $script:FeatureUpdateStaged = $false
 $script:FeatureUpgradeState = "UNKNOWN"
@@ -217,8 +217,8 @@ try {
 # ============================================================================
 # Some managed endpoints carry NoAutoUpdate=1, which can prevent the direct Windows
 # Update API from servicing ordinary updates. Open the policy here, but DO NOT kick
-# a USO feature-update scan. Region 5 owns the 25H2 upgrade path. Starting USO here
-# can pre-download 25H2 in parallel and race the deterministic ISO/eKB path. Enterprise
+# a USO feature-update scan. Region 5 owns the feature upgrade path. Starting USO here
+# can pre-download the feature update in parallel and race the deterministic ISO/eKB path. Enterprise
 # and ARM64 fallback paths explicitly start USO later only when Windows Update is the
 # selected upgrade mechanism. Original policy values are recorded for restoration.
 $IPU_WorkDir          = "C:\Windows\Temp\25H2IPU"
@@ -315,7 +315,7 @@ try {
     foreach ($u in $s1) {
         # Do not install a feature update through the generic WU loop. A download or
         # pre-download is not a completed upgrade and used to cause false WU_HANDOFF
-        # success. Region 5 handles 25H2 with a deterministic upgrade mechanism.
+        # success. Region 5 handles the feature upgrade with a deterministic mechanism.
         if ($u.Title -match [regex]::Escape($LatestVersion) -or $u.Title -match 'Feature update to Windows') {
             $script:FeatureUpdateOffered = $true
             continue
@@ -628,8 +628,8 @@ if ($run3rdParty -and $ChocoAvailable) {
 # International ISO, everything else defaults to en-US for the US fleet.
 $IPU_InstallLang = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction SilentlyContinue).InstallLanguage
 switch ($IPU_InstallLang) {
-    '0809'  { $IPU_IsoName = "Win11_25H2_x64_en-GB.iso"; $IPU_IsoSha256 = "66B7B4B71763ED6F9B2CE29326ED9284544DA6F5283D00329921540C01AAAEEA" }
-    default { $IPU_IsoName = "Win11_25H2_x64_en-US.iso"; $IPU_IsoSha256 = "768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3" }
+    '0809'  { $IPU_IsoName = "Win11_26H2_x64_en-GB.iso"; $IPU_IsoSha256 = "" }
+    default { $IPU_IsoName = "Win11_26H2_x64_en-US.iso"; $IPU_IsoSha256 = "" }
 }
 $IPU_IsoUrl     = "https://iso.killertools.net/$IPU_IsoName"
 $IPU_IsoSizeGB  = 6.0
@@ -644,11 +644,18 @@ $IPU_TaskName   = "WURSA-25H2-IPU"
 $IPU_VerifierPath  = Join-Path $IPU_WorkDir "Verify-25H2.ps1"
 $IPU_VerifyTaskName = "WURSA-25H2-Verify"
 
-# 24H2 (26100) -> 25H2 enablement package (KB5054156). x64 only; host MSU in killer-isos bucket.
-$IPU_EkbName    = "Win11_25H2_eKB_KB5054156_x64.msu"
+# 24H2 (26100) or 25H2 (26200) -> 26H2 enablement package (KB5121794), x64 and ARM64.
+# Host both MSUs in the killer-isos bucket. Prerequisite: servicing baseline
+# 26100.9278 / 26200.9278 (KB5120998) or later; below that, Windows Update takes over.
+$IPU_EkbName    = "Win11_26H2_eKB_KB5121794_x64.msu"
 $IPU_EkbUrl     = "https://iso.killertools.net/$IPU_EkbName"
-$IPU_EkbSha256  = "92EDDA7EEAA19B60D15CCDF777556BF0662EE9FEA1DCC9AEC281FCF12068044C"
+$IPU_EkbSha256  = "BF43EB13B7EBDE920C2201473BFD5C531B45E0F46ACD8E0843F27F9744FB4B43"
 $IPU_EkbPath    = Join-Path $IPU_WorkDir $IPU_EkbName
+$IPU_EkbArmName   = "Win11_26H2_eKB_KB5121794_arm64.msu"
+$IPU_EkbArmUrl    = "https://iso.killertools.net/$IPU_EkbArmName"
+$IPU_EkbArmSha256 = "367E77739B3B09DC8C48553F9853BF53042F052DDAADC07ED025B83BB1D53A9D"
+$IPU_EkbArmPath   = Join-Path $IPU_WorkDir $IPU_EkbArmName
+$IPU_EkbMinUBR    = 9278
 
 # Installation Assistant fallback (online, edition-correct). The local ISO is a
 # consumer image with no Enterprise SKU, so an Enterprise-composition box fails the
@@ -670,14 +677,17 @@ function Restore-WUUpgradeOverrides {
     foreach ($line in (Get-Content $IPU_AURestoreFile -ErrorAction SilentlyContinue)) {
         if ($line -match '^([^=]+)=(.+)$') { $map[$matches[1]] = $matches[2] }
     }
-    $targets = @{ NoAutoUpdate = $auk; AUOptions = $auk; SetActiveHours = $polk; ActiveHoursStart = $polk; ActiveHoursEnd = $polk }
+    $targets = @{ NoAutoUpdate = $auk; AUOptions = $auk; SetActiveHours = $polk; ActiveHoursStart = $polk; ActiveHoursEnd = $polk; ProductVersion = $polk; TargetReleaseVersion = $polk; TargetReleaseVersionInfo = $polk }
     foreach ($name in @($targets.Keys)) {
         $key = $targets[$name]; $orig = $map[$name]
+        # The release pin is restored only when it was recorded (it is set only on a Windows Update handoff).
+        if ($null -eq $orig -and $name -match '^(ProductVersion|TargetReleaseVersion)') { continue }
         if ($null -eq $orig -or $orig -eq 'ABSENT') { Remove-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue }
+        elseif ($name -in @('ProductVersion','TargetReleaseVersionInfo')) { Set-ItemProperty -Path $key -Name $name -Value $orig -Type String -Force }
         else { Set-ItemProperty -Path $key -Name $name -Value ([int]$orig) -Type DWord -Force }
     }
     Remove-Item $IPU_AURestoreFile -Force -ErrorAction SilentlyContinue
-    Write-Host "      Restored original Windows Update policy values (auto-update and active hours)." -ForegroundColor $DimCol
+    Write-Host "      Restored original Windows Update policy values (auto-update, active hours and release pin)." -ForegroundColor $DimCol
 }
 
 function Test-WUFeatureUpdateStaged {
@@ -713,6 +723,8 @@ if (-not $IPU_IsArm64 -and $null -eq $IPU_ProcArch -and -not $IPU_OSArch) {
 Write-Host "      Installed Version : $InstalledVersion" -ForegroundColor Yellow
 Write-Host "      Latest Version    : $LatestVersion"    -ForegroundColor Yellow
 if ($IPU_IsArm64) { Write-Host "      Architecture      : ARM64" -ForegroundColor $AccentCol }
+# ARM64 24H2/25H2 takes the ARM64 eKB; older ARM64 builds can only upgrade through Windows Update.
+$IPU_ArmWUOnly = $IPU_IsArm64 -and $InstalledBuild -notin @(26100, 26200)
 if ($NoUpgrade) {
     $script:FeatureUpgradeState = "SKIPPED"
     Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
@@ -738,7 +750,7 @@ if ($NoUpgrade) {
         $script:FeatureUpgradeState = "BLOCKED_BATTERY"
         Write-Host "      [!] Upgrade skipped: device is running on battery power." -ForegroundColor Yellow
     } elseif ($InplaceUpgrade) {
-        if ($IPU_IsArm64) {
+        if ($IPU_ArmWUOnly) {
             Write-Host "      [-InplaceUpgrade] ARM64 detected; auto-dispatching Windows Update feature-upgrade handoff." -ForegroundColor $DimCol
         } else {
             Write-Host "      [-InplaceUpgrade] Auto-dispatching detached feature-upgrade workflow." -ForegroundColor $DimCol
@@ -748,7 +760,7 @@ if ($NoUpgrade) {
         # Flush buffered keystrokes; guarded so redirected (RMM) consoles do not throw
         try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
         try {
-            if ($IPU_IsArm64) {
+            if ($IPU_ArmWUOnly) {
                 Write-Host "Would you like to hand off the $($LatestVersion) upgrade to Windows Update? (Y/N): " -NoNewline -ForegroundColor $WarnCol
             } else {
                 Write-Host "Would you like to perform an in-place upgrade to $($LatestVersion)? (Y/N): " -NoNewline -ForegroundColor $WarnCol
@@ -768,7 +780,7 @@ if ($NoUpgrade) {
     }
 
     if (-not $OnBattery -and $proceed) {
-        if ($IPU_IsArm64) {
+        if ($IPU_ArmWUOnly) {
             Write-Host "[>] Dispatching detached ARM64 Windows Update handoff (survives session disconnect)..." -ForegroundColor $LineCol
         } else {
             Write-Host "[>] Dispatching detached feature-upgrade workflow (survives session disconnect)..." -ForegroundColor $LineCol
@@ -778,7 +790,7 @@ if ($NoUpgrade) {
 
         # Build a one-shot post-reboot verifier. It runs as SYSTEM at startup, waits
         # for normal boot to settle, verifies DisplayVersion, and restores the temporary
-        # Windows Update policy overrides only after 25H2 is actually committed.
+        # Windows Update policy overrides only after the target release is actually committed.
         $VerifierBody = @"
 `$ErrorActionPreference = 'SilentlyContinue'
 Start-Sleep -Seconds 180
@@ -796,10 +808,12 @@ if ([int]`$build -ge $LatestBuild) {
         foreach (`$line in (Get-Content '$IPU_AURestoreFile' -ErrorAction SilentlyContinue)) {
             if (`$line -match '^([^=]+)=(.+)$') { `$map[`$matches[1]] = `$matches[2] }
         }
-        `$targets = @{ NoAutoUpdate = `$auk; AUOptions = `$auk; SetActiveHours = `$polk; ActiveHoursStart = `$polk; ActiveHoursEnd = `$polk }
+        `$targets = @{ NoAutoUpdate = `$auk; AUOptions = `$auk; SetActiveHours = `$polk; ActiveHoursStart = `$polk; ActiveHoursEnd = `$polk; ProductVersion = `$polk; TargetReleaseVersion = `$polk; TargetReleaseVersionInfo = `$polk }
         foreach (`$name in @(`$targets.Keys)) {
             `$key = `$targets[`$name]; `$orig = `$map[`$name]
+            if (`$null -eq `$orig -and `$name -match '^(ProductVersion|TargetReleaseVersion)') { continue }
             if (`$null -eq `$orig -or `$orig -eq 'ABSENT') { Remove-ItemProperty -Path `$key -Name `$name -ErrorAction SilentlyContinue }
+            elseif (`$name -in @('ProductVersion','TargetReleaseVersionInfo')) { Set-ItemProperty -Path `$key -Name `$name -Value `$orig -Type String -Force }
             else { Set-ItemProperty -Path `$key -Name `$name -Value ([int]`$orig) -Type DWord -Force }
         }
         Remove-Item '$IPU_AURestoreFile' -Force -ErrorAction SilentlyContinue
@@ -840,6 +854,11 @@ exit 1
 `$IPU_EkbUrl     = '$IPU_EkbUrl'
 `$IPU_EkbSha256  = '$IPU_EkbSha256'
 `$IPU_EkbPath    = '$IPU_EkbPath'
+`$IPU_EkbArmUrl    = '$IPU_EkbArmUrl'
+`$IPU_EkbArmSha256 = '$IPU_EkbArmSha256'
+`$IPU_EkbArmPath   = '$IPU_EkbArmPath'
+`$IPU_EkbMinUBR    = $IPU_EkbMinUBR
+`$LatestVersion    = '$LatestVersion'
 "@
 
         # Runner body (single-quoted here-string: written verbatim, runs later).
@@ -945,7 +964,20 @@ function Set-WUUpgradeOverrides {
     Set-ItemProperty -Path $polk -Name SetActiveHours   -Value 1 -Type DWord -Force
     Set-ItemProperty -Path $polk -Name ActiveHoursStart -Value $IPU_ActiveHoursStart -Type DWord -Force
     Set-ItemProperty -Path $polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd -Type DWord -Force
-    Write-Output "Cleared NoAutoUpdate, set AUOptions=4, and pinned active hours $IPU_ActiveHoursStart-$IPU_ActiveHoursEnd so WU can deliver and reboot out of hours (originals recorded)."
+    # Pin Windows Update to the target release so it offers that feature update and not an
+    # older one. Originals go into the same restore file; a file written by an older run
+    # gets the missing entries appended before anything is changed.
+    $trvRec = @(Get-Content -Path $IPU_AURestoreFile -ErrorAction SilentlyContinue)
+    foreach ($trvName in 'ProductVersion','TargetReleaseVersion','TargetReleaseVersionInfo') {
+        if (-not ($trvRec -match "^$trvName=")) {
+            $trvVal = (Get-ItemProperty -Path $polk -Name $trvName -ErrorAction SilentlyContinue).$trvName
+            Add-Content -Path $IPU_AURestoreFile -Value "$trvName=$(if ($null -eq $trvVal) {'ABSENT'} else {$trvVal})" -Encoding ASCII
+        }
+    }
+    Set-ItemProperty -Path $polk -Name ProductVersion           -Value 'Windows 11'   -Type String -Force
+    Set-ItemProperty -Path $polk -Name TargetReleaseVersion     -Value 1              -Type DWord  -Force
+    Set-ItemProperty -Path $polk -Name TargetReleaseVersionInfo -Value $LatestVersion -Type String -Force
+    Write-Output "Cleared NoAutoUpdate, set AUOptions=4, pinned active hours $IPU_ActiveHoursStart-$IPU_ActiveHoursEnd and pinned the target release to $LatestVersion so WU can deliver and reboot out of hours (originals recorded)."
 }
 
 function Invoke-IPUStaleCleanup {
@@ -1013,17 +1045,19 @@ function Invoke-IPUComponentRepair {
     Write-Output "Component store repair complete."
 }
 function Invoke-IPUEnablementPackage {
-    # 24H2 (26100) -> 25H2 via KB5054156 eKB. Verify servicing baseline, apply, repair+retry once, else WU fallback. x64 only.
+    # 24H2 (26100) or 25H2 (26200) -> 26H2 via KB5121794 eKB (x64 or ARM64 package). Verify servicing baseline, apply, repair+retry once, else WU fallback.
     $ekCV = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
     $ekBuild = [int]$ekCV.CurrentBuild
     $ekUBR = [int]$ekCV.UBR
-    if ($ekBuild -eq 26100 -and $ekUBR -lt 5074) {
-        Write-Output "24H2 servicing baseline $ekBuild.$ekUBR is below the 25H2 eKB prerequisite 26100.5074. Handing off to Windows Update."
-        Invoke-IPUWindowsUpdate -Reason "24H2 servicing baseline $ekBuild.$ekUBR below 26100.5074"
+    $ekFrom = if ($ekBuild -eq 26100) { '24H2' } else { '25H2' }
+    if ($IPU_IsArm) { $IPU_EkbUrl = $IPU_EkbArmUrl; $IPU_EkbSha256 = $IPU_EkbArmSha256; $IPU_EkbPath = $IPU_EkbArmPath }
+    if ($ekUBR -lt $IPU_EkbMinUBR) {
+        Write-Output "$ekFrom servicing baseline $ekBuild.$ekUBR is below the $LatestVersion eKB prerequisite $ekBuild.$IPU_EkbMinUBR. Handing off to Windows Update."
+        Invoke-IPUWindowsUpdate -Reason "$ekFrom servicing baseline $ekBuild.$ekUBR below $ekBuild.$IPU_EkbMinUBR"
         return
     }
 
-    Write-Output "24H2 detected (build $ekBuild.$ekUBR). Applying the 25H2 enablement package (KB5054156)."
+    Write-Output "$ekFrom detected (build $ekBuild.$ekUBR). Applying the $LatestVersion enablement package (KB5121794)."
     try {
         $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
         if ($bl -and $bl.ProtectionStatus -eq 'On') { Suspend-BitLocker -MountPoint "C:" -RebootCount 2 -ErrorAction Stop; Write-Output "BitLocker suspension for the eKB reboot." }
@@ -1053,7 +1087,7 @@ function Invoke-IPUEnablementPackage {
             if ($ec -eq 0 -or $ec -eq 3010) {
                 $null = Register-IPUPostRebootVerifier
                 Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-                Write-Output "eKB applied (exit $($codes[-1])). Reboot to finish 25H2."
+                Write-Output "eKB applied (exit $($codes[-1])). Reboot to finish $LatestVersion."
                 return
             }
             if ($ec -eq 2359302) {
@@ -1061,26 +1095,29 @@ function Invoke-IPUEnablementPackage {
                 if ($ekPending) {
                     $null = Register-IPUPostRebootVerifier
                     Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-                    Write-Output "eKB is already installed and servicing reports a pending reboot. Reboot to finish 25H2."
+                    Write-Output "eKB is already installed and servicing reports a pending reboot. Reboot to finish $LatestVersion."
                     return
                 }
-                Write-Output "eKB is already installed, but no pending reboot is present and the OS is still 24H2. Handing off to Windows Update."
-                Invoke-IPUWindowsUpdate -Reason "24H2 eKB already installed without pending reboot"
+                Write-Output "eKB is already installed, but no pending reboot is present and the OS is still $ekFrom. Handing off to Windows Update."
+                Invoke-IPUWindowsUpdate -Reason "$ekFrom eKB already installed without pending reboot"
                 return
             }
             if ($t -eq 1) { Write-Output "eKB apply returned $($codes[-1]). Repairing component store and retrying once."; Invoke-IPUComponentRepair }
         }
         Write-Output "eKB did not apply after repair and retry (codes: $($codes -join ', ')). Handing off to Windows Update."
     } else {
-        Write-Output "eKB not available locally. Handing off to Windows Update (it delivers prerequisite CUs and the 25H2 feature update)."
+        Write-Output "eKB not available locally. Handing off to Windows Update (it delivers prerequisite CUs and the $LatestVersion feature update)."
     }
-    Invoke-IPUWindowsUpdate -Reason "24H2 eKB unavailable or failed"
+    Invoke-IPUWindowsUpdate -Reason "$ekFrom eKB unavailable or failed"
 }
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
 if (-not (Test-Path $IPU_LogDir))  { New-Item -ItemType Directory -Path $IPU_LogDir  -Force | Out-Null }
-$IPU_LegacyIso = Join-Path $IPU_WorkDir "Win11_25H2_x64.iso"
-if (Test-Path $IPU_LegacyIso) { Remove-Item $IPU_LegacyIso -Force -ErrorAction SilentlyContinue }
+# Media left by older runs (earlier ISO name, 25H2 ISOs and eKB) is no longer used.
+foreach ($IPU_LegacyName in 'Win11_25H2_x64.iso','Win11_25H2_x64_en-US.iso','Win11_25H2_x64_en-GB.iso','Win11_25H2_eKB_KB5054156_x64.msu') {
+    $IPU_LegacyIso = Join-Path $IPU_WorkDir $IPU_LegacyName
+    if (Test-Path $IPU_LegacyIso) { Remove-Item $IPU_LegacyIso -Force -ErrorAction SilentlyContinue }
+}
 Set-Status "RUNNING $stamp"
 Start-Transcript -Path (Join-Path $IPU_LogDir "ipu_runner.log") -Append -Force | Out-Null
 
@@ -1095,8 +1132,8 @@ $cancel = $false
 # worldwide, so the device may be any architecture, edition, UI language, or build.
 # The local ISO only covers x64 + retail editions + the languages we host (en-US/en-GB).
 #   LTSC / LTSB            -> skip and report (not feature-upgraded this way)
+#   24H2 / 25H2 (26100 / 26200, x64 or ARM64) -> KB5121794 enablement package (light, one reboot)
 #   ARM64                  -> Windows Update (x64 ISO and x64-only Assistant cannot run)
-#   24H2 x64 (build 26100) -> KB5054156 enablement package (light, one reboot)
 #   Enterprise             -> Windows Update (no retail media carries Enterprise)
 #   non-hosted UI language -> Installation Assistant (MS serves matching language+edition)
 #   hosted language, retail-> the local ISO below (covers Win10 and older Win11 x64)
@@ -1125,14 +1162,14 @@ if ($IPU_IsLtsc) {
     Set-Status "BLOCK_LTSC $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     $cancel = $true
 }
+elseif ($IPU_Build -in @(26100, 26200)) {
+    # 24H2 or 25H2 (x64 or ARM64): take the enablement package, not the ISO.
+    Invoke-IPUEnablementPackage
+    $cancel = $true
+}
 elseif ($IPU_IsArm) {
     Write-Output "ARM64 device; the x64 ISO and Installation Assistant cannot run here."
     Invoke-IPUWindowsUpdate -Reason "ARM64"
-    $cancel = $true
-}
-elseif ($IPU_Build -eq 26100) {
-    # 24H2 (x64, since ARM was handled above): take the enablement package, not the ISO.
-    Invoke-IPUEnablementPackage
     $cancel = $true
 }
 elseif ($IPU_EdId -match 'Enterprise') {
@@ -1313,7 +1350,7 @@ if (-not $RebootPending) {
 }
 
 # Never report SYSTEM CURRENT solely because there is no reboot flag. A feature
-# upgrade is complete only when the installed build is actually 25H2 or newer.
+# upgrade is complete only when the installed build is actually the target release or newer.
 $_finalCV      = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
 $_finalVersion = $_finalCV.DisplayVersion
 $_ipuState     = ""
