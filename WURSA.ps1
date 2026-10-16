@@ -27,6 +27,9 @@ $_ver    = "| v2.8"
 
 # Define the latest known Windows release
 $LatestVersion = "25H2"
+# Build of the target release. CurrentBuild at or above this is current or newer
+# (25H2 = 26200, 26H2 = 26300), so the upgrade is never offered as a downgrade.
+$LatestBuild   = 26200
 
 # Feature-upgrade state is tracked separately from ordinary Windows Update.
 # A surfaced/downloaded feature update is NOT considered staged. Region 5 owns
@@ -152,6 +155,7 @@ Write-Host "[>] Device Name      : " -NoNewline -ForegroundColor $LineCol
 Write-Host "$($env:COMPUTERNAME)" -ForegroundColor $AccentCol
 Write-Host "[>] Operating System : " -NoNewline -ForegroundColor $LineCol
 $WinVer = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
+$WinBuild = [int](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuild
 Write-Host "$($OS.Caption) $WinVer (Build $($OS.BuildNumber))" -ForegroundColor $AccentCol
 Write-HLine -Style dashed
 
@@ -221,7 +225,7 @@ $IPU_WorkDir          = "C:\Windows\Temp\25H2IPU"
 $IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
 $IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
 $IPU_ActiveHoursEnd   = 19
-if (-not $NoUpgrade -and $WinVer -ne $LatestVersion) {
+if (-not $NoUpgrade -and $WinBuild -lt $LatestBuild) {
     Write-Host "[>] Opening Windows Update policy for the update pass..." -ForegroundColor $LineCol
     $_polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $_auk  = "$_polk\AU"
@@ -693,6 +697,7 @@ function Test-WUFeatureUpdateStaged {
 Write-HLine -Style dashed
 Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
 $InstalledVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
+$InstalledBuild   = [int](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuild
 # Detect the native machine architecture from CIM instead of the PowerShell process
 # environment. Snapdragon/ARM64 devices can run x64-emulated management processes,
 # where PROCESSOR_ARCHITECTURE may report AMD64 and incorrectly route to x64 media.
@@ -711,7 +716,7 @@ if ($IPU_IsArm64) { Write-Host "      Architecture      : ARM64" -ForegroundColo
 if ($NoUpgrade) {
     $script:FeatureUpgradeState = "SKIPPED"
     Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
-} elseif ($InstalledVersion -ne $LatestVersion -and (Test-WUFeatureUpdateStaged)) {
+} elseif ($InstalledBuild -lt $LatestBuild -and (Test-WUFeatureUpdateStaged)) {
     # This is the only Windows Update state that suppresses the dedicated upgrade path.
     # Windows has actually staged the feature update and is asking for a reboot.
     $script:FeatureUpdateStaged = $true
@@ -719,7 +724,7 @@ if ($NoUpgrade) {
     Write-Host "      > $LatestVersion is staged by Windows Update and requires a reboot." -ForegroundColor $DimCol
     if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
     ('REBOOT_REQUIRED WU ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
-} elseif ($InstalledVersion -ne $LatestVersion) {
+} elseif ($InstalledBuild -lt $LatestBuild) {
     Write-Host "      > Feature update available." -ForegroundColor $WarnCol
     # Battery safety
     $OnBattery = $false
@@ -782,8 +787,8 @@ Start-Sleep -Seconds 180
 `$build = `$cv.CurrentBuild
 `$ubr = `$cv.UBR
 `$stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-if (`$ver -eq '$LatestVersion') {
-    "VERIFIED $LatestVersion `$build.`$ubr `$stamp" | Out-File -FilePath '$IPU_StatusFile' -Encoding ASCII -Force
+if ([int]`$build -ge $LatestBuild) {
+    "VERIFIED `$ver `$build.`$ubr `$stamp" | Out-File -FilePath '$IPU_StatusFile' -Encoding ASCII -Force
     if (Test-Path '$IPU_AURestoreFile') {
         `$polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
         `$auk  = "`$polk\AU"
@@ -1289,7 +1294,11 @@ schtasks.exe /Delete /TN "$IPU_TaskName" /F | Out-Null
     }
 } else {
     $script:FeatureUpgradeState = "CURRENT"
-    Write-Host "      System is already on the latest feature update." -ForegroundColor Green
+    if ($InstalledBuild -gt $LatestBuild) {
+        Write-Host "      System is on $InstalledVersion, newer than $LatestVersion. No feature upgrade needed." -ForegroundColor Green
+    } else {
+        Write-Host "      System is already on the latest feature update." -ForegroundColor Green
+    }
     Restore-WUUpgradeOverrides
 }
 #endregion
@@ -1304,7 +1313,7 @@ if (-not $RebootPending) {
 }
 
 # Never report SYSTEM CURRENT solely because there is no reboot flag. A feature
-# upgrade is complete only when the installed DisplayVersion actually equals 25H2.
+# upgrade is complete only when the installed build is actually 25H2 or newer.
 $_finalCV      = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
 $_finalVersion = $_finalCV.DisplayVersion
 $_ipuState     = ""
@@ -1313,8 +1322,8 @@ if (Test-Path $IPU_StatusFile) {
 }
 
 Write-HLine -Style dashed
-if (-not $NoUpgrade -and $_finalVersion -eq $LatestVersion) {
-    Write-Host "STATUS: SYSTEM CURRENT ($LatestVersion)" -ForegroundColor Green
+if (-not $NoUpgrade -and [int]$_finalCV.CurrentBuild -ge $LatestBuild) {
+    Write-Host "STATUS: SYSTEM CURRENT ($_finalVersion)" -ForegroundColor Green
     $script:ExitCode = 0
 } elseif ($NoUpgrade) {
     if ($RebootPending) {
