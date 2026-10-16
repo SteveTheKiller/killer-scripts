@@ -629,7 +629,7 @@ if ($run3rdParty -and $ChocoAvailable) {
 $IPU_InstallLang = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction SilentlyContinue).InstallLanguage
 switch ($IPU_InstallLang) {
     '0809'  { $IPU_IsoName = "Win11_26H2_x64_en-GB.iso"; $IPU_IsoSha256 = "" }
-    default { $IPU_IsoName = "Win11_26H2_x64_en-US.iso"; $IPU_IsoSha256 = "" }
+    default { $IPU_IsoName = "Win11_26H2_x64_en-US.iso"; $IPU_IsoSha256 = "BD4307DF32BC8AF33B39CCECB1174AEB345386630F89A2B86C7A4E36B55EA650" }
 }
 $IPU_IsoUrl     = "https://iso.killertools.net/$IPU_IsoName"
 $IPU_IsoSizeGB  = 6.0
