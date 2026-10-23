@@ -60,4 +60,3 @@ Be prepared to revise an approved contribution after review. Contributions must 
 ## Project-specific guidance
 
 Describe the machine changes a script makes and how failures are handled. Use a disposable environment for scripts that change system settings or remove software or data.
-
