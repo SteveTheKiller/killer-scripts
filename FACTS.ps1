@@ -103,6 +103,50 @@ function Set-FactsUpdaterValues {
     } catch { return $false } finally { if ($base) { $base.Close() } }
 }
 
+function Disable-FactsUpdateServicesAndTasks {
+    # Disables every Foxit update service and scheduled task (in any task folder) and reads each one back.
+    # Returns one line per problem, nothing when everything is in place.
+    $issues = New-Object System.Collections.ArrayList
+    foreach ($svc in @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*Foxit*Update*' })) {
+        try {
+            Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction Stop
+            Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+            $now = Get-Service -Name $svc.Name -ErrorAction Stop
+            if ("$($now.StartType)" -ne 'Disabled') { [void]$issues.Add("service $($svc.Name) is still $($now.StartType)") }
+        } catch { [void]$issues.Add("service $($svc.Name) could not be disabled: $($_.Exception.Message)") }
+    }
+    foreach ($t in @(Get-ScheduledTask -TaskName '*Foxit*' -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like '*Update*' })) {
+        $full = "$($t.TaskPath)$($t.TaskName)"
+        try {
+            Stop-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction SilentlyContinue
+            Disable-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction Stop | Out-Null
+            $now = Get-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction Stop
+            if ("$($now.State)" -ne 'Disabled') { [void]$issues.Add("task $full is still $($now.State)") }
+        } catch { [void]$issues.Add("task $full could not be disabled: $($_.Exception.Message)") }
+    }
+    @($issues.ToArray())
+}
+
+# The hourly task runs the same functions the interactive pass uses, so the two cannot drift apart.
+# The text is captured here, when the file loads, so it is the real function bodies.
+$script:FactsLibraryNames = @('Open-FactsHklm64', 'Get-FactsFoxitApps', 'Add-FactsUpdaterKeys', 'Get-FactsUpdaterKeys', 'Set-FactsUpdaterValues', 'Disable-FactsUpdateServicesAndTasks')
+$script:FactsLibrary = (($script:FactsLibraryNames | ForEach-Object {
+    "function $_ {`n" + (Get-Command $_ -CommandType Function).ScriptBlock.ToString() + "`n}"
+}) -join "`n")
+function Get-FactsMaintenanceScript {
+    $script:FactsLibrary + @'
+
+$bad = 0
+$audit = Get-FactsFoxitApps
+if ($audit.Ok -and @($audit.Names).Count -gt 0) {
+    foreach ($p in @(Get-FactsUpdaterKeys)) { if (-not (Set-FactsUpdaterValues -Path $p)) { $bad++ } }
+    $bad += @(Disable-FactsUpdateServicesAndTasks).Count
+}
+if ($bad -gt 0) { exit 3 }
+exit 0
+'@
+}
+
 $script:StepRow = -1
 $script:StepMsg = ""
 $script:Width   = 85
@@ -233,12 +277,14 @@ function Invoke-FactsMain {
     }
     #endregion
 
+    $Problems = New-Object System.Collections.ArrayList
+
     #region 2. Universal Registry Hardening
     # ============================================================================
     if ($FoundApps.Count -gt 0) {
         Write-StepUpdate "[2/4] Applying Recursive Registry Blocks..."
         foreach ($Key in @(Get-FactsUpdaterKeys)) {
-            [void](Set-FactsUpdaterValues -Path $Key)
+            if (-not (Set-FactsUpdaterValues -Path $Key)) { [void]$Problems.Add("registry value did not read back: HKLM\$Key") }
         }
         Write-StepUpdate -Success
     } else {
@@ -250,14 +296,7 @@ function Invoke-FactsMain {
     # ============================================================================
     if ($FoundApps.Count -gt 0) {
         Write-StepUpdate "[3/4] Disabling Native Services and Tasks..."
-        Get-Service | Where-Object { $_.Name -like "*Foxit*Update*" } | ForEach-Object {
-            Set-Service -Name $_.Name -StartupType Disabled
-            Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
-        }
-        Get-ScheduledTask -TaskName "*Foxit*" | Where-Object { $_.TaskName -like "*Update*" } | ForEach-Object {
-            Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue
-            Disable-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue
-        }
+        foreach ($Issue in @(Disable-FactsUpdateServicesAndTasks)) { [void]$Problems.Add($Issue) }
         Write-StepUpdate -Success
     } else {
         Write-StepUpdate "[3/4] Skipping Service/Task Block..." -CustomInfo "(Not Required)"
@@ -268,19 +307,18 @@ function Invoke-FactsMain {
     # ============================================================================
     if ($FoundApps.Count -gt 0) {
         Write-StepUpdate "[4/4] Configuring Persistence (Hourly Task)..."
-        $MaintenanceScript = {
-            $AuditPaths = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
-            if (Get-ItemProperty $AuditPaths | Where-Object { $_.DisplayName -like "*Foxit*" }) {
-                Get-Service | Where-Object {$_.Name -like "*Foxit*Update*"} | ForEach-Object {Set-Service -Name $_.Name -StartupType Disabled; Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue}
-                Get-ScheduledTask -TaskName "*Foxit*" | Where-Object {$_.TaskName -like "*Update*"} | ForEach-Object {Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue; Disable-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue}
-            }
-        }.ToString()
-        $EncodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($MaintenanceScript))
-        $Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $EncodedCommand"
-        $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1)
+        $EncodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes((Get-FactsMaintenanceScript)))
         try {
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-            Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+            $Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $EncodedCommand"
+            $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1)
+            # -Force replaces an existing task in one step, so a failed update keeps the installed task.
+            Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -User "SYSTEM" -RunLevel Highest -Force -ErrorAction Stop | Out-Null
+            $Back = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if (-not $Back) {
+                [void]$Problems.Add("maintenance task $TaskName was registered but could not be read back")
+            } elseif ("$($Back.State)" -eq 'Disabled') {
+                [void]$Problems.Add("maintenance task $TaskName is registered but disabled")
+            }
             Write-StepUpdate -Success
         }
         catch {
@@ -290,18 +328,31 @@ function Invoke-FactsMain {
         }
     } else {
         Write-StepUpdate "[4/4] Removing existing Maintenance Tasks..."
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop }
+            catch { [void]$Problems.Add("maintenance task $TaskName could not be removed: $($_.Exception.Message)") }
+        }
         Write-StepUpdate -Success -CustomInfo "(No Foxit Detected)"
     }
     # Footer (reuses header art - art on right, fill on left)
     $_ffillW = $script:Width - $_artW - 2  # 1 leading space + 1 sfx char
-    $_footer = "  FOXIT MAINTENANCE ENFORCEMENT COMPLETE"
+    $_footer = if ($Problems.Count -gt 0) { "  FOXIT MAINTENANCE ENFORCEMENT INCOMPLETE" } else { "  FOXIT MAINTENANCE ENFORCEMENT COMPLETE" }
     $_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $_ver.Length))
 
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host "█" -ForegroundColor $LineCol
     Write-Host "$_footer$_fpad$_ver" -ForegroundColor $BorderCol -NoNewline; Write-Host " $_art2" -ForegroundColor $ArtCol -NoNewline; Write-Host "█" -ForegroundColor $LineCol
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host "█" -ForegroundColor $LineCol
-    Write-Output "[PASS] FACTS complete (exit 0)"
+
+    if ($Problems.Count -gt 0) {
+        foreach ($Issue in $Problems) { Write-Output "[FAILED] $Issue" }
+        Write-Output ("[WARN] FACTS partial: {0} problem(s), see above (exit 3)" -f $Problems.Count)
+        Exit-KillerScript 3
+    }
+    if ($FoundApps.Count -gt 0) {
+        Write-Output ("[PASS] FACTS complete: {0} Foxit install(s) blocked, hourly task in place (exit 0)" -f $FoundApps.Count)
+    } else {
+        Write-Output "[PASS] FACTS complete: no Foxit detected, maintenance task removed (exit 0)"
+    }
     Exit-KillerScript 0
     #endregion
 }
