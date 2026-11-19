@@ -34,9 +34,23 @@ function Exit-KillerScript {
     exit $Code
 }
 
+# Well-known SID of the local Administrators group. Group names are localized, so use the SID.
+$script:AdminsGroupSid = 'S-1-5-32-544'
+
 function Reset-DepotState {
     $script:RebootRequired = $false
     $script:UserHives      = @()
+    $script:DepotResults   = @()
+}
+
+function Add-DepotResult {
+    # Records one step outcome. Status is Done, AlreadyInstalled, Skipped or Failed.
+    param([string]$Step, [ValidateSet('Done', 'AlreadyInstalled', 'Skipped', 'Failed')][string]$Status, [string]$Detail = '')
+    $script:DepotResults = @($script:DepotResults) + [pscustomobject]@{ Step = $Step; Status = $Status; Detail = $Detail }
+}
+
+function Get-DepotCurrentSid {
+    try { return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { return $null }
 }
 
 function Write-StatusTag {
@@ -308,46 +322,105 @@ function Invoke-DepotRename {
 }
 
 function New-DepotLocalAdmin {
+    # Returns the new account's SID once it exists, is enabled and is in Administrators. Otherwise $null.
     $NewAdminName = Read-Host "   > Local Admin Username"
     $Password = Read-Host "   > Local Admin Password" -AsSecureString
-    if ($NewAdminName -and $Password) {
+    if ($NewAdminName -and $Password -and $Password.Length -gt 0) {
         Write-Host "[>] Creating local account: $NewAdminName..." -NoNewline
         try {
-            New-LocalUser -Name $NewAdminName -Password $Password -Description "Local Admin created" -ErrorAction Stop
-            Add-LocalGroupMember -Group "Administrators" -Member $NewAdminName -ErrorAction Stop
+            $created = New-LocalUser -Name $NewAdminName -Password $Password -Description "Local Admin created" -ErrorAction Stop
+            Add-LocalGroupMember -SID $script:AdminsGroupSid -Member $NewAdminName -ErrorAction Stop
+            $check = Get-LocalUser -SID $created.SID -ErrorAction Stop
+            if (-not $check -or -not $check.Enabled) { throw "The new account is not enabled." }
             Write-Host " Done." -ForegroundColor Green
+            Add-DepotResult "Create local admin $NewAdminName" 'Done'
+            return $created.SID
         } catch {
             Write-Host " Failed." -ForegroundColor Red
             Write-Warning $_.Exception.Message
+            Add-DepotResult "Create local admin $NewAdminName" 'Failed' $_.Exception.Message
+            return $null
         }
-    } else {
-        Write-Host "[!] Username or Password cannot be empty. Skipping." -ForegroundColor Gray
     }
-    return $NewAdminName
+    Write-Host "[!] Username or Password cannot be empty. Skipping." -ForegroundColor Gray
+    return $null
 }
 
 function Invoke-DepotAdminPurge {
-    param([string]$NewAdminName)
-    Write-Host "[>] Disabling built-in Administrator account..." -NoNewline
-    Disable-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue
-    Write-Host " Done." -ForegroundColor Green
+    # Disables the built-in Administrator and deletes other local administrators, all by SID, and only
+    # when the account created earlier in this run is verified as an enabled administrator.
+    param($SurvivorSid)
+    $step = "Purge administrators"
+    Write-Host "[>] Verifying a usable administrator will remain..." -NoNewline
+    try {
+        $users   = @(Get-LocalUser -ErrorAction Stop)
+        $members = @(Get-LocalGroupMember -SID $script:AdminsGroupSid -ErrorAction Stop)
+    } catch {
+        Write-Host " Failed." -ForegroundColor Red
+        Write-Host "[!] Could not read local accounts, so nothing was disabled or deleted: $($_.Exception.Message)" -ForegroundColor Red
+        Add-DepotResult $step 'Failed' "Could not read local accounts: $($_.Exception.Message)"
+        return
+    }
+    $builtIn = $users | Where-Object { $_.SID.Value -match '^S-1-5-21-[\d-]+-500$' } | Select-Object -First 1
+    $survivor = $null
+    if ($SurvivorSid) {
+        $survivor = $users | Where-Object { $_.SID.Value -eq "$SurvivorSid" -and $_.Enabled } | Select-Object -First 1
+        if ($survivor -and -not ($members | Where-Object { $_.SID.Value -eq "$SurvivorSid" })) { $survivor = $null }
+    }
+    if (-not $builtIn -or -not $survivor -or $survivor.SID.Value -eq $builtIn.SID.Value) {
+        Write-Host " Refused." -ForegroundColor Red
+        Write-Host "[!] No new administrator was created and verified in this run, so the built-in Administrator and other admins were left alone." -ForegroundColor Red
+        Add-DepotResult $step 'Failed' 'No verified administrator would remain'
+        return
+    }
+    Write-Host " OK ($($survivor.Name))." -ForegroundColor Green
+
+    $failed = 0
+    Write-Host "[>] Disabling built-in Administrator account ($($builtIn.Name))..." -NoNewline
+    try {
+        if ($builtIn.Enabled) {
+            Disable-LocalUser -SID $builtIn.SID -ErrorAction Stop
+            $after = Get-LocalUser -SID $builtIn.SID -ErrorAction Stop
+            if ($after.Enabled) { throw "The account is still enabled." }
+        }
+        Write-Host " Done." -ForegroundColor Green
+        Write-Host "    Recovery: Enable-LocalUser -SID $($builtIn.SID.Value)" -ForegroundColor DarkGray
+    } catch {
+        Write-Host " Failed." -ForegroundColor Red
+        Write-Warning $_.Exception.Message
+        $failed++
+        Add-DepotResult "Disable built-in Administrator" 'Failed' $_.Exception.Message
+    }
 
     Write-Host "[>] Scanning for other local administrators to delete..." -NoNewline
-    $AdminsToPurge = Get-LocalGroupMember -Group "Administrators" | Where-Object {
-        $_.Name -notlike "*\Administrator" -and
-        $_.Name -notlike "*\$NewAdminName" -and
-        $_.ObjectClass -eq "User"
-    }
-    if ($AdminsToPurge) {
+    $machinePrefix = ($builtIn.SID.Value -replace '-500$', '') + '-'
+    $currentSid = Get-DepotCurrentSid
+    $AdminsToPurge = @($members | Where-Object {
+        $_.ObjectClass -eq "User" -and
+        $_.SID.Value.StartsWith($machinePrefix) -and
+        $_.SID.Value -ne $builtIn.SID.Value -and
+        $_.SID.Value -ne $survivor.SID.Value -and
+        $_.SID.Value -ne $currentSid
+    })
+    if ($AdminsToPurge.Count -gt 0) {
         Write-Host " Found $($AdminsToPurge.Count)." -ForegroundColor Cyan
         foreach ($Admin in $AdminsToPurge) {
             Write-Host "   [!] Deleting account: $($Admin.Name)..." -NoNewline
-            Remove-LocalUser -Name $Admin.Name -ErrorAction SilentlyContinue
-            Write-Host " Done." -ForegroundColor Green
+            try {
+                Remove-LocalUser -SID $Admin.SID -ErrorAction Stop
+                if (Get-LocalUser -SID $Admin.SID -ErrorAction SilentlyContinue) { throw "The account still exists." }
+                Write-Host " Done." -ForegroundColor Green
+            } catch {
+                Write-Host " Failed." -ForegroundColor Red
+                Write-Warning $_.Exception.Message
+                $failed++
+                Add-DepotResult "Delete account $($Admin.Name)" 'Failed' $_.Exception.Message
+            }
         }
     } else {
         Write-Host " None found." -ForegroundColor Green
     }
+    if ($failed -eq 0) { Add-DepotResult $step 'Done' }
 }
 
 function Invoke-DepotInteractiveSetup {
@@ -362,12 +435,12 @@ function Invoke-DepotInteractiveSetup {
     # 1.2: Local Admin Creation
     Write-Host ""
     $AdminChoice = Read-DepotChoice "2) Do you want to make a local admin account? (y/N) "
-    $NewAdminName = $null
-    if ($AdminChoice -eq "Y" -or $AdminChoice -eq "y") { $NewAdminName = New-DepotLocalAdmin }
+    $NewAdminSid = $null
+    if ($AdminChoice -eq "Y" -or $AdminChoice -eq "y") { $NewAdminSid = New-DepotLocalAdmin }
     # 1.3: Purge & Secure Admin Accounts
     Write-Host ""
     $PurgeChoice = Read-DepotChoice "3) Do you want to purge other admins and disable built-in Administrator? (y/N) "
-    if ($PurgeChoice -eq "Y" -or $PurgeChoice -eq "y") { Invoke-DepotAdminPurge -NewAdminName $NewAdminName }
+    if ($PurgeChoice -eq "Y" -or $PurgeChoice -eq "y") { Invoke-DepotAdminPurge -SurvivorSid $NewAdminSid }
 }
 
 function Show-DepotBanner {

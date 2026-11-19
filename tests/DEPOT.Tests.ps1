@@ -58,3 +58,99 @@ Describe 'Exit codes at the entry point' {
         { Invoke-DepotMain } | Should -Throw 'KILLERSCRIPT_EXIT:3010'
     }
 }
+
+Describe 'Finding 12: admin purge needs a verified survivor' {
+    BeforeEach {
+        $sid = { param($s) [Security.Principal.SecurityIdentifier]"S-1-5-21-111-222-333-$s" }
+        # The built-in Administrator has been renamed to Owner, so only the SID identifies it.
+        $script:Users = @(
+            [pscustomobject]@{ Name = 'Owner';   SID = (& $sid 500);  Enabled = $true },
+            [pscustomobject]@{ Name = 'oldtech'; SID = (& $sid 1001); Enabled = $true }
+        )
+        $script:Members = @(
+            [pscustomobject]@{ Name = 'PC\Owner';   SID = (& $sid 500);  ObjectClass = 'User' },
+            [pscustomobject]@{ Name = 'PC\oldtech'; SID = (& $sid 1001); ObjectClass = 'User' },
+            [pscustomobject]@{ Name = 'CONTOSO\dadmin'; SID = [Security.Principal.SecurityIdentifier]'S-1-5-21-999-888-777-1105'; ObjectClass = 'User' }
+        )
+        $script:Choices = New-Object System.Collections.Queue
+        $script:NewSid = (& $sid 1002)
+        Reset-DepotState
+        Mock Clear-Host { }
+        Mock Read-DepotChoice { $script:Choices.Dequeue() }
+        Mock Read-Host {
+            if ($AsSecureString) { $s = New-Object System.Security.SecureString; 'pw'.ToCharArray() | ForEach-Object { $s.AppendChar($_) }; $s } else { 'techadmin' }
+        }
+        Mock Get-LocalUser {
+            if ($SID) { $script:Users | Where-Object { $_.SID.Value -eq $SID.Value } }
+            elseif ($Name) { $script:Users | Where-Object { $_.Name -eq $Name } }
+            else { $script:Users }
+        }
+        Mock Get-LocalGroupMember { $script:Members }
+        Mock New-LocalUser {
+            $u = [pscustomobject]@{ Name = $Name; SID = $script:NewSid; Enabled = $true }
+            $script:Users += $u
+            $u
+        }
+        Mock Add-LocalGroupMember {
+            $u = $script:Users | Where-Object { $_.Name -eq $Member -or $_.SID.Value -eq "$Member" } | Select-Object -First 1
+            $script:Members += [pscustomobject]@{ Name = "PC\$($u.Name)"; SID = $u.SID; ObjectClass = 'User' }
+        }
+        Mock Disable-LocalUser { $u = $script:Users | Where-Object { ($SID -and $_.SID.Value -eq $SID.Value) -or ($Name -and $_.Name -eq $Name) }; if ($u) { $u.Enabled = $false } }
+        Mock Remove-LocalUser {
+            $script:Users = @($script:Users | Where-Object { -not ($SID -and $_.SID.Value -eq $SID.Value) -and -not ($Name -and $_.Name -eq $Name) })
+            $script:Members = @($script:Members | Where-Object { $_.SID.Value -ne $SID.Value })
+        }
+        Mock Rename-Computer { }
+    }
+
+    It 'refuses to disable the built-in Administrator or delete anyone when the operator declines to create an admin' {
+        'N', 'N', 'Y' | ForEach-Object { $script:Choices.Enqueue($_) }
+        Invoke-DepotInteractiveSetup 6>$null 3>$null
+        Should -Invoke Disable-LocalUser -Times 0 -Exactly
+        Should -Invoke Remove-LocalUser -Times 0 -Exactly
+        @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'refuses to disable or delete anyone when creating the new admin fails' {
+        Mock New-LocalUser { throw 'The password does not meet the password policy requirements.' }
+        'N', 'Y', 'Y' | ForEach-Object { $script:Choices.Enqueue($_) }
+        Invoke-DepotInteractiveSetup 6>$null 3>$null
+        Should -Invoke Disable-LocalUser -Times 0 -Exactly
+        Should -Invoke Remove-LocalUser -Times 0 -Exactly
+    }
+
+    It 'refuses the purge when the new account exists but could not be added to Administrators' {
+        Mock Add-LocalGroupMember { throw 'Access is denied.' }
+        'N', 'Y', 'Y' | ForEach-Object { $script:Choices.Enqueue($_) }
+        Invoke-DepotInteractiveSetup 6>$null 3>$null
+        Should -Invoke Disable-LocalUser -Times 0 -Exactly
+        Should -Invoke Remove-LocalUser -Times 0 -Exactly
+    }
+
+    It 'disables the renamed built-in Administrator by SID and deletes other local admins by SID once the new admin is verified' {
+        'N', 'Y', 'Y' | ForEach-Object { $script:Choices.Enqueue($_) }
+        Invoke-DepotInteractiveSetup 6>$null 3>$null
+        Should -Invoke Disable-LocalUser -Times 1 -Exactly -ParameterFilter { $SID.Value -eq 'S-1-5-21-111-222-333-500' }
+        Should -Invoke Remove-LocalUser -Times 1 -Exactly -ParameterFilter { $SID.Value -eq 'S-1-5-21-111-222-333-1001' }
+        # not the survivor, and not the domain account that Remove-LocalUser cannot delete
+        Should -Invoke Remove-LocalUser -Times 0 -Exactly -ParameterFilter { $SID.Value -eq 'S-1-5-21-111-222-333-1002' }
+        Should -Invoke Remove-LocalUser -Times 0 -Exactly -ParameterFilter { $SID.Value -eq 'S-1-5-21-999-888-777-1105' }
+        @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -Be 0
+    }
+
+    It 'reports a failed deletion instead of printing Done' {
+        Mock Remove-LocalUser { throw 'The user could not be removed.' }
+        'N', 'Y', 'Y' | ForEach-Object { $script:Choices.Enqueue($_) }
+        $out = Invoke-DepotInteractiveSetup 6>&1 3>$null | Out-String
+        $out | Should -Not -Match 'Deleting account: PC\\oldtech\.\.\.\s*Done'
+        (@($script:DepotResults | Where-Object { $_.Status -eq 'Failed' -and $_.Step -match 'oldtech' })).Count | Should -Be 1
+    }
+
+    It 'fails closed when the Administrators group cannot be read' {
+        Mock Get-LocalGroupMember { throw 'One or more members could not be resolved.' }
+        'N', 'Y', 'Y' | ForEach-Object { $script:Choices.Enqueue($_) }
+        Invoke-DepotInteractiveSetup 6>$null 3>$null
+        Should -Invoke Disable-LocalUser -Times 0 -Exactly
+        Should -Invoke Remove-LocalUser -Times 0 -Exactly
+    }
+}
