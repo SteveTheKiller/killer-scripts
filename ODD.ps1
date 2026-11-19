@@ -298,10 +298,6 @@ function Write-OddSection {
 }
 
 function Invoke-OddMain {
-    if (-not (Test-OddElevated)) {
-        Write-Error "O.D.D. requires Elevated Privileges. Please run as Administrator."
-        Exit-KillerScript 1
-    }
     $endpointsOut = @(Get-OddEndpoints -Branch Render)
     $endpointsIn  = @(Get-OddEndpoints -Branch Capture)
     $OutDevice = Get-DefaultDevice -Branch Render  -Endpoints $endpointsOut

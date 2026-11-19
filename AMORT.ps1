@@ -546,7 +546,9 @@ function Invoke-AmortCleanup {
         [switch]$RemoveRollback
     )
 $TempAgeDays = 2
-$_fver   = "| v18.0"
+$_fver   = "| v18.1"
+# Without admin, AMORT cleans only the current user's files and skips the system steps.
+$UserMode = -not (Test-AmortElevated)
 #region Pre-Flight Checks
 # ============================================================================
 # Force UTF-8 output so box-drawing characters render correctly
@@ -633,16 +635,24 @@ if ($DryRun) {
     Write-Host "      Mode: DRY RUN - estimate only, no changes will be made" -ForegroundColor Magenta
 }
 if ($IsVM) {
-    Write-Host "      Mode: Virtual Machine" -ForegroundColor Yellow 
+    Write-Host "      Mode: Virtual Machine" -ForegroundColor Yellow
+}
+if ($UserMode) {
+    Write-Host "      Mode: USER - current profile only, admin steps skipped" -ForegroundColor Yellow
 }
 #endregion
-$UserProfiles = Get-ChildItem "C:\Users" -Directory -Force -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -notin @("All Users", "Default User") -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }
+if ($UserMode) {
+    $UserProfiles = @(Get-Item -LiteralPath $env:USERPROFILE -Force -ErrorAction SilentlyContinue)
+} else {
+    $UserProfiles = Get-ChildItem "C:\Users" -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @("All Users", "Default User") -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }
+}
 $script:Notes = @()
 #region 1. Snapshots, Upgrade Leftovers & OEM Installers
 # ============================================================================
 Write-StepUpdate "[01/11] Purging Snapshots, Upgrade Leftovers & OEM Installers"
 $RegionEst = [int64]0
+if ($UserMode) { Write-StepUpdate -CustomInfo "[ADMIN ONLY]" } else {
 # Dell SupportAssist Remediation snapshot purge
 # SupportAssist OS Recovery stores system-repair snapshots under
 # SARemediation\SystemRepair\{Snapshots,Backup} that can grow to 20-80GB when
@@ -725,6 +735,7 @@ if (Test-Path "C:\Windows.old") {
     }
 }
 Complete-Step -Estimate $RegionEst
+}
 #endregion
 
 #region 2. Crash Dumps & Error Reports (age-gated)
@@ -739,6 +750,7 @@ $DumpPaths = @(
     "C:\ProgramData\Microsoft\Windows\WER\ReportQueue",
     "C:\ProgramData\Microsoft\Windows\WER\Temp"
 )
+if ($UserMode) { $DumpPaths = @() }
 foreach ($U in $UserProfiles) {
     $DumpPaths += "$($U.FullName)\AppData\Local\CrashDumps"
     $DumpPaths += "$($U.FullName)\AppData\Local\Microsoft\Windows\WER"
@@ -752,7 +764,7 @@ Complete-Step -Estimate $RegionEst
 Write-StepUpdate "[03/11] Purging Temp, Browser, Teams, and GPU Caches"
 $RegionEst = [int64]0
 # Temp files are age-gated so installers and apps running right now keep their working files.
-$TempPaths = @("C:\Windows\Temp", "C:\Windows\SystemTemp")
+$TempPaths = if ($UserMode) { @() } else { @("C:\Windows\Temp", "C:\Windows\SystemTemp") }
 foreach ($U in $UserProfiles) { $TempPaths += "$($U.FullName)\AppData\Local\Temp" }
 $RegionEst += Remove-OldFiles -Path $TempPaths -Days $TempAgeDays
 
@@ -833,7 +845,9 @@ Write-StepUpdate "[05/11] Clearing Windows Update Download Cache"
 # startup types are left at their Windows defaults. BITS is never stopped so the RMM
 # and LiveConnect stay connected.
 $WUDownload = "C:\Windows\SoftwareDistribution\Download"
-if ($PendingReboot) {
+if ($UserMode) {
+    Write-StepUpdate -CustomInfo "[ADMIN ONLY]"
+} elseif ($PendingReboot) {
     Write-StepUpdate -CustomInfo "[SKIPPED]"
 } elseif ($DryRun) {
     Write-DryEstimate (Get-PathSize $WUDownload)
@@ -852,6 +866,7 @@ Write-StepUpdate "[06/11] Trimming Restore Points (keeping newest $KeepRestorePo
 # Restore points are shadow copies of C:. The newest ones are always kept so the machine
 # can still be rolled back. Only older copies beyond that count are deleted.
 $RegionEst = [int64]0
+if ($UserMode) { Write-StepUpdate -CustomInfo "[ADMIN ONLY]" } else {
 $CVol = Get-CimInstance Win32_Volume -Filter "DriveLetter='C:'" -ErrorAction SilentlyContinue
 $Shadows = @()
 if ($CVol) {
@@ -875,6 +890,7 @@ if ($OldShadows.Count -gt 0) {
     }
 }
 Complete-Step -Estimate $RegionEst
+}
 #endregion
 
 #region 7. Log Compaction
@@ -883,7 +899,9 @@ Write-StepUpdate "[07/11] Compressing System Logs (NTFS, nothing deleted)"
 # Logs are compressed in place, so every log is still there and readable for audits.
 # Files that are open are skipped.
 $LogDirs = @("C:\Windows\Logs", "C:\Windows\Panther", "C:\Windows\System32\LogFiles", "C:\ProgramData\Microsoft\Windows\WER")
-if ($DryRun) {
+if ($UserMode) {
+    Write-StepUpdate -CustomInfo "[ADMIN ONLY]"
+} elseif ($DryRun) {
     Complete-Step -NoEstimate
 } else {
     foreach ($L in $LogDirs) {
@@ -904,8 +922,11 @@ $PendingRename = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\
 $HasPendingRename = $null -ne $PendingRename
 # One decision for every repair step: dry run, active servicing, a pending reboot or a pending
 # rename. TrustedInstaller is only touched when repair will actually run.
-$SkipRepair = [bool]($DryRun -or $PendingReboot -or $ServicingActive -or $HasPendingRename)
-if ($DryRun) {
+$SkipRepair = [bool]($UserMode -or $DryRun -or $PendingReboot -or $ServicingActive -or $HasPendingRename)
+if ($UserMode) {
+    Write-Host "        [i] User mode - DISM and SFC need admin and were skipped." -ForegroundColor Yellow
+}
+elseif ($DryRun) {
     Write-Host "        [i] Dry run - DISM and SFC repair steps skipped (no changes)." -ForegroundColor Magenta
 }
 elseif ($PendingReboot) {
@@ -1170,7 +1191,9 @@ if (-not $DryRun) {
 #region 8. Final Optimization
 # ============================================================================
 Write-StepUpdate "[11/11] Disabling Hibernation, Flushing DNS & Running SSD TRIM"
-if ($DryRun) {
+if ($UserMode) {
+    Write-StepUpdate -CustomInfo "[ADMIN ONLY]"
+} elseif ($DryRun) {
     $HibBytes = [int64]0
     if (Test-Path "C:\hiberfil.sys") {
         try { $HibBytes = [int64](Get-Item "C:\hiberfil.sys" -Force -ErrorAction SilentlyContinue).Length } catch { $HibBytes = 0 }
@@ -1224,10 +1247,6 @@ function Invoke-AmortMain {
         [int]$KeepRestorePoints = 2,
         [switch]$RemoveRollback
     )
-    if (-not (Test-AmortElevated)) {
-        Write-Warning "Elevation Required: Please run as Administrator."
-        Exit-KillerScript 1
-    }
     $script:AmortFailures = @()
     $script:AmortSkips    = @()
     $script:AmortReboot   = $false

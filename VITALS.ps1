@@ -213,10 +213,7 @@ $_title = "VISUAL INTERFACE FOR TECHNICAL ASSET & LOGISTICS SUMMARY"
 function Invoke-VitalsMain {
     #region Pre-Flight Checks
     # ============================================================================
-    if (-not (Test-VitalsElevated)) {
-        Write-Warning "Elevation Required: Please run as Administrator."
-        Exit-KillerScript 1
-    }
+    $Elevated = Test-VitalsElevated
     $Problems = New-Object System.Collections.ArrayList
     Initialize-VitalsConsole
     $OS  = Get-WMI Win32_OperatingSystem
@@ -256,7 +253,9 @@ function Invoke-VitalsMain {
     $TPMStatus  = if ($TPMInfo -and $TPMInfo.TpmPresent) { if ($TPMInfo.TpmReady) { "Ready" } else { "Not Ready" } } else { "Not Detected" }
     $TPMColor   = if ($TPMInfo -and $TPMInfo.TpmPresent) { if ($TPMInfo.TpmReady) { "Green" } else { "DarkYellow" } } else { "DarkYellow" }
     $TPMDisplay = if ($TPMVerClean) { "TPM $TPMVerClean $TPMStatus" } else { "TPM $TPMStatus" }
-    $SBText     = if ($SecureBoot -eq $true) { "Enabled" } elseif ($SecureBoot -eq $false) { "Disabled" } else { "Unavailable" }
+    # TPM and Secure Boot can only be read elevated, so say so instead of reporting them missing.
+    if (-not $Elevated -and -not ($TPMInfo -and $TPMInfo.TpmPresent)) { $TPMDisplay = "TPM needs admin" }
+    $SBText     = if ($SecureBoot -eq $true) { "Enabled" } elseif ($SecureBoot -eq $false) { "Disabled" } elseif (-not $Elevated) { "needs admin" } else { "Unavailable" }
     $SBColor    = if ($SecureBoot -eq $true) { "Green" } elseif ($SecureBoot -eq $false) { "Red" } else { "DarkYellow" }
     Write-Host "   Security     : " -NoNewline -ForegroundColor $script:LabelFG
     Write-Host $TPMDisplay -NoNewline -ForegroundColor $TPMColor
