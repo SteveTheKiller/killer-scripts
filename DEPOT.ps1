@@ -14,6 +14,7 @@ $script:DepotScriptPath = $MyInvocation.MyCommand.Path
 
 $script:Width     = 85
 $script:DepotTemp = 'C:\Windows\Temp'
+$script:OneDriveVerifySeconds = 30
 $script:LineCol   = "DarkRed"
 $script:MainCol   = "Green"
 $script:AccentCol = "Yellow"
@@ -407,13 +408,23 @@ function Read-DepotChoice {
 }
 
 function Invoke-DepotRename {
+    $script:DepotStep = 'Rename'
     $CurrentName = $env:COMPUTERNAME
-    $NewName = Read-Host "   > New Device Name"
-    if ($NewName -and $NewName -ne $CurrentName) {
+    $NewName = ("$(Read-Host "   > New Device Name")").Trim()
+    # NetBIOS rules: 1 to 15 letters, digits or hyphens, not all digits, no leading or trailing hyphen.
+    $valid = ($NewName -match '^[A-Za-z0-9]([A-Za-z0-9-]{0,13}[A-Za-z0-9])?$') -and ($NewName -notmatch '^\d+$')
+    if ($valid -and $NewName -ne $CurrentName) {
         Write-Host "[>] Renaming computer from $CurrentName to $NewName..." -NoNewline
-        Rename-Computer -NewName $NewName -Force -ErrorAction SilentlyContinue
-        Write-Host " Done." -ForegroundColor Green
-        Write-Host "[!] Note: Name change requires a reboot to take effect." -ForegroundColor Red
+        try {
+            Rename-Computer -NewName $NewName -Force -ErrorAction Stop
+            Write-Host " Done." -ForegroundColor Green
+            Write-Host "[!] Note: Name change requires a reboot to take effect." -ForegroundColor Red
+            $script:RebootRequired = $true
+            Add-DepotResult 'Rename' 'Done' "renamed to $NewName, reboot needed"
+        } catch {
+            Write-Host " Failed: $($_.Exception.Message)" -ForegroundColor Red
+            Add-DepotResult 'Rename' 'Failed' "rename to $NewName failed: $($_.Exception.Message)"
+        }
     } else {
         Write-Host "[!] Invalid name or same as current. Skipping." -ForegroundColor Gray
     }
@@ -719,6 +730,18 @@ function Install-DepotOffice {
     }
 }
 
+function Wait-DepotOneDrive {
+    # OneDrive's installer can exit 0 and still leave nothing behind. Look for the real OneDrive.exe, giving the
+    # per-machine installer a short window to finish writing it.
+    $deadline = (Get-Date).AddSeconds($script:OneDriveVerifySeconds)
+    while ($true) {
+        if ((Test-Path "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe") -or
+            (Test-Path "$env:ProgramFiles (x86)\Microsoft OneDrive\OneDrive.exe")) { return $true }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds 2
+    }
+}
+
 function Install-DepotOneDrive {
     $script:DepotStep = 'OneDrive'
     Write-Host "      > Installing: OneDrive..." -NoNewline -ForegroundColor Gray
@@ -733,7 +756,10 @@ function Install-DepotOneDrive {
         if (Get-Installer -Url "https://go.microsoft.com/fwlink/?linkid=844652" -Dest $dest) {
             Write-Installing
             $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/allusers /silent"
-            Show-Result $ExitCode
+            if ($ExitCode -in 0, 3010) {
+                if (Wait-DepotOneDrive) { Show-Result $ExitCode }
+                else { Write-DepotStatus Failed "[FAILED - OneDrive.exe not found after install]" "Red" "installer exited $ExitCode but OneDrive.exe is missing" }
+            } else { Show-Result $ExitCode }
         } else { Write-DepotStatus Failed "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }

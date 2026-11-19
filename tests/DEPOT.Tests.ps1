@@ -697,3 +697,95 @@ Describe 'Finding 42: per-user hives are loaded, verified and unloaded honestly'
         Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -match 'applied to 1 of 2 user profile' }
     }
 }
+
+Describe 'Finding 71: rename and OneDrive report what really happened' {
+    BeforeAll {
+        function New-FakeProc {
+            param($ExitCode = 0, [int]$ProcessId = 4242, [bool]$Exits = $true)
+            $p = [pscustomobject]@{ Id = $ProcessId; ExitCode = $ExitCode; Handle = [IntPtr]::Zero; HasExited = $Exits }
+            $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $this.HasExited } -Force
+            $p
+        }
+    }
+
+    BeforeEach {
+        Reset-DepotState
+        $script:SavedTemp = $script:DepotTemp
+        $script:DepotTemp = $TestDrive
+        $script:SavedVerify = $script:OneDriveVerifySeconds
+        $script:OneDriveVerifySeconds = 0
+        Mock Start-Sleep { }
+        Mock Write-Host { }
+        Mock Write-StatusTag { }
+        Mock Get-Process { }
+        Mock Get-Service { }
+        Mock Get-ItemProperty { }
+        Mock Remove-Item { } -ParameterFilter { $true }
+        Mock Rename-Computer { }
+        Mock Read-Host { 'NEWPC01' }
+        $script:Known = @()
+        Mock Test-Path { "$Path" -in $script:Known } -ParameterFilter { "$Path" -notlike "$TestDrive*" }
+        Mock Get-Installer { $true }
+        Mock Start-Process { New-FakeProc -ExitCode 0 }
+    }
+
+    AfterEach {
+        $script:DepotTemp = $script:SavedTemp
+        $script:OneDriveVerifySeconds = $script:SavedVerify
+    }
+
+    Context 'rename' {
+        It 'a rename that throws is reported as failed, not Done, and sets no reboot flag' {
+            Mock Rename-Computer { throw 'Access is denied' }
+            Invoke-DepotRename
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -Be 1
+            $script:RebootRequired | Should -BeFalse
+            Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { "$Object" -match '^ Done' }
+        }
+
+        It 'a rename that works is recorded Done and requires a reboot' {
+            Invoke-DepotRename
+            Should -Invoke Rename-Computer -Times 1 -Exactly -ParameterFilter { $NewName -eq 'NEWPC01' }
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Done' }).Count | Should -Be 1
+            $script:RebootRequired | Should -BeTrue
+        }
+
+        It 'an invalid computer name is refused before Rename-Computer is called' {
+            Mock Read-Host { 'bad name!' }
+            Invoke-DepotRename
+            Should -Invoke Rename-Computer -Times 0 -Exactly
+        }
+    }
+
+    Context 'OneDrive' {
+        It 'installs through Start-Installer and announces it once' {
+            Mock Write-Installing { }
+            $script:Known = @("$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe")
+            # not installed before the run: hide the file until the installer has "run"
+            $script:Known = @()
+            Mock Start-Installer { $script:Known = @("$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe"); 0 }
+            Install-DepotOneDrive
+            Should -Invoke Write-Installing -Times 1 -Exactly
+        }
+
+        It 'exit 0 without OneDrive.exe on disk is a failure' {
+            Mock Start-Installer { 0 }
+            Install-DepotOneDrive
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -Be 1
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Done' }).Count | Should -Be 0
+        }
+
+        It 'exit 0 with OneDrive.exe on disk is Done' {
+            Mock Start-Installer { $script:Known = @("$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe"); 0 }
+            Install-DepotOneDrive
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Done' }).Count | Should -Be 1
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -Be 0
+        }
+
+        It 'a failing installer exit code is Failed whether or not a file exists' {
+            Mock Start-Installer { 1603 }
+            Install-DepotOneDrive
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -Be 1
+        }
+    }
+}
