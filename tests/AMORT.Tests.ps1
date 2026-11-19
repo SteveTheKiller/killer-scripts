@@ -59,6 +59,7 @@ Describe 'AMORT' {
 
         Mock Test-AmortElevated { $script:Elevated }
         Mock Test-AmortConsole { $false }
+        Mock Test-AmortRebootPending { $false }
         Mock Get-AmortCursorTop { -1 }
         Mock Get-AmortCursorLeft { 0 }
         Mock Set-AmortCursor { }
@@ -162,7 +163,7 @@ Describe 'AMORT' {
         }
 
         It 'exits 3 and says repair was skipped when a reboot is pending' {
-            Mock Test-Path { $true } -ParameterFilter { "$Path" -like '*RebootPending' }
+            Mock Test-AmortRebootPending { $true }
             $r = Invoke-AmortCapture
             $r.Code | Should -Be 3
             $r.Output | Should -Match 'reboot pending'
@@ -311,7 +312,7 @@ Describe 'AMORT' {
         }
 
         It 'does not enable or start TrustedInstaller when a reboot is pending' {
-            Mock Test-Path { $true } -ParameterFilter { "$Path" -like '*RebootPending' }
+            Mock Test-AmortRebootPending { $true }
             [void](Invoke-AmortCapture)
             Should -Invoke Set-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' }
             Should -Invoke Start-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' }
@@ -394,7 +395,7 @@ Describe 'AMORT' {
         }
 
         It 'refuses while a reboot is pending' {
-            Mock Test-Path { $true } -ParameterFilter { "$Path" -like '*RebootPending' }
+            Mock Test-AmortRebootPending { $true }
             $r = Invoke-AmortCapture @{ RemoveRollback = $true }
             Should -Invoke Remove-AmortWindowsOld -Times 0 -Exactly
             $r.Code | Should -Be 3
@@ -435,6 +436,32 @@ Describe 'AMORT' {
             $r.Code | Should -Be 0
             $script:StartedFiles.Count | Should -Be 3
             @($script:StartedFiles | Where-Object { $_ -ne (Join-Path $env:windir 'Sysnative\cmd.exe') }).Count | Should -Be 0
+        }
+    }
+
+    Describe 'Finding 02 follow-up: rollback staging data and the real pending-reboot state' {
+        BeforeEach {
+            Mock Test-Path { $true } -ParameterFilter { "$Path" -eq 'C:\Windows.old' -or "$LiteralPath" -in 'C:\$WINDOWS.~BT', 'C:\$WINDOWS.~WS', 'C:\$GetCurrent' }
+            Mock Get-PathSize { [int64]0 }
+        }
+
+        It 'keeps $WINDOWS.~BT and $WINDOWS.~WS while Windows.old exists and rollback removal was not requested' {
+            [void](Invoke-AmortCapture)
+            Should -Invoke Remove-Tree -Times 0 -Exactly -ParameterFilter { $Path -in 'C:\$WINDOWS.~BT', 'C:\$WINDOWS.~WS' }
+            Should -Invoke Remove-Tree -Times 1 -Exactly -ParameterFilter { $Path -eq 'C:\$GetCurrent' }
+        }
+
+        It 'removes them when rollback removal is requested and allowed' {
+            [void](Invoke-AmortCapture @{ RemoveRollback = $true })
+            Should -Invoke Remove-Tree -Times 1 -Exactly -ParameterFilter { $Path -eq 'C:\$WINDOWS.~BT' }
+            Should -Invoke Remove-Tree -Times 1 -Exactly -ParameterFilter { $Path -eq 'C:\$WINDOWS.~WS' }
+        }
+
+        It 'Test-AmortRebootPending reads the 64-bit registry view and sees both pending-reboot keys' {
+            $src = ${function:Test-AmortRebootPending}.ToString()
+            $src | Should -Match 'Registry64'
+            $src | Should -Match 'Component Based Servicing.RebootPending'
+            $src | Should -Match 'WindowsUpdate.Auto Update.RebootRequired'
         }
     }
 }

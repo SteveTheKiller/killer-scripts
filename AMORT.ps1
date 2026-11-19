@@ -68,6 +68,23 @@ function Start-AmortProcess {
     param([System.Diagnostics.ProcessStartInfo]$StartInfo)
     [System.Diagnostics.Process]::Start($StartInfo)
 }
+# True when Windows is waiting for a reboot. Reads the 64-bit registry view, because a 32-bit host
+# would otherwise be redirected to WOW6432Node. Covers servicing and Windows Update.
+function Test-AmortRebootPending {
+    $keys = @(
+        'SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    $base = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        foreach ($k in $keys) {
+            $sub = $base.OpenSubKey($k)
+            if ($sub) { $sub.Close(); return $true }
+        }
+    } catch { } finally { if ($base) { $base.Close() } }
+    return $false
+}
 # A 32-bit host on 64-bit Windows (some RMM agents launch one) sees a redirected System32.
 # Sysnative reaches the real one, so DISM, vssadmin and cmd act on the running system.
 function Test-AmortWow64 {
@@ -510,7 +527,7 @@ if ($ServicingActive) {
     Write-Host "[Pre-Flight] Windows servicing active (TiWorker/DISM running). Repair steps will be skipped." -ForegroundColor Yellow
 }
 # A pending reboot means SoftwareDistribution and upgrade staging are still in use.
-$PendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+$PendingReboot = Test-AmortRebootPending
 
 # Environment Setup
 # Expose DryRun at script scope so the output helpers can see it
@@ -627,12 +644,21 @@ $RegionEst += Clear-CachePath @("C:\Windows\ServiceProfiles\NetworkService\AppDa
 # failed upgrade attempt. They are only skipped while an upgrade is actually running or
 # waiting on its reboot, because that is the one time Windows still needs them.
 $UpgradeActive = $null -ne (Get-Process -Name "SetupHost", "SetupPrep", "Windows10UpgraderApp" -ErrorAction SilentlyContinue)
+# $WINDOWS.~BT and $WINDOWS.~WS can hold the rollback data, so while Windows.old exists they follow the
+# same opt-in decision as Windows.old itself.
+$RollbackStaging = @('C:\$WINDOWS.~BT', 'C:\$WINDOWS.~WS')
+$KeepRollbackStaging = $false
+if (Test-Path "C:\Windows.old") {
+    $StagingDecision = Get-AmortRollbackDecision -Requested (Test-AmortRemoveRollbackRequested -Switch $RemoveRollback) -ServicingActive $ServicingActive -PendingReboot $PendingReboot -UpgradeActive $UpgradeActive
+    $KeepRollbackStaging = -not $StagingDecision.Allowed
+}
 $UpgradeDirs = @('C:\$WINDOWS.~BT', 'C:\$WINDOWS.~WS', 'C:\$GetCurrent', 'C:\ESD', 'C:\Windows10Upgrade')
 if ($UpgradeActive -or $PendingReboot) {
     # A pending reboot is reported once, on the reboot-pending line before the repair steps.
     if (-not $PendingReboot) { $script:Notes += "Upgrade staging folders were kept because a Windows upgrade is running." }
 } else {
     foreach ($D in $UpgradeDirs) {
+        if ($KeepRollbackStaging -and $RollbackStaging -contains $D) { continue }
         if (Test-Path -LiteralPath $D) {
             if ($DryRun) { $RegionEst += Get-PathSize $D } else { Remove-Tree $D }
         }
