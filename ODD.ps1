@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Output Device Diagnostic (ODD) v1.9
-    Developed by SteveTheKiller | Updated: 2026-03-13
+    Output Device Diagnostic (ODD) v2.0
+    Developed by SteveTheKiller | Updated: 2026-11-19
 .DESCRIPTION
     Inventories all physical, USB, and Bluetooth audio devices with
     health status and driver versions across input and output categories.
@@ -194,7 +194,7 @@ function Format-DriverString([string]$DevName, [string]$DevId, [int]$ColWidth = 
 }
 
 $script:Width    = 85
-$script:Version  = "v1.9"
+$script:Version  = "v2.0"
 $LineCol   = "Magenta"
 $MainCol   = "White"
 $ArtCol    = "Yellow"
