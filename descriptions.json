@@ -1,7 +1,7 @@
 {
   "AMORT.ps1": {
     "name": "Advanced Maintenance, Optimization, and Repair Tool",
-    "description": "Automated Windows 10/11 tune-up for MSP field and remote deployment."
+    "description": "Disk cleanup and Windows repair for MSP field and remote support, keeping the rollback window unless asked."
   },
   "BEAM.ps1": {
     "name": "Bulk Endpoint App Mover",
@@ -9,7 +9,7 @@
   },
   "BERET.ps1": {
     "name": "BitLocker Encryption, Recovery, & Escrow Tool",
-    "description": "Interactive BitLocker lifecycle manager with TPM enforcement and AD/Entra ID key escrow."
+    "description": "BitLocker lifecycle manager with TPM enforcement and verified AD / Entra ID key escrow."
   },
   "DEBLOAT.ps1": {
     "name": "Deployment Environment Bloatware Liquidator & Optimized Automated Toolkit",
@@ -17,7 +17,7 @@
   },
   "DEFEND.ps1": {
     "name": "Definition Enforcement & Full Endpoint Network Defense",
-    "description": "Audits kernel-level security including TPM, Secure Boot, HVCI, and Defender."
+    "description": "Audits TPM, Secure Boot, HVCI, Defender, and the firewall, and verifies every change it makes."
   },
   "DEPOT.ps1": {
     "name": "Deployment & Endpoint Provisioning Operations Tool",
@@ -25,15 +25,15 @@
   },
   "FACTS.ps1": {
     "name": "Foxit Audit and Control Task Script",
-    "description": "Audits Foxit PDF installations and permanently blocks auto-updates via registry hardening."
+    "description": "Audits Foxit installations and blocks auto-updates with an hourly self-healing task."
   },
   "MACE.ps1": {
     "name": "Microsoft Application Cleanse & Eradication",
-    "description": "Completely removes OneDrive, New Outlook, Office/M365, and Teams from a Windows endpoint."
+    "description": "Clean-slate removal of OneDrive, New Outlook, Office/M365, Project, and Teams that never deletes documents."
   },
   "ODD.ps1": {
     "name": "Output Device Diagnostic",
-    "description": "Inventories all physical, USB, and Bluetooth audio devices with health status and driver info."
+    "description": "Read-only inventory of physical, USB, and Bluetooth audio devices with the true default device."
   },
   "ORCA.ps1": {
     "name": "Outlook Reset & Configuration Assistant",
@@ -49,7 +49,7 @@
   },
   "PRUNE.ps1": {
     "name": "Profile Removal Utility for Neglected Entries",
-    "description": "Interactive editor for managing Windows user profiles."
+    "description": "Finds stale and orphaned user profiles and removes them safely by SID."
   },
   "SHADE.ps1": {
     "name": "System Hardening Against Data Exposure",
@@ -57,15 +57,15 @@
   },
   "STARE.ps1": {
     "name": "Scheduled Task Administration & Routine Executor",
-    "description": "Interactive terminal wizard for fast and reliable Windows Scheduled Task management."
+    "description": "Interactive wizard for browsing, creating, and deleting Windows scheduled tasks."
   },
   "TICK.ps1": {
     "name": "Trigger Immediate Clock Kickstart",
-    "description": "Resets and re-syncs Windows Time service against a chosen NTP peer with before/after reporting."
+    "description": "Resets and re-syncs the Windows Time service, then verifies the source and last sync."
   },
   "URT.ps1": {
     "name": "Universal Rename Tool",
-    "description": "Renames local or domain-joined computers from an admin shell with no GUI popups."
+    "description": "Renames workgroup and domain-member computers from an admin shell, refusing domain controllers."
   },
   "VITALS.ps1": {
     "name": "Visual Interface for Technical Asset & Logistics Summary",
@@ -73,6 +73,6 @@
   },
   "WURSA.ps1": {
     "name": "Windows Update, Repair, & System Alignment",
-    "description": "Enforces OS patches, OEM driver updates, and third-party app upgrades via Chocolatey."
+    "description": "Enforces OS patches, drivers, feature upgrades, and Chocolatey updates for installed apps."
   }
 }
