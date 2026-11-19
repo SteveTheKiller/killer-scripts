@@ -82,6 +82,8 @@ $script:BitLockerState       = "Unknown"
 $script:SetupCommandLinePath = ""
 $script:SetupCommandLine     = ""
 $script:SetupDeepScanTime    = [datetime]::MinValue
+$script:SetupDeepScanPath    = $null
+$script:SetupDeepScanKey     = $null
 
 #endregion
 
@@ -573,9 +575,14 @@ function Get-PEEKSetupState {
             }
         } catch {}
 
-        $deepScanDue = ($script:SetupCommandLinePath -ne $act.FullName) -or
-                       (-not $script:SetupCommandLine) -or
-                       (((Get-Date) - $script:SetupDeepScanTime).TotalSeconds -ge 15)
+        # The 50,000 line scan is cached by source identity (path, write time, length), so a log
+        # that has not changed is never reread, whether or not it held a command line. A log that
+        # keeps growing is rescanned at most every 15 seconds, and any log at least every 5 minutes.
+        $deepScanKey   = "$($act.FullName)|$($act.LastWriteTime.Ticks)|$($act.Length)"
+        $sinceDeepScan = ((Get-Date) - $script:SetupDeepScanTime).TotalSeconds
+        $deepScanDue = ($script:SetupDeepScanPath -ne $act.FullName) -or
+                       (($script:SetupDeepScanKey -ne $deepScanKey) -and ($sinceDeepScan -ge 15)) -or
+                       ($sinceDeepScan -ge 300)
 
         if ($deepScanDue) {
             try {
@@ -591,8 +598,15 @@ function Get-PEEKSetupState {
                     $script:SetupCommandLine = $foundCommandLine
                     $script:SetupCommandLinePath = $act.FullName
                 }
+                $script:SetupDeepScanPath = $act.FullName
+                $script:SetupDeepScanKey  = $deepScanKey
                 $script:SetupDeepScanTime = Get-Date
-            } catch {}
+            } catch {
+                # A failed read is retried on the normal 15 second interval.
+                $script:SetupDeepScanPath = $act.FullName
+                $script:SetupDeepScanKey  = $null
+                $script:SetupDeepScanTime = Get-Date
+            }
         }
 
         if ($script:SetupCommandLinePath -eq $act.FullName) {

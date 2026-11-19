@@ -278,3 +278,95 @@ Describe 'PEEK finding 73: every reboot source that counts is displayed' {
         Get-FlagText $reboot | Should -Match 'UpdateExe=no'
     }
 }
+
+Describe 'PEEK finding 44: the deep Panther scan is cached by source identity' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
+        Initialize-KillerSafetyNet
+        Enable-KillerTestMode
+        . (Get-KillerScriptPath 'PEEK')
+        $script:FixtureDir = Join-Path $PSScriptRoot 'fixtures\peek'
+
+    function Grow-Log {
+        param([int]$SecondsAhead = 1)
+        [IO.File]::AppendAllText($script:Act, "2026-11-18 09:01:00, Info                  SP     more synthetic output`r`n")
+        [IO.File]::SetLastWriteTime($script:Act, (Get-Date).AddSeconds($SecondsAhead))
+    }    }
+    AfterAll { Disable-KillerTestMode }
+
+    BeforeEach {
+        $script:SetupCommandLinePath = ""
+        $script:SetupCommandLine     = ""
+        $script:SetupDeepScanTime    = [datetime]::MinValue
+        $script:SetupDeepScanPath    = $null
+        $script:SetupDeepScanKey     = $null
+
+        $script:Act = Join-Path $TestDrive 'setupact.log'
+        [IO.File]::Copy((Join-Path $FixtureDir 'setupact-nocmdline.log'), $script:Act, $true)
+        $script:ActLines = [IO.File]::ReadAllLines((Join-Path $FixtureDir 'setupact-nocmdline.log'))
+
+        # Only the Windows\Panther setupact.log exists. Everything else on the machine is absent.
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like '*Windows\Panther\setupact.log' -and $LiteralPath -notlike '*BT*' }
+        Mock Test-Path { $false } -ParameterFilter { -not ($LiteralPath -like '*Windows\Panther\setupact.log' -and $LiteralPath -notlike '*BT*') }
+        Mock Get-Item { New-Object System.IO.FileInfo $script:Act }
+        Mock Get-Content { $script:ActLines }
+    }
+
+    function Grow-Log {
+        param([int]$SecondsAhead = 1)
+        [IO.File]::AppendAllText($script:Act, "2026-11-18 09:01:00, Info                  SP     more synthetic output`r`n")
+        (Get-Item -LiteralPath $script:Act).LastWriteTime = (Get-Date).AddSeconds($SecondsAhead)
+    }
+
+    It 'reads the 50,000 line tail once, not every refresh, while a negative log is unchanged' {
+        1..4 | ForEach-Object { $null = Get-PEEKSetupState }
+        Should -Invoke Get-Content -Times 1 -Exactly -ParameterFilter { $Tail -eq 50000 }
+    }
+
+    It 'still reports no command line and no mode for the negative log' {
+        $s = Get-PEEKSetupState
+        $s.CommandLine | Should -Be ''
+        $s.Mode | Should -Be 'None'
+    }
+
+    It 'does not rescan a growing negative log more often than every 15 seconds' {
+        $null = Get-PEEKSetupState
+        Grow-Log
+        $null = Get-PEEKSetupState
+        Grow-Log
+        $null = Get-PEEKSetupState
+        Should -Invoke Get-Content -Times 1 -Exactly -ParameterFilter { $Tail -eq 50000 }
+    }
+
+    It 'rescans a changed log once the 15 second interval has passed' {
+        $null = Get-PEEKSetupState
+        Grow-Log
+        $script:SetupDeepScanTime = (Get-Date).AddSeconds(-20)
+        $null = Get-PEEKSetupState
+        Should -Invoke Get-Content -Times 2 -Exactly -ParameterFilter { $Tail -eq 50000 }
+    }
+
+    It 'rescans an unchanged log after the bounded refresh window' {
+        $null = Get-PEEKSetupState
+        $script:SetupDeepScanTime = (Get-Date).AddSeconds(-400)
+        $null = Get-PEEKSetupState
+        Should -Invoke Get-Content -Times 2 -Exactly -ParameterFilter { $Tail -eq 50000 }
+    }
+
+    It 'finds the command line once the log gains it, after the interval' {
+        $null = Get-PEEKSetupState
+        $script:ActLines = [IO.File]::ReadAllLines((Join-Path $FixtureDir 'setupact-cmdline.log'))
+        Grow-Log
+        $script:SetupDeepScanTime = (Get-Date).AddSeconds(-20)
+        $s = Get-PEEKSetupState
+        $s.CommandLine | Should -Match '/auto upgrade'
+        $s.Mode | Should -Be 'In-Place Upgrade'
+    }
+
+    It 'does not reread a log whose command line is already known and unchanged' {
+        $script:ActLines = [IO.File]::ReadAllLines((Join-Path $FixtureDir 'setupact-cmdline.log'))
+        1..3 | ForEach-Object { $s = Get-PEEKSetupState }
+        $s.Mode | Should -Be 'In-Place Upgrade'
+        Should -Invoke Get-Content -Times 1 -Exactly -ParameterFilter { $Tail -eq 50000 }
+    }
+}
