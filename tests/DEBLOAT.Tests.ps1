@@ -290,4 +290,22 @@ Describe 'DEBLOAT' {
             Should -Invoke Set-ItemProperty -ParameterFilter { "$Path" -like "*HKEY_USERS\$($script:Sid)\*" }
         }
     }
+
+    Context 'finding 69: not elevated' {
+        It 'exits 2 with an honest status line and touches nothing' {
+            Mock Test-IsAdmin { $false }
+            $r = Get-Run
+            $r.Code | Should -Be 2
+            $r.Text | Should -Match '\[FAIL\] DEBLOAT not elevated, nothing was changed \(exit 2\)'
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly
+            Should -Invoke New-Item -Times 0 -Exactly
+            Should -Invoke Invoke-RegExe -Times 0 -Exactly
+            Should -Invoke Start-Process -Times 0 -Exactly
+            Should -Invoke Remove-AppxProvisionedPackage -Times 0 -Exactly
+            Should -Invoke powercfg -Times 0 -Exactly
+        }
+        It 'still runs when elevated' {
+            Get-Exit | Should -Be 0
+        }
+    }
 }

@@ -320,8 +320,9 @@ function Uninstall-MsiPackage {
 
 function Invoke-DebloatMain {
     if (-not (Test-IsAdmin)) {
-        Write-Error "DEBLOAT requires Administrative privileges. Please relaunch as Admin."
-        Exit-KillerScript 0
+        Write-Warning "Elevation Required: Please run as Administrator."
+        Write-Output "[FAIL] DEBLOAT not elevated, nothing was changed (exit 2)"
+        Exit-KillerScript 2
     }
 
     $script:DebloatFailures = New-Object System.Collections.ArrayList
