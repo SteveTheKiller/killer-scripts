@@ -1,7 +1,7 @@
 ﻿<#
 .NAME
-    Deployment Environment Bloatware Liquidator & Optimized Automated Toolkit (D.E.B.L.O.A.T.) v2.2
-    Developed by Steve the Killer | Updated: 2026-05-12
+    Deployment Environment Bloatware Liquidator & Optimized Automated Toolkit (D.E.B.L.O.A.T.) v2.3
+    Developed by Steve the Killer | Updated: 2026-11-18
 .DESCRIPTION
     Standardizes Windows 11 by removing OEM bloat (HP, Dell,
     ASUS/Acer), AI/Recall features, and sponsored consumer content.
@@ -350,7 +350,7 @@ function Invoke-DebloatMain {
     $_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
     $_fillW = $script:Width - $_pfx.Length - $_artW
     $_title = "DEPLOYMENT ENV BLOAT LIQUIDATOR & OPTIMIZED TOOLKIT"
-    $_ver   = "| v2.2"
+    $_ver   = "| v2.3"
 
     Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art1 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
     Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art2 -ForegroundColor $ArtCol -NoNewline; Write-Host "$_title" -ForegroundColor $MainCol
