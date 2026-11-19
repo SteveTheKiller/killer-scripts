@@ -164,7 +164,8 @@ function Invoke-ShadeMain {
 
     if (-not (Test-IsAdmin)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Exit-KillerScript 0
+        Write-Output "[FAIL] SHADE not elevated, nothing was changed (exit 2)"
+        Exit-KillerScript 2
     }
 
     # Environment Setup

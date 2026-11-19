@@ -54,4 +54,13 @@ Describe 'SHADE' {
             Get-Exit | Should -Be 0
         }
     }
+
+    Context 'finding 69: not elevated' {
+        It 'exits 2 and touches nothing when not elevated' {
+            Mock Test-IsAdmin { $false }
+            Get-Exit | Should -Be 2
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly
+            Should -Invoke Stop-Service -Times 0 -Exactly
+        }
+    }
 }
