@@ -13,6 +13,7 @@
 $script:DepotScriptPath = $MyInvocation.MyCommand.Path
 
 $script:Width     = 85
+$script:DepotTemp = 'C:\Windows\Temp'
 $script:LineCol   = "DarkRed"
 $script:MainCol   = "Green"
 $script:AccentCol = "Yellow"
@@ -497,10 +498,14 @@ function Invoke-DepotWindowsUpdate {
     }
 }
 
-function Install-DepotApps {
-    Write-Host "[*] Executing Application Provisioning..." -ForegroundColor DarkRed
-    Write-Host "    (Press 'ESC' at any time to skip current install)" -ForegroundColor DarkGray
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+function Get-DepotWebText {
+    param([string]$Url)
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add("User-Agent","Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+    return $wc.DownloadString($Url)
+}
+
+function Install-DepotOffice {
     # --- Microsoft 365 via Office Deployment Tool ---
     Write-Host "      > Installing: Microsoft 365..." -NoNewline -ForegroundColor Gray
     # Kill any lingering Office/C2R processes from previous runs
@@ -512,16 +517,14 @@ function Install-DepotApps {
     if ($OfficeInstalled) {
         Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
     } else {
-        $ODTDir  = "C:\Windows\Temp\ODT"
-        $ODTExe  = "C:\Windows\Temp\ODT.exe"
+        $ODTDir  = Join-Path $script:DepotTemp "ODT"
+        $ODTExe  = Join-Path $script:DepotTemp "ODT.exe"
         # Try multiple ODT sources - scrape MS page first, then fall back to known URLs
         $downloaded = $false
         $ODTUrls = @()
         # Attempt to scrape current URL from Microsoft download page
         try {
-            $wc2 = New-Object System.Net.WebClient
-            $wc2.Headers.Add("User-Agent","Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            $html = $wc2.DownloadString("https://www.microsoft.com/en-us/download/details.aspx?id=49117")
+            $html = Get-DepotWebText "https://www.microsoft.com/en-us/download/details.aspx?id=49117"
             $match = [regex]::Match($html, '"url"\s*:\s*"(https://download\.microsoft\.com/download/[^"]+officedeploymenttool[^"]+\.exe)"')
             if ($match.Success) { $ODTUrls += $match.Groups[1].Value }
         } catch { }
@@ -590,8 +593,9 @@ function Install-DepotApps {
             Start-Process "cmd.exe" -ArgumentList "/c timeout /t 120 /nobreak >nul && rd /s /q `"$ODTDir`" && del /f /q `"$ODTExe`"" -WindowStyle Hidden
         }
     }
-    # --- Microsoft Teams ---
-    # --- OneDrive & Teams (included with M365) ---
+}
+
+function Install-DepotOneDrive {
     Write-Host "      > Installing: OneDrive..." -NoNewline -ForegroundColor Gray
     $OneDriveInstalled = (Test-Path "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe") -or
                          (Test-Path "$env:ProgramFiles (x86)\Microsoft OneDrive\OneDrive.exe") -or
@@ -599,7 +603,7 @@ function Install-DepotApps {
     if ($OneDriveInstalled) {
         Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
     } else {
-        $dest = "C:\Windows\Temp\OneDriveSetup.exe"
+        $dest = Join-Path $script:DepotTemp "OneDriveSetup.exe"
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
         if (Get-Installer -Url "https://go.microsoft.com/fwlink/?linkid=844652" -Dest $dest) {
             Write-Installing
@@ -615,6 +619,9 @@ function Install-DepotApps {
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Install-DepotTeams {
     Write-Host "      > Installing: Microsoft Teams..." -NoNewline -ForegroundColor Gray
     $TeamsInstalled = (Test-Path "$env:ProgramFiles\WindowsApps\MSTeams*\ms-teams.exe") -or
                       (Test-Path "$env:ProgramFiles (x86)\Microsoft\Teams\current\Teams.exe") -or
@@ -622,7 +629,7 @@ function Install-DepotApps {
     if ($TeamsInstalled) {
         Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
     } else {
-        $dest = "C:\Windows\Temp\TeamsSetup.exe"
+        $dest = Join-Path $script:DepotTemp "TeamsSetup.exe"
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
         if (Get-Installer -Url "https://go.microsoft.com/fwlink/?linkid=2196106" -Dest $dest) {
             Write-Installing
@@ -631,7 +638,9 @@ function Install-DepotApps {
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
-    # --- Google Chrome ---
+}
+
+function Install-DepotChrome {
     Write-Host "      > Installing: Google Chrome..." -NoNewline -ForegroundColor Gray
     # Kill any lingering msiexec from previous installs
     Get-Process -Name "msiexec" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -641,7 +650,7 @@ function Install-DepotApps {
     if ($ChromeInstalled) {
         Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
     } else {
-        $dest = "C:\Windows\Temp\ChromeEnterprise.msi"
+        $dest = Join-Path $script:DepotTemp "ChromeEnterprise.msi"
         $ChromeUrls = @(
             "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi",
             "https://dl.google.com/chrome/install/googlechromestandaloneenterprise64.msi",
@@ -659,7 +668,9 @@ function Install-DepotApps {
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
-    # --- Adobe Acrobat Reader DC ---
+}
+
+function Install-DepotAcrobat {
     Write-Host "      > Installing: Adobe Acrobat Reader..." -NoNewline -ForegroundColor Gray
     $AcrobatInstalled = (Test-Path "C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe") -or
                         (Test-Path "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe") -or
@@ -667,7 +678,7 @@ function Install-DepotApps {
     if ($AcrobatInstalled) {
         Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
     } else {
-        $dest = "C:\Windows\Temp\AcrobatReader.exe"
+        $dest = Join-Path $script:DepotTemp "AcrobatReader.exe"
         $AcrobatUrls = @(
             "https://ardownload2.adobe.com/pub/adobe/reader/win/AcrobatDC/2300820555/AcroRdrDC2300820555_en_US.exe",
             "https://get.adobe.com/reader/download/?installer=Reader_DC_2300820555_English_for_Windows&os=Windows%2011&browser_type=KHTML&browser_dist=Chrome&d=true&d_pkg=exe"
@@ -683,14 +694,16 @@ function Install-DepotApps {
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
-    # --- Zoom ---
+}
+
+function Install-DepotZoom {
     Write-Host "      > Installing: Zoom..." -NoNewline -ForegroundColor Gray
     $ZoomInstalled = (Test-Path "C:\Program Files\Zoom\bin\Zoom.exe") -or
                      (Test-Path "C:\Program Files (x86)\Zoom\bin\Zoom.exe")
     if ($ZoomInstalled) {
         Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
     } else {
-        $dest = "C:\Windows\Temp\ZoomInstaller.msi"
+        $dest = Join-Path $script:DepotTemp "ZoomInstaller.msi"
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
         if (Get-Installer -Url "https://zoom.us/client/latest/ZoomInstallerFull.msi?archType=x64" -Dest $dest) {
             Write-Installing
@@ -699,14 +712,16 @@ function Install-DepotApps {
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
-    # --- 7-Zip ---
+}
+
+function Install-Depot7Zip {
     Write-Host "      > Installing: 7-Zip..." -NoNewline -ForegroundColor Gray
     $7ZipInstalled = (Test-Path "C:\Program Files\7-Zip\7z.exe") -or
                      (Test-Path "C:\Program Files (x86)\7-Zip\7z.exe")
     if ($7ZipInstalled) {
         Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
     } else {
-        $dest = "C:\Windows\Temp\7zip.exe"
+        $dest = Join-Path $script:DepotTemp "7zip.exe"
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
         if (Get-Installer -Url "https://www.7-zip.org/a/7z2407-x64.exe" -Dest $dest) {
             Write-Installing
@@ -715,6 +730,9 @@ function Install-DepotApps {
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Install-DepotBrowserExtensions {
     # --- Browser Extension Policy Keys ---
     Write-Host "      > Adding uBlock adblocker extensions..." -NoNewline -ForegroundColor Gray
     $IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")
@@ -745,6 +763,20 @@ function Install-DepotApps {
     } else {
         Write-StatusTag "[SKIPPED - not elevated]" "Yellow"
     }
+}
+
+function Install-DepotApps {
+    Write-Host "[*] Executing Application Provisioning..." -ForegroundColor DarkRed
+    Write-Host "    (Press 'ESC' at any time to skip current install)" -ForegroundColor DarkGray
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Install-DepotOffice
+    Install-DepotOneDrive
+    Install-DepotTeams
+    Install-DepotChrome
+    Install-DepotAcrobat
+    Install-DepotZoom
+    Install-Depot7Zip
+    Install-DepotBrowserExtensions
 }
 
 function Invoke-DepotCleanup {
