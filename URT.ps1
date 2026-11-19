@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Universal Rename Tool (U.R.T.) v1.6
-    Developed by SteveTheKiller | Updated: 2026-03-13
+    Universal Rename Tool (U.R.T.) v2.0
+    Developed by SteveTheKiller | Updated: 2026-11-19
 .DESCRIPTION
     Renames local or domain-joined computers from an admin shell with
     no GUI popups. Collects domain credentials inline if needed,
@@ -159,7 +159,7 @@ function Write-HLine {
 }
 
 $script:Width  = 85
-$_ver    = "| v1.6"
+$_ver    = "| v2.0"
 $LineCol   = "Green"
 $MainCol   = "White"
 $WarnCol   = "Yellow"
