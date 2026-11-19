@@ -255,8 +255,24 @@ function Invoke-MaceRun {
     Write-Host "[>] Device  : " -NoNewline -ForegroundColor $LineCol
     Write-Host $env:COMPUTERNAME -ForegroundColor $MainCol
 
+    # Scope is never assumed. It comes from $MaceScope ('AllUsers' or a profile folder name, set
+    # before running the script) or from an explicit menu choice. Anything else stops the script
+    # before it changes anything.
+    $PresetScope = Get-Variable -Name MaceScope -ValueOnly -ErrorAction SilentlyContinue
+    $Choice = $null      # 'All' | 'Profile' | 'Abort' | 'Invalid'
+    $SelectedProfile = $null
     $menuRow = Get-MaceCursorTop
-    if ($IsInteractive) {
+    $menuShown = $false
+
+    if ($PresetScope) {
+        if ([string]$PresetScope -eq 'AllUsers') {
+            $Choice = 'All'
+        } else {
+            $SelectedProfile = $DetectedProfiles | Where-Object { $_.Name -eq [string]$PresetScope } | Select-Object -First 1
+            if ($SelectedProfile) { $Choice = 'Profile' } else { $Choice = 'Invalid' }
+        }
+    } elseif ($IsInteractive) {
+        $menuShown = $true
         Write-Host "[?] Select target user profile:" -ForegroundColor Yellow
         Write-Host ""
         for ($i = 0; $i -lt $DetectedProfiles.Count; $i++) {
@@ -266,40 +282,59 @@ function Invoke-MaceRun {
         }
         Write-Host "    " -NoNewline
         Write-Host '[A]' -NoNewline -ForegroundColor $AccentCol
-        Write-Host " All Users (system-wide) " -NoNewline -ForegroundColor White
-        Write-Host '[Default]' -ForegroundColor $DimCol
+        Write-Host " All Users (system-wide, removes Office and Teams for every account)" -ForegroundColor White
         Write-Host "    " -NoNewline
         Write-Host '[ESC]' -NoNewline -ForegroundColor $DimCol
         Write-Host " Exit" -ForegroundColor $DimCol
         Write-Host ""
         Write-Host "Enter choice: " -NoNewline -ForegroundColor $AccentCol
         $key = Read-MaceKey
-        if ($key.VirtualKeyCode -eq 27) {
-            Write-Host ""
-            Write-Host "[!] Aborted." -ForegroundColor $DimCol
-            $script:MaceExit = 0
-            $script:MaceNote = "aborted by user"
-            return
-        }
-        $ScopeChoice = $key.Character.ToString()
-        if ($ScopeChoice -match '^\d+$' -and [int]$ScopeChoice -lt $DetectedProfiles.Count) {
-            $SelectedProfile = $DetectedProfiles[[int]$ScopeChoice]
-            $Choice = 'Profile'
+        if ($null -eq $key) {
+            $Choice = 'Invalid'
+        } elseif ($key.VirtualKeyCode -eq 27) {
+            $Choice = 'Abort'
         } else {
-            $Choice = 'All'
+            $ScopeChoice = $key.Character.ToString()
+            if ($ScopeChoice -match '^\d+$' -and [int]$ScopeChoice -lt $DetectedProfiles.Count) {
+                $SelectedProfile = $DetectedProfiles[[int]$ScopeChoice]
+                $Choice = 'Profile'
+            } elseif ($ScopeChoice -eq 'A' -or $ScopeChoice -eq 'a') {
+                $Choice = 'All'
+            } else {
+                $Choice = 'Invalid'
+            }
         }
-    } else {
-        $Choice = 'All'
-        Write-Host "[>] Non-interactive session: defaulting to All Users scope." -ForegroundColor Yellow
     }
 
-    if ($IsInteractive -and $menuRow -ge 0) {
+    if ($menuShown -and $menuRow -ge 0) {
         $endRow = Get-MaceCursorTop
         for ($r = $menuRow; $r -le $endRow; $r++) {
             Set-MaceCursor 0 $r
             try { [Console]::Write(" " * $script:Width) } catch { }
         }
         Set-MaceCursor 0 $menuRow
+    }
+
+    if ($Choice -eq 'Abort') {
+        Write-Host ""
+        Write-Host "[!] Aborted." -ForegroundColor $DimCol
+        $script:MaceExit = 0
+        $script:MaceNote = "aborted by user; nothing was changed"
+        return
+    }
+    if ($null -eq $Choice -or $Choice -eq 'Invalid') {
+        if ($PresetScope) {
+            Write-Host "[!] `$MaceScope '$PresetScope' does not match AllUsers or a profile folder under C:\Users. Nothing was changed." -ForegroundColor Yellow
+            $script:MaceNote = "scope '$PresetScope' not recognized; nothing was changed"
+        } elseif ($IsInteractive) {
+            Write-Host "[!] No valid scope was chosen. Nothing was changed." -ForegroundColor Yellow
+            $script:MaceNote = "no valid scope chosen; nothing was changed"
+        } else {
+            Write-Host "[!] Non-interactive session and no scope set. Set `$MaceScope = 'AllUsers' (or a profile folder name) before running. Nothing was changed." -ForegroundColor Yellow
+            $script:MaceNote = "no scope set in a non-interactive session; nothing was changed"
+        }
+        $script:MaceExit = 2
+        return
     }
 
     $ProfileList = Get-MaceProfileList

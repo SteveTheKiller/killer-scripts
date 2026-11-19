@@ -139,4 +139,61 @@ Describe 'MACE' {
         }
     }
 
+    Context 'Finding 16a: scope selection' {
+        It '16a: stops with exit 2 before changing anything when non-interactive and no scope is set' {
+            $r = Invoke-MaceCapture
+            $r.Code | Should -Be 2
+            $r.Output | Should -Match 'MACE RESULT: NOT RUN \(exit 2\)'
+            $script:Stopped.Count | Should -Be 0
+            $script:Started.Count | Should -Be 0
+            $script:Removed.Count | Should -Be 0
+            $script:Appx.Count | Should -Be 0
+            $script:CmdKey.Count | Should -Be 0
+        }
+
+        It '16a: stops with exit 2 before changing anything when an interactive choice is invalid' {
+            Mock Test-MaceInteractive { $true }
+            Mock Read-MaceKey { [pscustomobject]@{ VirtualKeyCode = 13; Character = [char]13 } }
+            $r = Invoke-MaceCapture
+            $r.Code | Should -Be 2
+            $script:Stopped.Count | Should -Be 0
+            $script:Removed.Count | Should -Be 0
+        }
+
+        It '16a: stops with exit 2 before changing anything when $MaceScope names no profile' {
+            $global:MaceScope = 'nobody'
+            $r = Invoke-MaceCapture
+            $r.Code | Should -Be 2
+            $script:Stopped.Count | Should -Be 0
+            $script:Removed.Count | Should -Be 0
+        }
+
+        It '16a: ESC aborts with exit 0 and changes nothing' {
+            Mock Test-MaceInteractive { $true }
+            Mock Read-MaceKey { [pscustomobject]@{ VirtualKeyCode = 27; Character = [char]27 } }
+            $r = Invoke-MaceCapture
+            $r.Code | Should -Be 0
+            $r.Output | Should -Match 'aborted'
+            $script:Stopped.Count | Should -Be 0
+            $script:Removed.Count | Should -Be 0
+        }
+
+        It '16a: runs all users only after a deliberate A choice' {
+            Mock Test-MaceInteractive { $true }
+            Mock Read-MaceKey { [pscustomobject]@{ VirtualKeyCode = 65; Character = 'A' } }
+            $r = Invoke-MaceCapture
+            $r.Code | Should -Be 0
+            $r.Output | Should -Match 'MACE RESULT: SUCCESS \(exit 0\)'
+            $script:Stopped | Should -Contain 101
+            $script:Stopped | Should -Contain 202
+        }
+
+        It '16a: runs all users non-interactively when $MaceScope is AllUsers' {
+            $global:MaceScope = 'AllUsers'
+            $r = Invoke-MaceCapture
+            $r.Code | Should -Be 0
+            $script:Stopped | Should -Contain 202
+        }
+    }
+
 }
