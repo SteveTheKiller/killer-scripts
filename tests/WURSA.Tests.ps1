@@ -53,6 +53,7 @@ BeforeAll {
         $script:MainBuild = $Build
         $script:MainVersion = $Version
         Mock Test-WursaElevated { $true }
+        Mock Get-WursaPowerLineStatus { 'Online' }
         Mock Get-CimInstance {
             if ($ClassName -eq 'Win32_Battery' -or $Class -eq 'Win32_Battery') { return $null }
             if ($ClassName -eq 'Win32_Processor' -or $Class -eq 'Win32_Processor') { return [pscustomobject]@{ Architecture = 9 } }
@@ -669,5 +670,83 @@ Describe 'Failures reach the exit code in a full run (finding 30a)' {
         Get-ExitCode { Invoke-WursaMain } | Should -Be 3
         Mock Invoke-WursaThirdPartyUpdate { [pscustomobject]@{ Status = 'Done'; Succeeded = 1; Failed = 0; RebootRequired = $true } }
         Get-ExitCode { Invoke-WursaMain } | Should -Be 3010
+    }
+}
+
+Describe 'Power state (finding 31)' {
+    BeforeEach {
+        $script:Batteries = @()
+        Mock Get-CimInstance { $script:Batteries }
+    }
+
+    It 'trusts the OS power line: <Line> means <Expect>' -ForEach @(
+        @{ Line = 'Online';  Expect = 'AC' }
+        @{ Line = 'Offline'; Expect = 'Battery' }
+    ) {
+        $v = $Line
+        Mock Get-WursaPowerLineStatus { $v }.GetNewClosure()
+        Get-WursaPowerState | Should -Be $Expect
+    }
+
+    It 'treats a machine with no battery as on AC when the power line is unknown' {
+        Mock Get-WursaPowerLineStatus { 'Unknown' }
+        $script:Batteries = @()
+        Get-WursaPowerState | Should -Be 'AC'
+    }
+
+    It 'falls back to the battery status when the power line cannot be read: status <Status> is <Expect>' -ForEach @(
+        @{ Status = 1;  Expect = 'Battery' }
+        @{ Status = 2;  Expect = 'AC' }
+        @{ Status = 3;  Expect = 'AC' }
+        @{ Status = 4;  Expect = 'Battery' }
+        @{ Status = 5;  Expect = 'Battery' }
+        @{ Status = 6;  Expect = 'AC' }
+        @{ Status = 7;  Expect = 'AC' }
+        @{ Status = 8;  Expect = 'AC' }
+        @{ Status = 9;  Expect = 'AC' }
+        @{ Status = 11; Expect = 'AC' }
+        @{ Status = 10; Expect = 'Unknown' }
+        @{ Status = 0;  Expect = 'Unknown' }
+    ) {
+        Mock Get-WursaPowerLineStatus { $null }
+        $script:Batteries = @([pscustomobject]@{ BatteryStatus = $Status })
+        Get-WursaPowerState | Should -Be $Expect
+    }
+
+    It 'counts a fully charged battery on AC as AC, not as discharging' {
+        Mock Get-WursaPowerLineStatus { $null }
+        $script:Batteries = @([pscustomobject]@{ BatteryStatus = 3 })
+        Get-WursaPowerState | Should -Be 'AC'
+    }
+
+    It 'treats any AC-ish battery as AC when a second battery reads discharging' {
+        Mock Get-WursaPowerLineStatus { $null }
+        $script:Batteries = @([pscustomobject]@{ BatteryStatus = 1 }, [pscustomobject]@{ BatteryStatus = 2 })
+        Get-WursaPowerState | Should -Be 'AC'
+    }
+
+    It 'reports Unknown when the power line is unreadable and the battery is unreadable' {
+        Mock Get-WursaPowerLineStatus { $null }
+        Mock Get-CimInstance { throw 'cim down' }
+        Get-WursaPowerState | Should -Be 'Unknown'
+    }
+}
+
+Describe 'Power state gates the upgrade (finding 31)' {
+    BeforeEach { Set-MainMocks -Build 26100 -Version '24H2' }
+
+    It 'blocks with an explicit state and message when power cannot be determined' {
+        Mock Get-WursaPowerState { 'Unknown' }
+        $InplaceUpgrade = $true; $NoUpgrade = $false; $No3rdParty = $true
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 1
+        ($script:said -join "`n") | Should -Match 'power'
+        ($script:said -join "`n") | Should -Match 'BLOCKED_POWER_UNKNOWN'
+    }
+
+    It 'blocks on battery' {
+        Mock Get-WursaPowerState { 'Battery' }
+        $InplaceUpgrade = $true; $NoUpgrade = $false; $No3rdParty = $true
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 1
+        ($script:said -join "`n") | Should -Match 'battery'
     }
 }

@@ -758,13 +758,31 @@ exit 1
 "@
 }
 
-function Test-WursaOnBattery {
-    $OnBattery = $false
+function Get-WursaPowerState {
+    # 'AC', 'Battery' or 'Unknown'. The OS power line is trusted first. When it cannot say, the battery
+    # status decides: no battery means a desktop on AC; any AC-ish battery means AC (BatteryStatus 2 and 3
+    # are AC, 6 to 9 are charging, 11 is partially charged); only batteries that all read discharging
+    # (1, 4, 5) mean Battery; anything else is Unknown and the caller must not guess.
+    $line = $null
+    try { $line = Get-WursaPowerLineStatus } catch {}
+    if ($line -eq 'Online')  { return 'AC' }
+    if ($line -eq 'Offline') { return 'Battery' }
     try {
-        $Battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
-        if ($Battery -and $Battery.BatteryStatus -ne 2) { $OnBattery = $true }
-    } catch {}
-    $OnBattery
+        $batteries = @(Get-CimInstance Win32_Battery -ErrorAction Stop)
+    } catch {
+        return 'Unknown'
+    }
+    if ($batteries.Count -eq 0) { return 'AC' }
+    $ac = 0; $discharging = 0
+    foreach ($b in $batteries) {
+        switch ([int]$b.BatteryStatus) {
+            { $_ -in 2, 3, 6, 7, 8, 9, 11 } { $ac++ }
+            { $_ -in 1, 4, 5 } { $discharging++ }
+        }
+    }
+    if ($ac -gt 0) { return 'AC' }
+    if ($discharging -gt 0) { return 'Battery' }
+    'Unknown'
 }
 #endregion
 
@@ -1682,12 +1700,16 @@ if ($NoUpgrade) {
 } elseif ($InstalledBuild -lt $LatestBuild) {
     Write-Host "      > Feature update available." -ForegroundColor $WarnCol
     # Battery safety
-    $OnBattery = Test-WursaOnBattery
+    $_power = Get-WursaPowerState
+    $OnBattery = ($_power -ne 'AC')
 
     $proceed = $false
-    if ($OnBattery) {
+    if ($_power -eq 'Battery') {
         $script:FeatureUpgradeState = "BLOCKED_BATTERY"
         Write-Host "      [!] Upgrade skipped: device is running on battery power." -ForegroundColor Yellow
+    } elseif ($_power -eq 'Unknown') {
+        $script:FeatureUpgradeState = "BLOCKED_POWER_UNKNOWN"
+        Write-Host "      [!] Upgrade skipped: could not determine the power source (BLOCKED_POWER_UNKNOWN). Plug in AC and run again." -ForegroundColor Yellow
     } elseif ($InplaceUpgrade) {
         if ($IPU_ArmWUOnly) {
             Write-Host "      [-InplaceUpgrade] ARM64 detected; auto-dispatching Windows Update feature-upgrade handoff." -ForegroundColor $DimCol
