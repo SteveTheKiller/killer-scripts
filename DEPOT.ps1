@@ -930,18 +930,69 @@ function Invoke-DepotCleanup {
     Write-StatusTag "[DONE]" "Green"
 }
 
+function Get-DepotProfileHive {
+    # Local (S-1-5-21) and Entra ID (S-1-12-1) user profiles that have an NTUSER.DAT. The pattern is anchored
+    # so service accounts, .bak profiles and other look-alikes are never touched.
+    $sidPattern = '^S-1-(5-21|12-1)-\d+-\d+-\d+-\d+$'
+    $found = @()
+    $rows = @(Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" -ErrorAction SilentlyContinue)
+    foreach ($r in $rows) {
+        if ("$($r.PSChildName)" -notmatch $sidPattern) { continue }
+        $path = [Environment]::ExpandEnvironmentVariables("$($r.ProfileImagePath)")
+        if (-not $path) { continue }
+        $dat = "$path\NTUSER.DAT"
+        if (-not (Test-Path $dat)) { continue }
+        $found += [pscustomobject]@{ SID = "$($r.PSChildName)"; Path = $dat }
+    }
+    return $found
+}
+
+function Mount-DepotUserHive {
+    # Fills $script:UserHives with the hives that are really writable. A hive that is already loaded (the user
+    # is logged on) is written in place and never unloaded. A hive DEPOT loads is verified before it counts.
+    $script:UserHives = @()
+    $script:DepotProfilesSeen = 0
+    foreach ($p in (Get-DepotProfileHive)) {
+        $script:DepotProfilesSeen++
+        $live = "Registry::HKEY_USERS\$($p.SID)"
+        if (Test-Path $live) {
+            $script:UserHives += [pscustomobject]@{ Mount = $live; SID = $p.SID; Loaded = $false; Name = $null }
+            continue
+        }
+        $name = "APT_$($p.SID)"
+        $r = Invoke-DepotReg @('load', "HKU\$name", $p.Path)
+        $mount = "Registry::HKEY_USERS\$name"
+        if ($r.ExitCode -eq 0 -and (Test-Path $mount)) {
+            $script:UserHives += [pscustomobject]@{ Mount = $mount; SID = $p.SID; Loaded = $true; Name = $name }
+        } else {
+            Write-Host " [profile $($p.SID) could not be loaded]" -NoNewline -ForegroundColor Yellow
+            Add-DepotResult 'Privacy' 'Failed' "profile $($p.SID) hive could not be loaded"
+        }
+    }
+}
+
+function Dismount-DepotUserHive {
+    # Unloads only the hives this run loaded, and says so when one will not let go.
+    [GC]::Collect()
+    Start-Sleep -Milliseconds 500
+    foreach ($Hive in @($script:UserHives | Where-Object { $_.Loaded })) {
+        $r = Invoke-DepotReg @('unload', "HKU\$($Hive.Name)")
+        if ($r.ExitCode -ne 0) {
+            Start-Sleep -Milliseconds 1000
+            [GC]::Collect()
+            $r = Invoke-DepotReg @('unload', "HKU\$($Hive.Name)")
+        }
+        if ($r.ExitCode -ne 0) {
+            Add-DepotResult 'Privacy' 'Failed' "could not unload hive $($Hive.Name); it is cleaned up on the next run"
+        }
+    }
+}
+
 function Invoke-DepotPrivacy {
     Write-Host "[*] Applying Privacy & UI Settings..." -ForegroundColor DarkRed
+    $script:DepotStep = 'Privacy'
     # --- Load all user hives so per-user keys can be set for every account ---
-    $script:UserHives = @()
-    $ProfileList = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" |
-        Where-Object { $_.PSChildName -match "S-1-5-21" -and (Test-Path "$($_.ProfileImagePath)\NTUSER.DAT") }
-    foreach ($UserProfile in $ProfileList) {
-        $HivePath  = "$($UserProfile.ProfileImagePath)\NTUSER.DAT"
-        $HiveMount = "HKU\APT_$($UserProfile.PSChildName)"
-        reg load $HiveMount $HivePath 2>$null | Out-Null
-        $script:UserHives += @{ Mount = "Registry::$HiveMount"; SID = $UserProfile.PSChildName }
-    }
+    Mount-DepotUserHive
     # ---- MICROSOFT EDGE ---------------------------------------------------------
     Write-Host "      > Configuring Microsoft Edge..." -NoNewline -ForegroundColor Gray
     $EdgePolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
@@ -1059,12 +1110,9 @@ function Invoke-DepotPrivacy {
     Set-AllUsers  "SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-310093Enabled" 0
     Write-StatusTag "[DONE]" "Green"
     # ---- UNLOAD USER HIVES -------------------------------------------------------------
-    [GC]::Collect()
-    Start-Sleep -Milliseconds 500
-    foreach ($Hive in $script:UserHives) {
-        reg unload "HKU\APT_$($Hive.SID)" 2>$null | Out-Null
-    }
-    Write-Host "    Privacy & UI settings applied to $($script:UserHives.Count) user profile(s)." -ForegroundColor Cyan
+    $reached = @($script:UserHives).Count
+    Dismount-DepotUserHive
+    Write-Host "    Privacy & UI settings applied to $reached of $($script:DepotProfilesSeen) user profile(s)." -ForegroundColor Cyan
 }
 
 function Test-DepotAnyFailed {

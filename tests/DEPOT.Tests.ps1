@@ -589,3 +589,111 @@ Describe 'Finding 14: unattended runs, honest results and exit codes' {
         }
     }
 }
+
+Describe 'Finding 42: per-user hives are loaded, verified and unloaded honestly' {
+    BeforeAll {
+        function New-ProfileRow { param($Sid, $Path) [pscustomobject]@{ PSChildName = $Sid; ProfileImagePath = $Path } }
+        $script:SidA = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $script:SidB = 'S-1-5-21-1111111111-2222222222-3333333333-1002'
+        $script:SidAad = 'S-1-12-1-1111111111-2222222222-3333333333-4444444444'
+    }
+
+    BeforeEach {
+        Reset-DepotState
+        Mock Start-Sleep { }
+        Mock Write-Host { }
+        $script:Rows  = @()
+        $script:Known = @()
+        $script:RegCalls = @()
+        $script:LoadExit = 0
+        $script:LoadFailFor = $null
+        $script:UnloadExit = 0
+        Mock Get-ItemProperty { $script:Rows }
+        Mock Test-Path { "$Path" -in $script:Known } -ParameterFilter { "$Path" -notlike "$TestDrive*" }
+        Mock Invoke-DepotReg {
+            $script:RegCalls += ,($Arguments -join ' ')
+            if ($Arguments[0] -eq 'load') {
+                $bad = ($script:LoadExit -ne 0) -or ($script:LoadFailFor -and "$($Arguments[1])" -like "*$($script:LoadFailFor)")
+                if (-not $bad) { $script:Known += "Registry::HKEY_USERS\$($Arguments[1] -replace '^HKU\\','')" }
+                return [pscustomobject]@{ ExitCode = $(if ($bad) { 1 } else { 0 }); Output = @() }
+            }
+            if ($Arguments[0] -eq 'unload') { return [pscustomobject]@{ ExitCode = $script:UnloadExit; Output = @() } }
+            [pscustomobject]@{ ExitCode = 0; Output = @() }
+        }
+    }
+
+    It 'only real user SIDs are accepted: local and AAD user SIDs yes, built-ins and look-alikes no' {
+        $script:Rows = @(
+            (New-ProfileRow $script:SidA 'C:\Users\a'),
+            (New-ProfileRow $script:SidAad 'C:\Users\aad'),
+            (New-ProfileRow 'S-1-5-18' 'C:\Windows\system32\config\systemprofile'),
+            (New-ProfileRow 'S-1-5-21-1-2-3-1001.bak' 'C:\Users\bak'),
+            (New-ProfileRow 'xS-1-5-21-1-2-3-1001' 'C:\Users\x'),
+            (New-ProfileRow 'S-1-5-21-1-2-3' 'C:\Users\short')
+        )
+        $script:Known = @('C:\Users\a\NTUSER.DAT', 'C:\Users\aad\NTUSER.DAT', 'C:\Windows\system32\config\systemprofile\NTUSER.DAT', 'C:\Users\bak\NTUSER.DAT', 'C:\Users\x\NTUSER.DAT', 'C:\Users\short\NTUSER.DAT')
+        $sids = @(Get-DepotProfileHive | ForEach-Object { $_.SID })
+        $sids -join ',' | Should -Be "$($script:SidA),$($script:SidAad)"
+    }
+
+    It 'an already loaded hive (a logged-on user) is written directly and never loaded or unloaded' {
+        $script:Rows = @(New-ProfileRow $script:SidA 'C:\Users\a')
+        $script:Known = @('C:\Users\a\NTUSER.DAT', "Registry::HKEY_USERS\$($script:SidA)")
+        Mount-DepotUserHive
+        $script:UserHives.Count | Should -Be 1
+        $script:UserHives[0].Mount | Should -Be "Registry::HKEY_USERS\$($script:SidA)"
+        Dismount-DepotUserHive
+        $script:RegCalls | Should -BeNullOrEmpty
+    }
+
+    It 'a hive that loads is counted and unloaded exactly once' {
+        $script:Rows = @(New-ProfileRow $script:SidA 'C:\Users\a')
+        $script:Known = @('C:\Users\a\NTUSER.DAT')
+        Mount-DepotUserHive
+        $script:UserHives.Count | Should -Be 1
+        Dismount-DepotUserHive
+        @($script:RegCalls | Where-Object { $_ -like 'unload*' }).Count | Should -Be 1
+        @($script:RegCalls | Where-Object { $_ -like 'load*' }).Count | Should -Be 1
+    }
+
+    It 'a reg load that fails is not counted, not unloaded and is recorded as Failed' {
+        $script:Rows = @(New-ProfileRow $script:SidA 'C:\Users\a')
+        $script:Known = @('C:\Users\a\NTUSER.DAT')
+        $script:LoadExit = 1
+        Mount-DepotUserHive
+        $script:UserHives.Count | Should -Be 0
+        Dismount-DepotUserHive
+        @($script:RegCalls | Where-Object { $_ -like 'unload*' }).Count | Should -Be 0
+        @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -Be 1
+    }
+
+    It 'a reg load that says success but leaves no mounted key is not counted' {
+        $script:Rows = @(New-ProfileRow $script:SidA 'C:\Users\a')
+        $script:Known = @('C:\Users\a\NTUSER.DAT')
+        Mock Invoke-DepotReg { [pscustomobject]@{ ExitCode = 0; Output = @() } }
+        Mount-DepotUserHive
+        $script:UserHives.Count | Should -Be 0
+    }
+
+    It 'an unload that keeps failing is recorded as Failed' {
+        $script:Rows = @(New-ProfileRow $script:SidA 'C:\Users\a')
+        $script:Known = @('C:\Users\a\NTUSER.DAT')
+        Mount-DepotUserHive
+        $script:UnloadExit = 1
+        Dismount-DepotUserHive
+        @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' -and $_.Detail -match 'unload' }).Count | Should -Be 1
+    }
+
+    It 'the privacy step reports how many profiles it really reached' {
+        $script:Rows = @((New-ProfileRow $script:SidA 'C:\Users\a'), (New-ProfileRow $script:SidB 'C:\Users\b'))
+        $script:Known = @('C:\Users\a\NTUSER.DAT', 'C:\Users\b\NTUSER.DAT')
+        Mock Set-RegValue { }
+        Mock Set-ItemProperty { } -ParameterFilter { $true }
+        Mock Get-Service { }
+        Mock New-Item { } -ParameterFilter { $true }
+        Mock Get-Item { } -ParameterFilter { $true }
+        $script:LoadFailFor = '1002'
+        Invoke-DepotPrivacy
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { "$Object" -match 'applied to 1 of 2 user profile' }
+    }
+}
