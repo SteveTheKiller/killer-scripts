@@ -1,14 +1,14 @@
 ﻿<#
 .SYNOPSIS
-    Definition Enforcement & Full Endpoint Network Defense (D.E.F.E.N.D.) v2.3
-    Developed by SteveTheKiller | Updated: 2026-03-13
+    Definition Enforcement & Full Endpoint Network Defense (D.E.F.E.N.D.) v3.0
+    Developed by SteveTheKiller | Updated: 2026-11-19
 .DESCRIPTION
     Audits and enforces kernel-level Windows security including TPM,
     Secure Boot, HVCI, and Defender hardening. Syncs threat definitions,
     runs a full Defender scan with live IOPS reporting, and lists any
     active threats with file paths pulled from event logs.
 #>
-$_ver = "| v2.3"
+$_ver = "| v3.0"
 
 #region [0] - HELPERS AND SYSTEM BOUNDARIES
 # ------------------------------------------------------------------------------
