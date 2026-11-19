@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    BitLocker Encryption, Recovery, & Escrow Tool (BERET) v6.0
-    Developed by SteveTheKiller | Updated: 2026-03-12
+    BitLocker Encryption, Recovery, & Escrow Tool (BERET) v7.0
+    Developed by SteveTheKiller | Updated: 2026-11-18
 .DESCRIPTION
     Interactive BitLocker lifecycle manager that prompts to choose
     between FIPS (XTS-AES-256) and Standard (XTS-AES-128) mode. Initializes
@@ -196,7 +196,7 @@ function Show-BeretFooter {
     $_ftrW = [Math]::Max($_ftr1.Length, [Math]::Max($_ftr2.Length, $_ftr3.Length))
     $_ftr1 = $_ftr1.PadRight($_ftrW); $_ftr2 = $_ftr2.PadRight($_ftrW); $_ftr3 = $_ftr3.PadRight($_ftrW)
     $_ffillW = $script:Width - $_ftrW - $_sfx.Length
-    $_ver    = "| v6.0"
+    $_ver    = "| v7.0"
     $_fpad   = " " * [Math]::Max(0, $_ffillW - $Text.Length - $_ver.Length)
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr1 -ForegroundColor $MainCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
     Write-Host "$Text$_fpad$_ver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $MainCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
