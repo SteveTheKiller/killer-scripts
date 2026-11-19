@@ -18,23 +18,40 @@
     marker, and detection matches that ID, so each run installs once per machine and does
     NOT loop. Re-running installs again. Detection is marker-based and does not inspect
     the app itself, so it works for any installer.
+
+    Exit codes: 0 success, 1 failure, 2 a precondition failed (missing input or no console),
+    3 partial success. The last line of output states the result and agrees with the code.
 #>
 
 #region UI Initialization
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding            = [System.Text.Encoding]::UTF8
 $ProgressPreference        = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-Clear-Host
 
 $script:Width = 85
 $_ver         = "1.00"
 $_fver        = "| v$_ver"
 
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
+}
+
+function Exit-BeamRun {
+    # One exit point. The final line goes to the success stream so an RMM captures it, and it
+    # always agrees with the exit code.
+    param([int]$Code, [string]$Text)
+    Write-Output "BEAM RESULT: exit code $Code - $Text"
+    Exit-KillerScript $Code
+}
+
 # ESC handling requires a true interactive console. Detect it without touching the input buffer
 # (accessing [Console]::KeyAvailable here breaks Read-Host in relayed consoles). In a
 # redirected/relayed console ESC can't be read at all, so Ctrl+C is the cancel there.
-$script:IsInteractive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+$script:IsInteractive = $false
+try { $script:IsInteractive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected } catch { }
 
 $LineCol   = "DarkCyan"
 $MainCol   = "Cyan"
@@ -228,7 +245,7 @@ function Read-TargetsField {
     # would otherwise fire the file browser and the rest of the paste would drive it. F only counts
     # as the shortcut when nothing else is queued behind it (a human keypress); F2 always works.
     param([string]$Prompt)
-    if (-not $script:IsInteractive) { return (Read-Host $Prompt) }
+    if (-not $script:IsInteractive) { return (Read-BeamValue $Prompt) }
 
     $disp = "$Prompt  [F = load CSV/TXT]"
     Write-Host "${disp}: " -NoNewline
@@ -264,151 +281,257 @@ function Read-TargetsField {
     }
 }
 
-# Header
-$_pfx  = "█  "
-$_art1 = "╔╗  ╔═╗ ╔═╗ ╔╦╗ "
-$_art2 = "╠╩╗ ║╣  ╠═╣ ║║║ "
-$_art3 = "╚═╝ ╚═╝ ╩ ╩ ╩ ╩ "
-$_artW  = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
-$_art1  = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
-$_fillW = $script:Width - $_pfx.Length - $_artW
-$_title = "BULK ENDPOINT APP MOVER"
-$_tpad  = " " * [Math]::Max(0, ($_fillW - $_title.Length))
+function Read-BeamValue {
+    # Read-Host that fails closed. With no console to read from it throws BEAM_NOCONSOLE, which
+    # the entry point turns into exit 2, instead of an unhandled host error.
+    param([string]$Prompt)
+    try {
+        if ($Prompt) { $v = Read-Host $Prompt } else { $v = Read-Host }
+    } catch { throw 'BEAM_NOCONSOLE' }
+    if ($null -eq $v) { return '' }
+    return [string]$v
+}
 
-Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art1 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
-Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art2 -ForegroundColor $ArtCol -NoNewline; Write-Host "$_title$_tpad" -ForegroundColor $MainCol
-Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art3 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
-Write-Host ""
-Write-HLine dashed
-#endregion
+function Show-BeamBanner {
+    $_pfx  = "█  "
+    $_art1 = "╔╗  ╔═╗ ╔═╗ ╔╦╗ "
+    $_art2 = "╠╩╗ ║╣  ╠═╣ ║║║ "
+    $_art3 = "╚═╝ ╚═╝ ╩ ╩ ╩ ╩ "
+    $_artW  = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
+    $_art1  = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
+    $_fillW = $script:Width - $_pfx.Length - $_artW
+    $_title = "BULK ENDPOINT APP MOVER"
+    $_tpad  = " " * [Math]::Max(0, ($_fillW - $_title.Length))
 
+    Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art1 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
+    Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art2 -ForegroundColor $ArtCol -NoNewline; Write-Host "$_title$_tpad" -ForegroundColor $MainCol
+    Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art3 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
+    Write-Host ""
+    Write-HLine dashed
+}
 
-#region Input Collection
-Write-StepUpdate "Collecting deployment parameters..." INFO
-Write-Host ""
+function Show-BeamFooter {
+    param([string]$Title = "  DEPLOYMENT COMPLETE")
+    $_art1 = "╔╗  ╔═╗ ╔═╗ ╔╦╗ "
+    $_art2 = "╠╩╗ ║╣  ╠═╣ ║║║ "
+    $_art3 = "╚═╝ ╚═╝ ╩ ╩ ╩ ╩ "
+    $_artW  = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
+    $_art1  = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
+    $_sfx    = "█"
+    $_ffillW = $script:Width - $_artW - 1 - $_sfx.Length
+    $_fpad   = " " * [Math]::Max(0, ($_ffillW - $Title.Length - $_fver.Length))
 
-# 1. Installer source. Type a direct download URL, or press Enter to browse for a local
-#    .exe / .msi. The file type drives the install command (msiexec for MSI, direct run for EXE).
-$installerUrl   = $null
-$localInstaller = $null
-$setupFile      = $null
-$isMsi          = $false
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+    Write-Host "$Title$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host " $_art2" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+}
 
-while (-not $setupFile) {
-    Write-Host "  Installer URL  [blank = browse for a local .exe/.msi]: " -NoNewline
-    $srcInput = (Read-Host).Trim().Trim('"')
+function New-BeamAbort {
+    param([int]$Code, [string]$Text)
+    [pscustomobject]@{ Abort = $true; Code = $Code; Text = $Text }
+}
+
+function Read-BeamInputs {
+    # Collects every operator input. Returns an Abort object (Code, Text) when a precondition is
+    # not met, otherwise the settings the deployment needs.
+    Write-StepUpdate "Collecting deployment parameters..." INFO
     Write-Host ""
 
-    if ($srcInput -eq "") {
-        if (-not $script:IsInteractive) {
-            Write-StepUpdate "The file picker needs an interactive console. Provide a URL instead: aborting" FAIL
-            return
-        }
-        $picked = Select-FileBrowser -Extensions @('.exe', '.msi') -Label "Installer browser (.exe/.msi)"
-        if (-not $picked) {
-            Write-StepUpdate "No file selected. Enter a URL or press F/Enter to browse (Ctrl+C aborts)." WARN
-            Write-Host ""
-            continue
-        }
-        $localInstaller = $picked
-        $setupFile      = Split-Path $picked -Leaf
-        $isMsi          = ([IO.Path]::GetExtension($setupFile).ToLower() -eq '.msi')
-        Write-StepUpdate "Selected: $setupFile" OK
-    } else {
-        $installerUrl = $srcInput
-        $pathPart     = ($srcInput -split '\?')[0]
-        $ext          = [IO.Path]::GetExtension($pathPart).ToLower()
-        $leaf         = Split-Path $pathPart -Leaf
-        if ($ext -eq '.msi') {
-            $isMsi = $true
-            $setupFile = $leaf
-        } elseif ($ext -eq '.exe') {
-            $isMsi = $false
-            $setupFile = $leaf
+    # 1. Installer source. Type a direct download URL, or press Enter to browse for a local
+    #    .exe / .msi. The file type drives the install command (msiexec for MSI, direct run for EXE).
+    $installerUrl   = $null
+    $localInstaller = $null
+    $setupFile      = $null
+    $isMsi          = $false
+
+    while (-not $setupFile) {
+        Write-Host "  Installer URL  [blank = browse for a local .exe/.msi]: " -NoNewline
+        $srcInput = (Read-BeamValue '').Trim().Trim('"')
+        Write-Host ""
+
+        if ($srcInput -eq "") {
+            if (-not $script:IsInteractive) {
+                Write-StepUpdate "The file picker needs an interactive console. Provide a URL instead: aborting" FAIL
+                return (New-BeamAbort 2 "the file picker needs an interactive console. Provide a URL instead. Nothing was changed.")
+            }
+            $picked = Select-FileBrowser -Extensions @('.exe', '.msi') -Label "Installer browser (.exe/.msi)"
+            if (-not $picked) {
+                Write-StepUpdate "No file selected. Enter a URL or press F/Enter to browse (Ctrl+C aborts)." WARN
+                Write-Host ""
+                continue
+            }
+            $localInstaller = $picked
+            $setupFile      = Split-Path $picked -Leaf
+            $isMsi          = ([IO.Path]::GetExtension($setupFile).ToLower() -eq '.msi')
+            Write-StepUpdate "Selected: $setupFile" OK
         } else {
-            # URL gives no usable extension. Ask the type so the install command is built correctly.
-            $ans   = (Read-Host "  Couldn't read a file type from the URL. Is it an MSI? (y/N)").Trim()
-            $isMsi = ($ans -match '^(y|yes)$')
-            $setupFile = if ($isMsi) { "installer.msi" } else { "installer.exe" }
+            $installerUrl = $srcInput
+            $pathPart     = ($srcInput -split '\?')[0]
+            $ext          = [IO.Path]::GetExtension($pathPart).ToLower()
+            $leaf         = Split-Path $pathPart -Leaf
+            if ($ext -eq '.msi') {
+                $isMsi = $true
+                $setupFile = $leaf
+            } elseif ($ext -eq '.exe') {
+                $isMsi = $false
+                $setupFile = $leaf
+            } else {
+                # URL gives no usable extension. Ask the type so the install command is built correctly.
+                $ans   = (Read-BeamValue "  Couldn't read a file type from the URL. Is it an MSI? (y/N)").Trim()
+                $isMsi = ($ans -match '^(y|yes)$')
+                $setupFile = if ($isMsi) { "installer.msi" } else { "installer.exe" }
+            }
+            Write-StepUpdate "Source URL accepted ($setupFile)" OK
         }
-        Write-StepUpdate "Source URL accepted ($setupFile)" OK
     }
-}
-Write-Host ""
+    Write-Host ""
 
-# 2. App name shown in Intune. Blank derives it from the installer file name.
-$defaultName = [IO.Path]::GetFileNameWithoutExtension($setupFile)
-$appName     = (Read-Host "  App name  [blank = '$defaultName']").Trim()
-if ($appName -eq "") { $appName = $defaultName }
+    # 2. App name shown in Intune. Blank derives it from the installer file name.
+    $defaultName = [IO.Path]::GetFileNameWithoutExtension($setupFile)
+    $appName     = (Read-BeamValue "  App name  [blank = '$defaultName']").Trim()
+    if ($appName -eq "") { $appName = $defaultName }
 
-# 3. Publisher (required by Intune, cosmetic). Blank defaults to BEAM.
-$publisher = (Read-Host "  Publisher  [blank = 'BEAM']").Trim()
-if ($publisher -eq "") { $publisher = "BEAM" }
+    # 3. Publisher (required by Intune, cosmetic). Blank defaults to BEAM.
+    $publisher = (Read-BeamValue "  Publisher  [blank = 'BEAM']").Trim()
+    if ($publisher -eq "") { $publisher = "BEAM" }
 
-# 4. Install switches. Optional. MSI defaults to /qn when blank; EXE runs bare when blank.
-$phSwitch    = if ($isMsi) { "MSI: blank uses /qn" } else { "EXE: e.g. /S  /silent  /qn  -s" }
-$installArgs = (Read-Host "  Install switches (optional)  [$phSwitch]").Trim()
-if ($isMsi -and $installArgs -eq "") { $installArgs = "/qn" }
-Write-Host ""
+    # 4. Install switches. Optional. MSI defaults to /qn when blank; EXE runs bare when blank.
+    $phSwitch    = if ($isMsi) { "MSI: blank uses /qn" } else { "EXE: e.g. /S  /silent  /qn  -s" }
+    $installArgs = (Read-BeamValue "  Install switches (optional)  [$phSwitch]").Trim()
+    if ($isMsi -and $installArgs -eq "") { $installArgs = "/qn" }
+    Write-Host ""
 
-# 5. Targets. Intune matches by hostname, so IP entries are dropped.
-$targetInput  = Read-TargetsField "  Targets (comma-separated hostnames, IPs can't match Intune)"
-$targets      = $targetInput -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
-$ipTargets    = @($targets | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
-if ($ipTargets.Count -gt 0) {
-    Write-StepUpdate "Dropping IP target(s), Intune matches by hostname only: $($ipTargets -join ', ')" WARN
-    $targets = @($targets | Where-Object { $_ -notmatch '^\d{1,3}(\.\d{1,3}){3}$' })
-}
-if ($targets.Count -eq 0) { Write-StepUpdate "No hostname targets to deploy: aborting" FAIL; return }
-Write-Host ""
+    # 5. Targets. Intune matches by hostname, so IP entries are dropped.
+    $targetInput  = Read-TargetsField "  Targets (comma-separated hostnames, IPs can't match Intune)"
+    $targets      = @($targetInput -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    $ipTargets    = @($targets | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+    if ($ipTargets.Count -gt 0) {
+        Write-StepUpdate "Dropping IP target(s), Intune matches by hostname only: $($ipTargets -join ', ')" WARN
+        $targets = @($targets | Where-Object { $_ -notmatch '^\d{1,3}(\.\d{1,3}){3}$' })
+    }
+    if ($targets.Count -eq 0) {
+        Write-StepUpdate "No hostname targets to deploy: aborting" FAIL
+        return (New-BeamAbort 2 "no hostname targets to deploy. Nothing was changed.")
+    }
+    Write-Host ""
 
-# 6. Global Admin for Intune. The domain resolves the tenant ID for the sign-in.
-$adminUpn = Read-Host "  Global admin email for Intune (required)"
-$tenantId = $null
-if (-not $adminUpn) {
-    Write-StepUpdate "A Global Admin / Intune Admin sign-in is required for this tool: aborting" FAIL
-    return
-}
-$adminDomain = ($adminUpn -split "@")[-1]
-if (-not $adminDomain -or $adminDomain -eq $adminUpn) {
-    Write-StepUpdate "Could not parse a domain from '$adminUpn': aborting" FAIL
-    return
-}
-Write-StepUpdate "Resolving tenant for domain: $adminDomain" INFO
-try {
-    $oidc     = Invoke-RestMethod "https://login.microsoftonline.com/$adminDomain/v2.0/.well-known/openid-configuration" -ErrorAction Stop
-    $tenantId = ([regex]::Match($oidc.issuer, '(?i)[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}')).Value
-} catch { }
-if (-not $tenantId) { Write-StepUpdate "Tenant lookup failed for '$adminDomain': aborting" FAIL; return }
-Write-StepUpdate "Tenant ID: $tenantId" OK
-
-Write-Host ""
-Write-HLine dashed
-Write-Host ""
-#endregion
-
-#region IntuneWin Tool Setup
-$workRoot          = Join-Path $env:LOCALAPPDATA "BEAM"
-$intunewinToolPath = Join-Path $workRoot "IntuneWinAppUtil.exe"
-$intuneWorkDir     = Join-Path $workRoot "IntuneWork"
-if (-not (Test-Path $workRoot)) { New-Item -ItemType Directory -Path $workRoot -Force | Out-Null }
-if (-not (Test-Path $intunewinToolPath)) {
-    Write-StepUpdate "IntuneWinAppUtil not found, downloading..." INFO
+    # 6. Global Admin for Intune. The domain resolves the tenant ID for the sign-in.
+    $adminUpn = Read-BeamValue "  Global admin email for Intune (required)"
+    if (-not $adminUpn) {
+        Write-StepUpdate "A Global Admin / Intune Admin sign-in is required for this tool: aborting" FAIL
+        return (New-BeamAbort 2 "an admin sign-in email is required. Nothing was changed.")
+    }
+    $adminDomain = ($adminUpn -split "@")[-1]
+    if (-not $adminDomain -or $adminDomain -eq $adminUpn) {
+        Write-StepUpdate "Could not parse a domain from '$adminUpn': aborting" FAIL
+        return (New-BeamAbort 2 "could not parse a domain from the admin email. Nothing was changed.")
+    }
+    Write-StepUpdate "Resolving tenant for domain: $adminDomain" INFO
+    $tenantId = $null
     try {
-        Invoke-WebRequest -Uri "https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe" -OutFile $intunewinToolPath -ErrorAction Stop
-        Write-StepUpdate "IntuneWinAppUtil ready at $intunewinToolPath" OK
-    } catch {
-        Write-StepUpdate "IntuneWinAppUtil download failed: cannot continue" FAIL
-        return
+        $oidc     = Invoke-RestMethod "https://login.microsoftonline.com/$adminDomain/v2.0/.well-known/openid-configuration" -ErrorAction Stop
+        $tenantId = ([regex]::Match($oidc.issuer, '(?i)[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}')).Value
+    } catch { }
+    if (-not $tenantId) {
+        Write-StepUpdate "Tenant lookup failed for '$adminDomain': aborting" FAIL
+        return (New-BeamAbort 1 "tenant lookup failed for '$adminDomain'. Nothing was changed.")
     }
-} else {
-    Write-StepUpdate "IntuneWinAppUtil found at $intunewinToolPath" OK
+    Write-StepUpdate "Tenant ID: $tenantId" OK
+
+    Write-Host ""
+    Write-HLine dashed
+    Write-Host ""
+    [pscustomobject]@{
+        Abort = $false; InstallerUrl = $installerUrl; LocalInstaller = $localInstaller; SetupFile = $setupFile
+        IsMsi = $isMsi; AppName = $appName; Publisher = $publisher; InstallArgs = $installArgs
+        Targets = @($targets); TenantId = $tenantId
+    }
 }
-Write-Host ""
-#endregion
 
+function Get-BeamWorkRoot {
+    $base = $env:LOCALAPPDATA
+    if (-not $base) { $base = $env:TEMP }
+    Join-Path $base "BEAM"
+}
 
-#region Helper Functions
+function Initialize-BeamTool {
+    # Returns the path of IntuneWinAppUtil.exe, downloading it when missing, or $null on failure.
+    $workRoot = Get-BeamWorkRoot
+    $toolPath = Join-Path $workRoot "IntuneWinAppUtil.exe"
+    if (-not (Test-Path $workRoot)) { New-Item -ItemType Directory -Path $workRoot -Force | Out-Null }
+    if (-not (Test-Path $toolPath)) {
+        Write-StepUpdate "IntuneWinAppUtil not found, downloading..." INFO
+        try {
+            Invoke-WebRequest -Uri "https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe" -OutFile $toolPath -ErrorAction Stop
+            Write-StepUpdate "IntuneWinAppUtil ready at $toolPath" OK
+        } catch {
+            Write-StepUpdate "IntuneWinAppUtil download failed: cannot continue" FAIL
+            return $null
+        }
+    } else {
+        Write-StepUpdate "IntuneWinAppUtil found at $toolPath" OK
+    }
+    Write-Host ""
+    return $toolPath
+}
+
+function Get-BeamUtcNow { [DateTime]::UtcNow }
+
+function Invoke-BeamPackager {
+    # Runs IntuneWinAppUtil.exe. Its output is not needed, only the .intunewin it writes.
+    param([string]$Tool, [string]$SourceDir, [string]$SetupFile, [string]$OutDir)
+    & $Tool -c $SourceDir -s $SetupFile -o $OutDir -q 2>&1 | Out-Null
+}
+
+function Open-BeamListener {
+    # Loopback listener on a free port. "localhost" prefix needs no URL ACL / elevation.
+    $listener = New-Object System.Net.HttpListener
+    for ($p = 8400; $p -le 8420; $p++) {
+        try {
+            $listener.Prefixes.Clear(); $listener.Prefixes.Add("http://localhost:$p/"); $listener.Start()
+            return [pscustomobject]@{ Listener = $listener; Port = $p }
+        } catch { }
+    }
+    return $null
+}
+
+function Start-BeamBrowser {
+    param([string]$Url)
+    try { Start-Process $Url } catch { }
+}
+
+function Receive-BeamRedirect {
+    # Waits for the loopback redirect, with a timeout so it never hangs forever. Returns
+    # Cancelled = $true when the operator pressed ESC, otherwise the query string or $null.
+    param($Listener, [int]$TimeoutSec = 180)
+    $query    = $null
+    $ctxTask  = $Listener.GetContextAsync()
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while (-not $ctxTask.IsCompleted -and (Get-Date) -lt $deadline) {
+        if (Test-EscPressed) { try { $Listener.Stop() } catch { }; return [pscustomobject]@{ Cancelled = $true; Query = $null } }
+        Start-Sleep -Milliseconds 300
+    }
+    if ($ctxTask.IsCompleted) {
+        try {
+            $ctx  = $ctxTask.Result
+            $query = $ctx.Request.Url.Query
+            $html = "<html><body style='font-family:Segoe UI;background:#111;color:#00CED1;text-align:center;padding-top:60px'><h2>BEAM authenticated. You can close this tab.</h2></body></html>"
+            $buf  = [System.Text.Encoding]::UTF8.GetBytes($html)
+            $ctx.Response.ContentType = "text/html"; $ctx.Response.StatusCode = 200
+            $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
+            $ctx.Response.OutputStream.Close()
+        } catch { }
+    }
+    try { $Listener.Stop() } catch { }
+    [pscustomobject]@{ Cancelled = $false; Query = $query }
+}
+
+function Get-BeamClipboardText {
+    $t = $null
+    try { $t = (Get-Clipboard -Raw) } catch { try { $t = (Get-Clipboard) -join '' } catch { $t = $null } }
+    return $t
+}
+
 function Get-GraphToken {
     param([string]$TenantId)
     $clientId = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
@@ -429,13 +552,9 @@ function Get-GraphToken {
     $challenge = (([Convert]::ToBase64String($chalRaw)) -replace '\+','-' -replace '/','_' -replace '=','')
     $state    = [Guid]::NewGuid().ToString("N")
 
-    # Loopback listener on a free port. "localhost" prefix needs no URL ACL / elevation.
-    $listener = New-Object System.Net.HttpListener
-    $port     = 0
-    for ($p = 8400; $p -le 8420; $p++) {
-        try { $listener.Prefixes.Clear(); $listener.Prefixes.Add("http://localhost:$p/"); $listener.Start(); $port = $p; break } catch { }
-    }
-    if ($port -eq 0) { Write-StepUpdate "Could not bind a loopback port (8400-8420) for auth" FAIL; return $null }
+    $lb = Open-BeamListener
+    if (-not $lb) { Write-StepUpdate "Could not bind a loopback port (8400-8420) for auth" FAIL; return $null }
+    $port        = $lb.Port
     $redirectUri = "http://localhost:$port/"
 
     $authUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/authorize?" +
@@ -451,37 +570,20 @@ function Get-GraphToken {
     Write-StepUpdate "Opening browser... if it doesn't open, paste this URL into your browser:" WARN
     Write-Host "  $authUrl" -ForegroundColor $InfoCol
     Write-Host ""
-    try { Start-Process $authUrl } catch { }
+    Start-BeamBrowser $authUrl
 
-    # Wait for the loopback redirect (auto-capture), with a timeout so it never hangs forever.
     Write-StepUpdate "Waiting for sign-in to complete (up to 180s, ESC to cancel)..." INFO
-    $query    = $null
-    $ctxTask  = $listener.GetContextAsync()
-    $deadline = (Get-Date).AddSeconds(180)
-    while (-not $ctxTask.IsCompleted -and (Get-Date) -lt $deadline) {
-        if (Test-EscPressed) { try { $listener.Stop() } catch { }; Write-StepUpdate "Sign-in cancelled by operator" WARN; return $null }
-        Start-Sleep -Milliseconds 300
-    }
-    if ($ctxTask.IsCompleted) {
-        try {
-            $ctx  = $ctxTask.Result
-            $query = $ctx.Request.Url.Query
-            $html = "<html><body style='font-family:Segoe UI;background:#111;color:#00CED1;text-align:center;padding-top:60px'><h2>BEAM authenticated. You can close this tab.</h2></body></html>"
-            $buf  = [System.Text.Encoding]::UTF8.GetBytes($html)
-            $ctx.Response.ContentType = "text/html"; $ctx.Response.StatusCode = 200
-            $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
-            $ctx.Response.OutputStream.Close()
-        } catch { }
-    }
-    try { $listener.Stop() } catch { }
+    $redirect = Receive-BeamRedirect -Listener $lb.Listener
+    if ($redirect.Cancelled) { Write-StepUpdate "Sign-in cancelled by operator" WARN; return $null }
+    $query = $redirect.Query
 
     # Last resort (e.g. browser on another machine): read the redirect URL from the clipboard.
     if (-not ($query -and $query -match 'code=')) {
         Write-Host ""
         Write-StepUpdate "No local redirect captured (browser likely on another machine)." WARN
         Write-StepUpdate "Copy the FULL address-bar URL from the browser, then press Enter here." INFO
-        Read-Host "  (press Enter after copying the URL)" | Out-Null
-        try { $query = (Get-Clipboard -Raw) } catch { try { $query = (Get-Clipboard) -join '' } catch { $query = $null } }
+        Read-BeamValue "  (press Enter after copying the URL)" | Out-Null
+        $query = Get-BeamClipboardText
     }
     if (-not $query) { Write-StepUpdate "No authorization response obtained: aborting auth" FAIL; return $null }
 
@@ -545,8 +647,8 @@ function Send-AzureStorageBlock {
 
 function Wait-GraphState {
     param([string]$Uri, [hashtable]$Headers, [string]$Property, [string[]]$SuccessValues, [string[]]$FailValues, [int]$TimeoutSec = 300)
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
-    while ([DateTime]::UtcNow -lt $deadline) {
+    $deadline = (Get-BeamUtcNow).AddSeconds($TimeoutSec)
+    while ((Get-BeamUtcNow) -lt $deadline) {
         $r = Invoke-RestMethod $Uri -Headers $Headers
         $v = $r.$Property
         if ($SuccessValues -contains $v) { return $r }
@@ -621,13 +723,14 @@ function Invoke-IntuneInstall {
         [string]$RunId
     )
     $runId = $RunId
+    $intuneWorkDir = Join-Path (Get-BeamWorkRoot) "IntuneWork"
 
     Write-HLine dashed
     Write-StepUpdate "Intune Win32 deployment" INFO
     Write-StepUpdate "Targets: $($Targets -join ', ')" INFO
     Write-Host ""
 
-    if (-not $intunewinToolPath) { Write-StepUpdate "IntuneWinAppUtil unavailable: aborted" FAIL; return $false }
+    if (-not $script:BeamToolPath) { Write-StepUpdate "IntuneWinAppUtil unavailable: aborted" FAIL; return $false }
 
     Write-StepUpdate "Authenticating to Graph (tenant: $TenantId)..." INFO
     $token = Get-GraphToken -TenantId $TenantId
@@ -707,7 +810,7 @@ function Invoke-IntuneInstall {
 
     Write-StepUpdate "Packaging with IntuneWinAppUtil..." INFO
     Get-ChildItem $outDir | Remove-Item -Force
-    & $intunewinToolPath -c $srcDir -s $SetupFile -o $outDir -q 2>&1 | Out-Null
+    Invoke-BeamPackager -Tool $script:BeamToolPath -SourceDir $srcDir -SetupFile $SetupFile -OutDir $outDir
     $intunewinFile = Get-ChildItem $outDir -Filter "*.intunewin" | Select-Object -First 1
     if (-not $intunewinFile) { Write-StepUpdate "Packaging failed: no .intunewin output" FAIL; return $false }
     Write-StepUpdate "Packaged: $($intunewinFile.Name) ($([math]::Round($intunewinFile.Length/1MB,1)) MB)" OK
@@ -989,58 +1092,73 @@ exit 1
     Write-Host ""
     return $true
 }
-#endregion
 
+function Invoke-BeamMain {
+    try { Clear-Host } catch { }
+    Show-BeamBanner
 
-#region Main
-$results = [ordered]@{}
-$targets | ForEach-Object { $results[$_] = "Intune pending" }
+    $in = $null; $inErr = $null
+    try { $in = Read-BeamInputs } catch { $inErr = $_ }
+    if ($inErr) {
+        if ($inErr.Exception.Message -eq 'BEAM_NOCONSOLE') {
+            Exit-BeamRun 2 "there is no console to read the deployment inputs from. Nothing was changed."
+        }
+        Exit-BeamRun 1 "reading the inputs failed: $($inErr.Exception.Message)"
+    }
+    if ($in.Abort) { Exit-BeamRun $in.Code $in.Text }
 
-# One run ID per BEAM execution, shared by every target this run. The install stamps it into a
-# marker and detection checks for it, so each run installs once per machine; re-running BEAM
-# generates a new ID and installs again.
-$runId = (Get-Date -Format "yyyyMMddHHmmss") + "-" + ([guid]::NewGuid().ToString("N").Substring(0,8))
+    $script:BeamToolPath = Initialize-BeamTool
+    if (-not $script:BeamToolPath) { Exit-BeamRun 1 "IntuneWinAppUtil is unavailable. Nothing was deployed." }
 
-Write-HLine
-Write-Host ""
-Write-StepUpdate "Deploying '$appName' to $($targets.Count) target(s) via Intune..." INFO
-Write-StepUpdate "Run ID: $runId" INFO
-Write-Host ""
+    $targets = @($in.Targets)
+    $results = [ordered]@{}
+    $targets | ForEach-Object { $results[$_] = "Intune pending" }
 
-$intuneOk = Invoke-IntuneInstall -Targets $targets -Url $installerUrl -LocalPath $localInstaller -SetupFile $setupFile -IsMsi $isMsi -InstallArgs $installArgs -AppName $appName -Publisher $publisher -TenantId $tenantId -RunId $runId
-if ($intuneOk) {
-    $targets | ForEach-Object { $results[$_] = "Intune queued" }
-} else {
-    $targets | ForEach-Object { $results[$_] = "FAIL" }
+    # One run ID per BEAM execution, shared by every target this run. The install stamps it into a
+    # marker and detection checks for it, so each run installs once per machine; re-running BEAM
+    # generates a new ID and installs again.
+    $runId = (Get-Date -Format "yyyyMMddHHmmss") + "-" + ([guid]::NewGuid().ToString("N").Substring(0,8))
+
+    Write-HLine
     Write-Host ""
-    Write-StepUpdate "Intune deployment did not complete (see error above): $($targets.Count) target(s) marked FAILED." FAIL
+    Write-StepUpdate "Deploying '$($in.AppName)' to $($targets.Count) target(s) via Intune..." INFO
+    Write-StepUpdate "Run ID: $runId" INFO
+    Write-Host ""
+
+    $intuneOk = Invoke-IntuneInstall -Targets $targets -Url $in.InstallerUrl -LocalPath $in.LocalInstaller -SetupFile $in.SetupFile -IsMsi $in.IsMsi -InstallArgs $in.InstallArgs -AppName $in.AppName -Publisher $in.Publisher -TenantId $in.TenantId -RunId $runId
+    if ($intuneOk) {
+        $targets | ForEach-Object { $results[$_] = "Intune queued" }
+    } else {
+        $targets | ForEach-Object { $results[$_] = "FAIL" }
+        Write-Host ""
+        Write-StepUpdate "Intune deployment did not complete (see error above): $($targets.Count) target(s) marked FAILED." FAIL
+    }
+
+    Write-HLine
+    Write-Host ""
+    Write-StepUpdate "Deployment Summary" INFO
+    Write-Host ""
+
+    $results.GetEnumerator() | Where-Object { $_.Value -eq "Intune queued" } | ForEach-Object { Write-StepUpdate "$($_.Key)  (Intune: pending check-in)" WARN }
+    $results.GetEnumerator() | Where-Object { $_.Value -eq "FAIL"          } | ForEach-Object { Write-StepUpdate "$($_.Key)" FAIL }
+    Write-Host ""
+
+    $queued = @($results.Values | Where-Object { $_ -eq "Intune queued" }).Count
+    $failed = @($results.Values | Where-Object { $_ -eq "FAIL" }).Count
+    Write-Host "  Intune queued : " -NoNewline -ForegroundColor $InfoCol; Write-Host $queued -ForegroundColor $AccentCol -NoNewline; Write-Host "    Failed : " -NoNewline -ForegroundColor $InfoCol; Write-Host "$failed    of $($targets.Count) total" -ForegroundColor $ArtCol
+    Write-StepUpdate "Devices install on next Intune check-in. Verify in Intune > the app > Device install status." INFO
+    Write-Host ""
+
+    if ($failed -eq 0 -and $queued -eq $targets.Count) {
+        Show-BeamFooter "  DEPLOYMENT COMPLETE"
+        Exit-BeamRun 0 "'$($in.AppName)' is queued in Intune for $queued of $($targets.Count) target(s). Devices install on their next check-in."
+    }
+    if ($queued -gt 0) {
+        Show-BeamFooter "  DEPLOYMENT FINISHED WITH PROBLEMS"
+        Exit-BeamRun 3 "'$($in.AppName)' is queued for $queued of $($targets.Count) target(s); $failed failed."
+    }
+    Show-BeamFooter "  DEPLOYMENT FAILED"
+    Exit-BeamRun 1 "'$($in.AppName)' was not deployed to any of the $($targets.Count) target(s)."
 }
-#endregion
 
-
-#region Summary & Footer
-Write-HLine
-Write-Host ""
-Write-StepUpdate "Deployment Summary" INFO
-Write-Host ""
-
-$results.GetEnumerator() | Where-Object { $_.Value -eq "Intune queued" } | ForEach-Object { Write-StepUpdate "$($_.Key)  (Intune: pending check-in)" WARN }
-$results.GetEnumerator() | Where-Object { $_.Value -eq "FAIL"          } | ForEach-Object { Write-StepUpdate "$($_.Key)" FAIL }
-Write-Host ""
-
-$queued = ($results.Values | Where-Object { $_ -eq "Intune queued" }).Count
-$failed = ($results.Values | Where-Object { $_ -eq "FAIL" }).Count
-Write-Host "  Intune queued : " -NoNewline -ForegroundColor $InfoCol; Write-Host $queued -ForegroundColor $AccentCol -NoNewline; Write-Host "    Failed : " -NoNewline -ForegroundColor $InfoCol; Write-Host "$failed    of $($targets.Count) total" -ForegroundColor $ArtCol
-Write-StepUpdate "Devices install on next Intune check-in. Verify in Intune > the app > Device install status." INFO
-Write-Host ""
-
-# Footer
-$_sfx    = "█"
-$_ffillW = $script:Width - $_artW - 1 - $_sfx.Length
-$_footer = "  DEPLOYMENT COMPLETE"
-$_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $_fver.Length))
-
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host " $_art2" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-#endregion
+if (-not $global:KillerScriptsTestMode) { Invoke-BeamMain }
