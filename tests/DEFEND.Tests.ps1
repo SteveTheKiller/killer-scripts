@@ -406,4 +406,158 @@ Describe 'DEFEND findings 56, 57, 58, 10 and 11' {
             $r.Text | Should -Match 'MSP Stack'
         }
     }
+
+    Context 'finding 10: firewall profiles are enforced and verified, networks are not reclassified' {
+        It 'never changes a connection profile on a workgroup machine with a Public network' {
+            Mock Get-NetConnectionProfile { [pscustomobject]@{ Name = 'Cafe'; NetworkCategory = 'Public' } }
+            $r = Get-Run
+            Should -Invoke Set-NetConnectionProfile -Times 0 -Exactly
+            $r.Text | Should -Not -Match 'Private Security Enforced'
+            $r.Text | Should -Match 'Cafe'
+            $r.Text | Should -Match 'Public'
+        }
+        It 'never tries to set DomainAuthenticated on a domain member' {
+            Mock Get-CimInstance {
+                switch ($ClassName) {
+                    'Win32_Processor'      { [pscustomobject]@{ VirtualizationFirmwareEnabled = $true } }
+                    'Win32_ComputerSystem' { [pscustomobject]@{ PartOfDomain = $true } }
+                    'MSFT_MpComputerStatus' { $script:TestStatus }
+                }
+            }
+            Mock Get-NetConnectionProfile { [pscustomobject]@{ Name = 'corp.local'; NetworkCategory = 'DomainAuthenticated' } }
+            $r = Get-Run
+            Should -Invoke Set-NetConnectionProfile -Times 0 -Exactly
+            $r.Text | Should -Match 'Domain Joined'
+            $r.Text | Should -Not -Match 'Domain Security Enforced'
+            $r.Code | Should -Be 0
+        }
+        It 'enables the Domain, Private and Public profiles and reports the verified result' {
+            $r = Get-Run
+            Should -Invoke Set-NetFirewallProfile -Times 1 -Exactly -ParameterFilter { $Enabled -eq 'True' -and (@($Profile) -join ',') -eq 'Domain,Private,Public' }
+            $r.Text | Should -Match 'Firewall Profiles\s+:\s+Domain=On Private=On Public=On'
+            $r.Code | Should -Be 0
+        }
+        It 'does not claim enforcement when the readback shows a profile still off, and exits 3' {
+            Mock Get-NetFirewallProfile {
+                [pscustomobject]@{ Name = 'Domain'; Enabled = 'True' }
+                [pscustomobject]@{ Name = 'Private'; Enabled = 'True' }
+                [pscustomobject]@{ Name = 'Public'; Enabled = 'False' }
+            }
+            $r = Get-Run
+            $r.Text | Should -Match 'Public=OFF'
+            $r.Text | Should -Not -Match 'Security Enforced'
+            $r.Code | Should -Be 3
+            $r.Lines[-1] | Should -Match '\[WARN\] DEFEND.*firewall.*\(exit 3\)'
+        }
+        It 'reports a refused firewall change and exits 3' {
+            Mock Set-NetFirewallProfile { throw 'Access is denied (policy)' }
+            $r = Get-Run
+            $r.Text | Should -Match 'Access is denied'
+            $r.Code | Should -Be 3
+        }
+        It 'does not claim enforcement when the profiles cannot be read back' {
+            Mock Get-NetFirewallProfile { throw 'readback unavailable' }
+            $r = Get-Run
+            $r.Text | Should -Match 'UNVERIFIED'
+            $r.Code | Should -Be 3
+        }
+    }
+
+    Context 'finding 11: scan result, completion and deadlines (interactive session)' {
+        BeforeAll {
+            function New-FakeScan {
+                param([int]$Polls = 2, [int]$ExitCode = 0, [int]$Id = 4242)
+                $o = [pscustomobject]@{ Id = $Id; ExitCode = $ExitCode; Polls = 0; Limit = $Polls }
+                Add-Member -InputObject $o -MemberType ScriptProperty -Name HasExited -Value { $this.Polls++; $this.Polls -gt $this.Limit }
+                $o
+            }
+        }
+        BeforeEach {
+            Mock Test-DefendInteractive { $true }
+            Mock Get-DefendConsoleValue { 5 }
+            Mock Set-DefendConsolePosition {}
+            Mock Test-DefendKeyAvailable { $false }
+            Mock Stop-DefendScan {}
+            Mock Test-DefendEngineBusy { $false }
+            $script:Now = [datetime]'2030-01-01T00:00:00'
+            $script:NowCalls = 0
+            # One fake minute passes per call. A runaway wait loop throws instead of hanging the suite.
+            Mock Get-DefendNow {
+                $script:NowCalls++
+                if ($script:NowCalls -gt 400) { throw 'runaway wait loop: no deadline' }
+                $script:Now = $script:Now.AddMinutes(1); $script:Now
+            }
+            Mock Start-DefendScanProcess { New-FakeScan -Polls 2 -ExitCode 0 }
+            $script:DoneEvent = [pscustomobject]@{ TimeCreated = [datetime]'2031-01-01'; Message = 'The antimalware scan has finished. Scan Type: Full Scan' }
+            Mock Get-WinEvent { @($script:DoneEvent) }
+        }
+
+        It 'reports COMPLETE and exits 0 when the scan exits 0 and a completion event exists' {
+            $r = Get-Run
+            $r.Text | Should -Match 'Scan Status\s+:\s+COMPLETE'
+            $r.Code | Should -Be 0
+        }
+        It 'reports FAILED with the exit code, not COMPLETE, when the scan process fails' {
+            Mock Start-DefendScanProcess { New-FakeScan -Polls 2 -ExitCode 2 }
+            $r = Get-Run
+            $r.Text | Should -Match 'Scan Status\s+:\s+FAILED \(exit 2\)'
+            $r.Text | Should -Not -Match 'Scan Status\s+:\s+COMPLETE'
+            $r.Code | Should -Be 3
+            $r.Lines[-1] | Should -Match '\[WARN\] DEFEND.*scan.*\(exit 3\)'
+        }
+        It 'does not report COMPLETE when exit 0 is not backed by a completion event' {
+            Mock Get-WinEvent { @() }
+            $r = Get-Run
+            $r.Text | Should -Match 'Scan Status\s+:\s+NOT VERIFIED'
+            $r.Text | Should -Not -Match 'Scan Status\s+:\s+COMPLETE'
+            $r.Code | Should -Be 3
+        }
+        It 'ignores a completion event older than this scan' {
+            $script:DoneEvent = [pscustomobject]@{ TimeCreated = [datetime]'2020-01-01'; Message = 'Full Scan finished' }
+            (Get-Run).Text | Should -Match 'Scan Status\s+:\s+NOT VERIFIED'
+        }
+        It 'stops a quick scan that runs past its deadline and reports TIMED OUT' {
+            $script:KeyCalls = 0
+            Mock Test-DefendKeyAvailable { $script:KeyCalls++; $script:KeyCalls -eq 1 }
+            Mock Read-DefendKey { [pscustomobject]@{ Key = 'Q'; KeyChar = 'q' } }
+            $script:ProcN = 0
+            Mock Start-DefendScanProcess {
+                $script:ProcN++
+                if ($script:ProcN -eq 1) { New-FakeScan -Polls 1000000 -ExitCode 0 -Id 1 } else { New-FakeScan -Polls 1000000 -ExitCode 0 -Id 2 }
+            }
+            $r = Get-Run
+            $r.Text | Should -Match 'Scan Status\s+:\s+TIMED OUT'
+            Should -Invoke Stop-DefendScan -Times 1 -Exactly -ParameterFilter { $Proc.Id -eq 2 }
+            $r.Code | Should -Be 3
+        }
+        It 'gives up on an engine that stays busy after Q and does not start the quick scan' {
+            $script:KeyCalls = 0
+            Mock Test-DefendKeyAvailable { $script:KeyCalls++; $script:KeyCalls -eq 1 }
+            Mock Read-DefendKey { [pscustomobject]@{ Key = 'Q'; KeyChar = 'q' } }
+            $script:BusyCalls = 0
+            Mock Test-DefendEngineBusy { $script:BusyCalls++; if ($script:BusyCalls -gt 300) { throw 'runaway busy wait: no deadline' }; $true }
+            Mock Start-DefendScanProcess { New-FakeScan -Polls 1000000 -ExitCode 0 -Id 1 }
+            $r = Get-Run
+            Should -Invoke Start-DefendScanProcess -Times 1 -Exactly
+            $r.Text | Should -Match 'Scan Status\s+:\s+FAILED'
+            $r.Text | Should -Match 'busy'
+            $r.Code | Should -Be 3
+        }
+        It 'treats Esc as a user skip: SKIPPED BY USER and exit 0' {
+            Mock Test-DefendKeyAvailable { $true }
+            Mock Read-DefendKey { [pscustomobject]@{ Key = 'Escape'; KeyChar = [char]27 } }
+            Mock Start-DefendScanProcess { New-FakeScan -Polls 1000000 -ExitCode 0 }
+            $r = Get-Run
+            $r.Text | Should -Match 'SKIPPED BY USER'
+            $r.Code | Should -Be 0
+        }
+        It 'skips the live scan in a non-interactive session and still exits 0' {
+            Mock Test-DefendInteractive { $false }
+            $r = Get-Run
+            $r.Text | Should -Match 'SKIPPED \(Non-Interactive Session\)'
+            Should -Invoke Start-DefendScanProcess -Times 0 -Exactly
+            $r.Code | Should -Be 0
+        }
+    }
 }
+

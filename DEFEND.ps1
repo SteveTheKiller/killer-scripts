@@ -188,6 +188,10 @@ function ConvertFrom-DefendJson {
 # A threat is active when it was detected and not remediated, or when remediation failed.
 $script:DefendActiveStatus = @(1, 102, 103, 104, 105, 107)
 
+# Bounded waits (RMM jobs time out): the Q-pivot quick scan and the wait for the engine to release its lock.
+$script:DefendQuickScanMinutes = 30
+$script:DefendEngineWaitSeconds = 300
+
 function Get-DefendActiveThreats {
     if ((Get-DefendPSMajor) -ge 6) {
         $det  = ConvertFrom-DefendJson (Invoke-DefendWinPS 'Get-MpThreatDetection | ConvertTo-Json -Depth 3').Output
@@ -365,20 +369,37 @@ function Invoke-DefendMain {
     # --------------------------------------------------------------------------
     Write-Host "[>] Configuring Adaptive Firewall..." -ForegroundColor DarkCyan
 
-    Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True
+    # Every profile is turned on, then read back. Connection categories are left exactly as Windows
+    # classified them (reclassifying a Public network as Private would loosen the firewall, and
+    # DomainAuthenticated cannot be set by hand), so they are only reported.
+    try {
+        Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True -ErrorAction Stop
+    } catch {
+        [void]$script:DefendFailures.Add("firewall profiles could not be enabled: $($_.Exception.Message)")
+        Write-Host "Firewall change refused      : $($_.Exception.Message)" -ForegroundColor Red
+    }
 
     $IsDomainJoined = (Get-CimInstance Win32_ComputerSystem).PartofDomain
+    Write-Field "Context" $(if ($IsDomainJoined) { "Domain Joined" } else { "Workgroup/Standalone" }) "Cyan"
 
-    if ($IsDomainJoined) {
-        Write-Field "Context" "Domain Joined" "Cyan"
-        Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory DomainAuthenticated -ErrorAction SilentlyContinue
-        Write-Field "Action" "Domain Security Enforced" "Green"
+    $FwProfiles = $null
+    try { $FwProfiles = @(Get-NetFirewallProfile -Profile Domain, Private, Public -ErrorAction Stop) } catch { }
+    if ($FwProfiles -and $FwProfiles.Count -gt 0) {
+        $FwParts = foreach ($n in 'Domain', 'Private', 'Public') {
+            $p = $FwProfiles | Where-Object { $_.Name -eq $n } | Select-Object -First 1
+            "{0}={1}" -f $n, $(if ($p -and [string]$p.Enabled -eq 'True') { 'On' } else { 'OFF' })
+        }
+        $FwAllOn = -not ($FwParts -match '=OFF')
+        Write-Field "Firewall Profiles" ($FwParts -join ' ') $(if ($FwAllOn) { "Green" } else { "Red" })
+        if (-not $FwAllOn) { [void]$script:DefendFailures.Add("firewall profile still off after enabling: $(($FwParts | Where-Object { $_ -match '=OFF' }) -join ', ')") }
     } else {
-        Write-Field "Context" "Workgroup/Standalone" "Cyan"
-        Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
-        Write-Field "Action" "Private Security Enforced" "Green"
+        Write-Field "Firewall Profiles" "UNVERIFIED (could not read the profiles back)" "Red"
+        [void]$script:DefendFailures.Add("firewall profile state could not be verified")
     }
-    #endregion
+
+    foreach ($c in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+        Write-Field "Network" ("{0} ({1})" -f $c.Name, $c.NetworkCategory) "Gray"
+    }    #endregion
 
     #region [3] - THREAT INTELLIGENCE SYNC
     # --------------------------------------------------------------------------
@@ -400,6 +421,7 @@ function Invoke-DefendMain {
     $ModeName = "FULL SCAN"
     $Pivoted = $false
     $Skipped = $false
+    $ScanResult = $null   # Complete, Failed, NotVerified or TimedOut once a scan has run
 
     if (-not $IsInteractive) {
         # Non-interactive session (Kaseya LiveConnect, piped, redirected): skip the live scan
@@ -411,14 +433,22 @@ function Invoke-DefendMain {
         $ScanProc = Start-DefendScanProcess -ScanType $ScanType
         $Y = Get-DefendCursorTop
 
-        $res = Wait-DefendScan -Proc $ScanProc -Mode $ModeName -Y $Y -AllowQuick $true
+        # The full scan is watched by a person who can press Esc, so it has no deadline.
+        $res = Wait-DefendScan -Proc $ScanProc -Mode $ModeName -Y $Y -AllowQuick $true -MaxMinutes 0
         if ($res -eq 'Skipped') { $Skipped = $true }
         if ($res -eq 'Pivot') {
             Write-Host "[>] Waiting for Defender engine to release session lock..." -ForegroundColor Gray
+            $lockDeadline = (Get-DefendNow).AddSeconds($script:DefendEngineWaitSeconds)
             do {
                 Start-Sleep -Seconds 5
-            } while (Test-DefendEngineBusy)
-            $Pivoted = $true
+                $busy = Test-DefendEngineBusy
+            } while ($busy -and (Get-DefendNow) -lt $lockDeadline)
+            if ($busy) {
+                $ScanResult = 'Failed'
+                $ScanDetail = "engine still busy after $($script:DefendEngineWaitSeconds) seconds, quick scan not started"
+            } else {
+                $Pivoted = $true
+            }
         }
 
         if ($Pivoted -and -not $Skipped) {
@@ -427,17 +457,43 @@ function Invoke-DefendMain {
             $StartTime = Get-DefendNow
             Write-Host "[!] Pivot Successful: Starting $ModeName... Hit 'Esc' to skip." -ForegroundColor Yellow
             $ScanProc = Start-DefendScanProcess -ScanType $ScanType
-            $res = Wait-DefendScan -Proc $ScanProc -Mode $ModeName -Y $Y -AllowQuick $false
+            $res = Wait-DefendScan -Proc $ScanProc -Mode $ModeName -Y $Y -AllowQuick $false -MaxMinutes $script:DefendQuickScanMinutes
             if ($res -eq 'Skipped') { $Skipped = $true }
+            if ($res -eq 'TimedOut') {
+                $ScanResult = 'TimedOut'
+                $ScanDetail = "$ModeName stopped after $($script:DefendQuickScanMinutes) minutes"
+            }
+        }
+
+        # An exited process is not a finished scan. Check its exit code, then look for the completion event.
+        if (-not $Skipped -and -not $ScanResult) {
+            $code = $ScanProc.ExitCode
+            if ($null -eq $code -or [int]$code -ne 0) {
+                $ScanResult = 'Failed'
+                $ScanDetail = "$ModeName exit " + $(if ($null -eq $code) { "code unavailable" } else { [string]$code })
+            } elseif (-not (Test-DefendScanCompleted -Since $StartTime)) {
+                $ScanResult = 'NotVerified'
+                $ScanDetail = "$ModeName exited 0 but Defender logged no completion event"
+            } else {
+                $ScanResult = 'Complete'
+            }
         }
 
         if ($Skipped) {
             Write-Field "Scan Status" "SKIPPED BY USER" "Yellow"
         } else {
-            Write-Field "Scan Status" "COMPLETE" "Green"
+            switch ($ScanResult) {
+                'Complete'    { Write-Field "Scan Status" "COMPLETE" "Green" }
+                'Failed'      {
+                    $shown = if ($ScanDetail -match 'exit (\d+)$') { "FAILED (exit $($Matches[1]))" } else { "FAILED ($ScanDetail)" }
+                    Write-Field "Scan Status" $shown "Red"
+                }
+                'NotVerified' { Write-Field "Scan Status" "NOT VERIFIED (no completion event)" "Yellow" }
+                'TimedOut'    { Write-Field "Scan Status" "TIMED OUT ($ScanDetail)" "Red" }
+            }
+            if ($ScanResult -and $ScanResult -ne 'Complete') { [void]$script:DefendFailures.Add("scan did not complete: $ScanDetail") }
         }
-    }
-    #endregion
+    }    #endregion
 
     #region [5] - THREAT IDENTIFICATION & AUDIT
     # --------------------------------------------------------------------------
@@ -516,9 +572,17 @@ function Invoke-DefendMain {
     Exit-KillerScript 0
 }
 
+function Test-DefendScanCompleted {
+    # True when Defender logged a scan-completed event (1001) at or after the given time.
+    param([datetime]$Since)
+    $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 1001; StartTime = $Since } -ErrorAction SilentlyContinue |
+            Where-Object { $_.TimeCreated -ge $Since })
+    $ev.Count -gt 0
+}
+
 function Wait-DefendScan {
-    # Waits for a scan process. Returns Exited, Skipped (Esc) or Pivot (Q).
-    param($Proc, [string]$Mode, [int]$Y, [bool]$AllowQuick)
+    # Waits for a scan process. Returns Exited, Skipped (Esc), Pivot (Q) or TimedOut (MaxMinutes, 0 = no limit).
+    param($Proc, [string]$Mode, [int]$Y, [bool]$AllowQuick, [int]$MaxMinutes = 0)
     $start = Get-DefendNow
     while (-not $Proc.HasExited) {
         if (Test-DefendKeyAvailable) {
@@ -526,7 +590,9 @@ function Wait-DefendScan {
             if ($key -and $key.Key -eq 'Escape') { Stop-DefendScan $Proc; return 'Skipped' }
             if ($key -and $AllowQuick -and $key.KeyChar -eq 'q') { Stop-DefendScan $Proc; return 'Pivot' }
         }
-        $timer = "{0:hh\:mm\:ss}" -f ((Get-DefendNow) - $start)
+        $elapsed = (Get-DefendNow) - $start
+        if ($MaxMinutes -gt 0 -and $elapsed.TotalMinutes -ge $MaxMinutes) { Stop-DefendScan $Proc; return 'TimedOut' }
+        $timer = "{0:hh\:mm\:ss}" -f $elapsed
         if ($Y -ge 0 -and (Set-DefendCursor 0 $Y)) {
             Write-Host ("Scan Activity : RUNNING ($Mode) [$timer]".PadRight(100)) -NoNewline
         }
@@ -535,5 +601,4 @@ function Wait-DefendScan {
     if ($Y -ge 0 -and (Set-DefendCursor 0 $Y)) { Write-Host (" " * 100) -NoNewline; [void](Set-DefendCursor 0 $Y) }
     'Exited'
 }
-
 if (-not $global:KillerScriptsTestMode) { Invoke-DefendMain }
