@@ -502,6 +502,10 @@ function Get-PEEKProcessSnapshot {
         $start = $null
         try { $start = [datetime]$process.StartTime } catch {}
 
+        # Path is unreadable for some protected processes and from a 32-bit host. Blank means unknown.
+        $exePath = ""
+        try { if ($process.Path) { $exePath = [string]$process.Path } } catch {}
+
         $rank = 99
         if ($priority.ContainsKey($process.ProcessName)) { $rank = [int]$priority[$process.ProcessName] }
 
@@ -512,6 +516,7 @@ function Get-PEEKProcessSnapshot {
             RAMMB    = [Math]::Round($process.WorkingSet64 / 1MB, 1)
             Start    = $start
             Priority = $rank
+            Path     = $exePath
         }
     }
 
@@ -862,8 +867,26 @@ function Get-PEEKSystemState {
     $now = Get-Date
     $processNames = @($Processes | ForEach-Object { $_.Name })
     $strongInstallProcess = @($processNames | Where-Object {
-        $_ -match '^(Windows11InstallationAssistant|setup|setuphost|setupprep|wuaulcore|TiWorker)$'
+        $_ -match '^(Windows11InstallationAssistant|setuphost|setupprep|wuaulcore|TiWorker)$'
     }).Count -gt 0
+
+    # "setup" is a generic name that any installer uses. It only counts as Windows servicing when
+    # it runs from the Windows Setup staging folder or the Panther setup log is being written.
+    if (-not $strongInstallProcess) {
+        $setupProcesses = @($Processes | Where-Object { $_.Name -eq 'setup' })
+        if ($setupProcesses.Count -gt 0) {
+            if ($Setup.Active) {
+                $strongInstallProcess = $true
+            } else {
+                foreach ($candidate in $setupProcesses) {
+                    if ($candidate.Path -and ([string]$candidate.Path) -like '*\$WINDOWS.~BT\*') {
+                        $strongInstallProcess = $true
+                        break
+                    }
+                }
+            }
+        }
+    }
     $trustedInstallerProcess = @($processNames | Where-Object { $_ -eq 'TrustedInstaller' }).Count -gt 0
     $orchestratorProcess = @($processNames | Where-Object { $_ -match '^(MoUsoCoreWorker|UsoClient)$' }).Count -gt 0
 
@@ -892,7 +915,9 @@ function Get-PEEKSystemState {
     $rebootAction = "NO REBOOT REQUIRED"
     $rebootColor = $script:DoneFG
 
-    if ($targetInstalled) {
+    $liveServicing = ($installProcess -or $Setup.Active)
+
+    if ($targetInstalled -and -not $liveServicing) {
         $state = "FEATURE UPDATE COMPLETE - $($UpdateContext.FeatureTarget) INSTALLED"
         $stateColor = $script:DoneFG
     }
@@ -943,7 +968,7 @@ function Get-PEEKSystemState {
         $stateColor = $AccentCol
     }
 
-    if ($activeStart -or $installProcess -or $Setup.Active) {
+    if (($activeStart -and -not $targetInstalled) -or $liveServicing) {
         $rebootAction = "DO NOT REBOOT - SERVICING ACTIVE OR INCOMPLETE"
         $rebootColor = $script:FailFG
     }
