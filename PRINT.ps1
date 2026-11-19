@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    PRINTER RESPONSE & INTERFACE NETWORK TOOL (PRINT) v1.0
-    Developed by SteveTheKiller | Updated: 2026-03-14
+    PRINTER RESPONSE & INTERFACE NETWORK TOOL (PRINT) v2.0
+    Developed by SteveTheKiller | Updated: 2026-11-19
 .DESCRIPTION
     Printer management utility that inventories, adds, and removes devices. Features a
     multi-threaded network scanner that discovers printers on the local subnet via port
@@ -13,27 +13,45 @@
     Parameters:
       -Silent     Non-interactive mode, lists printers only.
     Exit Codes:
-      0  - Completed successfully
-      3  - Insufficient privileges
+      0  - Success
+      1  - Failure
+      2  - Not elevated, or a precondition failed (for example no console and no -Silent)
+      3  - Partial success (some changes succeeded, some failed)
 #>
 param(
     [switch]$Silent
 )
 
-$EXIT_SUCCESS = 0
-$EXIT_DENIED  = 3
-
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Warning "Elevation Required: Please run as Administrator."
-    Exit $EXIT_DENIED
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
 }
 
+# --- System boundaries (thin wrappers so tests can replace them) ---
+function Test-PrintElevated {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function Test-PrintInteractive {
+    try { [Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected } catch { $false }
+}
+function Read-PrintKey {
+    # Returns $null when there is no console, so callers treat it as ESC and never spin.
+    try { [Console]::ReadKey($true) } catch { $null }
+}
+function Test-PrintIppSupported {
+    # Add-Printer -IppURL exists on newer Windows 10/11 and Server builds only.
+    try { (Get-Command Add-Printer -ErrorAction Stop).Parameters.ContainsKey('IppURL') } catch { $false }
+}
+function Get-PrintCursorTop { try { [Console]::CursorTop } catch { -1 } }
+function Set-PrintCursor {
+    param([int]$Left, [int]$Top)
+    try { [Console]::SetCursorPosition($Left, $Top) } catch { }
+}
 #region [0] - HELPERS & THEME
 # ============================================================================
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-
 $script:Width   = 85
-$script:Version = "v1.0"
+$script:Version = "v2.0"
 
 $LineCol   = "Green"
 $MainCol   = "Yellow"
@@ -65,7 +83,8 @@ function Read-Input {
     # Like Read-Host but returns $null on ESC (caller treats $null as "back")
     $buf = ""
     while ($true) {
-        $k = [Console]::ReadKey($true)
+        $k = Read-PrintKey
+        if ($null -eq $k)                        { return $null }
         if ($k.Key -eq [ConsoleKey]::Escape)     { Write-Host ""; return $null }
         if ($k.Key -eq [ConsoleKey]::Enter)      { Write-Host ""; return $buf  }
         if ($k.Key -eq [ConsoleKey]::Backspace) {
@@ -81,7 +100,7 @@ function Read-Input {
 }
 
 function Write-Banner {
-    Clear-Host
+    try { Clear-Host } catch { }
     $_pfx  = "█  "
     $_art1 = "╔═╗ ╦═╗ ╦ ╔╗╔ ╔╦╗ "
     $_art2 = "╠═╝ ╠╦╝ ║ ║║║  ║  "
@@ -128,18 +147,63 @@ function Show-PrinterList {
 
 #region [1] - NETWORK SCAN & DETECTION
 # ============================================================================
-function Get-LocalSubnet {
-    $adapter = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.PrefixOrigin -ne 'WellKnown' -and
-                       $_.IPAddress -notlike '169.*'   -and
-                       $_.IPAddress -ne '127.0.0.1' } |
-        Sort-Object PrefixLength -Descending |
-        Select-Object -First 1
-    if (-not $adapter) { return $null }
-    $parts = $adapter.IPAddress -split '\.'
-    return "$($parts[0]).$($parts[1]).$($parts[2])"
+function ConvertTo-PrintUInt32 {
+    param([string]$IP)
+    $o = $IP.Split('.')
+    [long]([long]$o[0] * 16777216 + [long]$o[1] * 65536 + [long]$o[2] * 256 + [long]$o[3])
+}
+function ConvertFrom-PrintUInt32 {
+    param([long]$N)
+    "{0}.{1}.{2}.{3}" -f (($N -shr 24) -band 255), (($N -shr 16) -band 255), (($N -shr 8) -band 255), ($N -band 255)
 }
 
+function Get-PrintScanRange {
+    # Host addresses of the network that IPAddress/PrefixLength belongs to, excluding the network and
+    # broadcast addresses. Networks larger than a /22 are bounded to the /24 around the host.
+    # Returns $null when the input is invalid or the network has no scannable hosts (/31, /32).
+    param([string]$IPAddress, [int]$PrefixLength)
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($IPAddress, [ref]$parsed)) { return $null }
+    if ($parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { return $null }
+    if ($PrefixLength -lt 0 -or $PrefixLength -gt 30) { return $null }
+    $note = $null
+    $prefix = $PrefixLength
+    if ($prefix -lt 22) {
+        $note = "/$PrefixLength is too large to scan, limiting to the /24 around $IPAddress"
+        $prefix = 24
+    }
+    $ip      = ConvertTo-PrintUInt32 $IPAddress
+    $mask    = (4294967295 -shl (32 - $prefix)) -band 4294967295
+    $network = $ip -band $mask
+    $bcast   = $network + (4294967295 -bxor $mask)
+    $addrs   = New-Object System.Collections.Generic.List[string]
+    for ($n = $network + 1; $n -lt $bcast; $n++) { $addrs.Add((ConvertFrom-PrintUInt32 $n)) }
+    [pscustomobject]@{
+        Label     = "$(ConvertFrom-PrintUInt32 $network)/$prefix"
+        Addresses = $addrs.ToArray()
+        Note      = $note
+    }
+}
+
+function Get-PrintScanTarget {
+    # Scan range for the interface that owns the best IPv4 default route (lowest route + interface metric).
+    # Returns $null when there is no default route or no usable address on it.
+    $routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+    if ($routes.Count -eq 0) { return $null }
+    $ifMetric = @{}
+    foreach ($i in @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue)) { $ifMetric[[int]$i.InterfaceIndex] = [int]$i.InterfaceMetric }
+    $ordered = $routes | Sort-Object { [int]$_.RouteMetric + [int]$ifMetric[[int]$_.InterfaceIndex] }
+    $all = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+    foreach ($r in $ordered) {
+        $addr = $all | Where-Object { $_.InterfaceIndex -eq $r.InterfaceIndex -and
+                                      $_.IPAddress -notlike '169.254.*' -and
+                                      $_.IPAddress -notlike '127.*' } | Select-Object -First 1
+        if (-not $addr) { continue }
+        $range = Get-PrintScanRange -IPAddress $addr.IPAddress -PrefixLength ([int]$addr.PrefixLength)
+        if ($range) { return $range }
+    }
+    return $null
+}
 function Get-PrinterModel {
     param([string]$IP)
     try {
@@ -155,21 +219,21 @@ function Get-PrinterModel {
 }
 
 function Invoke-PrinterScan {
-    param([string]$Subnet)
+    param([string[]]$Addresses, [string]$Label)
     $e       = [char]27
     $spinner = @('|','/','-','\')
     $tick    = 0
     $ports   = @(9100, 631)
     $timeout = 600
 
-    Write-Host -NoNewline "      > Scanning $Subnet.0/24..." -ForegroundColor $DimCol
+    Write-Host -NoNewline "      > Scanning $Label..." -ForegroundColor $DimCol
 
     $found = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
     $pool  = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 60)
     $pool.Open()
 
-    $jobs = 1..254 | ForEach-Object {
-        $ip = "$Subnet.$_"
+    $jobs = $Addresses | ForEach-Object {
+        $ip = $_
         $ps = [System.Management.Automation.PowerShell]::Create()
         $ps.RunspacePool = $pool
         $ps.AddScript({
@@ -188,7 +252,7 @@ function Invoke-PrinterScan {
     }
 
     while ($jobs | Where-Object { -not $_.Handle.IsCompleted }) {
-        Write-Host -NoNewline "${e}[2K`r      > Scanning $Subnet.0/24... $($spinner[$tick % 4])  ($($found.Count) found)" -ForegroundColor $DimCol
+        Write-Host -NoNewline "${e}[2K`r      > Scanning $Label... $($spinner[$tick % 4])  ($($found.Count) found)" -ForegroundColor $DimCol
         $tick++; Start-Sleep -Milliseconds 150
     }
     foreach ($j in $jobs) { $j.PS.Dispose() }
@@ -216,6 +280,16 @@ function Find-PrinterDriver {
     return "Microsoft IPP Class Driver"
 }
 #endregion
+
+function Resolve-PrintDriverChoice {
+    # Maps a typed 1-based driver ID to a driver. Empty, 0, non-numeric or out-of-range input returns $null
+    # so the caller keeps the suggested driver instead of indexing -1 (the last driver).
+    param([object[]]$Drivers, [string]$Raw)
+    $n = 0
+    if (-not [int]::TryParse(("$Raw").Trim(), [ref]$n)) { return $null }
+    if ($n -lt 1 -or $n -gt @($Drivers).Count) { return $null }
+    return @($Drivers)[$n - 1]
+}
 
 #region [2] - ADD WIZARD
 # ============================================================================
@@ -246,8 +320,8 @@ function Invoke-AddPrinterWizard {
         Write-Host "  " -NoNewline; Write-Host "[ESC]" -NoNewline -ForegroundColor Gray; Write-Host " Back" -ForegroundColor $DimCol
         Write-Host ""
         Write-Host "  Choice: " -NoNewline -ForegroundColor $LineCol
-        $key = [Console]::ReadKey($true)
-        if ($key.Key -eq [ConsoleKey]::Escape) { return }
+        $key = Read-PrintKey
+        if ($null -eq $key -or $key.Key -eq [ConsoleKey]::Escape) { return }
         $addChoice = $key.KeyChar.ToString()
         Write-Host $addChoice
 
@@ -256,13 +330,14 @@ function Invoke-AddPrinterWizard {
 
         switch ($addChoice) {
             '1' {
-                $subnet = Get-LocalSubnet
-                if (-not $subnet) {
-                    Write-Host "`n  [!] Could not determine local subnet." -ForegroundColor Red
+                $target = Get-PrintScanTarget
+                if (-not $target) {
+                    Write-Host "`n  [!] Could not determine the local network from the default route. Enter the IP manually." -ForegroundColor Red
                     Start-Sleep -Seconds 2; continue addmenu
                 }
                 Write-WizardBanner "Network Scan"
-                $ips = @(Invoke-PrinterScan -Subnet $subnet)
+                if ($target.Note) { Write-Host "      > $($target.Note)" -ForegroundColor $WarnCol }
+                $ips = @(Invoke-PrinterScan -Addresses $target.Addresses -Label $target.Label)
                 if ($ips.Count -eq 0) {
                     Write-Host "  [!] No printers found. Try entering the IP manually." -ForegroundColor $WarnCol
                     Start-Sleep -Seconds 2; continue addmenu
@@ -328,11 +403,13 @@ function Invoke-AddPrinterWizard {
                         Rename-Printer -InputObject $added -NewName $fname -ErrorAction SilentlyContinue
                     }
                     Write-Host "      > '$fname' added successfully." -ForegroundColor $OkCol
+                    $script:PrintSuccesses++
                 } catch {
+                    $script:PrintFailures++
                     Write-Host "      [!] Failed: $($_.Exception.Message)" -ForegroundColor Red
                 }
                 Write-Host ""; Write-Host "  Press any key..." -ForegroundColor $DimCol
-                [Console]::ReadKey($true) | Out-Null; return
+                Read-PrintKey | Out-Null; return
             }
 
             default { continue addmenu }
@@ -370,8 +447,8 @@ function Invoke-AddPrinterWizard {
                     Write-Host "  " -NoNewline; Write-Host "[C]" -NoNewline -ForegroundColor Gray; Write-Host " Choose from installed drivers" -ForegroundColor $MainCol
                     Write-Host "  " -NoNewline; Write-Host "[P]" -NoNewline -ForegroundColor Gray; Write-Host " Provide INF file path" -ForegroundColor $MainCol
                     Write-Host "  Choice [A]: " -NoNewline -ForegroundColor $LineCol
-                    $drvKey    = [Console]::ReadKey($true)
-                    if ($drvKey.Key -eq [ConsoleKey]::Escape) { break wizloop }
+                    $drvKey    = Read-PrintKey
+                    if ($null -eq $drvKey -or $drvKey.Key -eq [ConsoleKey]::Escape) { break wizloop }
                     $drvChoice = $drvKey.KeyChar.ToString().ToUpper()
                     Write-Host $(if ($drvChoice -in 'C','P') { $drvChoice } else { "A" })
 
@@ -391,7 +468,7 @@ function Invoke-AddPrinterWizard {
                             Write-Host "  Select driver ID: " -NoNewline -ForegroundColor $LineCol
                             $drvRaw = Read-Input
                             if ($null -eq $drvRaw) { continue wizloop }
-                            $drvSel = $allDrivers[[int]$drvRaw - 1]
+                            $drvSel = Resolve-PrintDriverChoice -Drivers $allDrivers -Raw $drvRaw
                             if ($drvSel) { $driverName = $drvSel.Name } else { Write-Host "  Invalid - using suggested." -ForegroundColor $WarnCol }
                         }
                     } elseif ($drvChoice -eq 'P') {
@@ -445,7 +522,8 @@ function Invoke-AddPrinterWizard {
                     Write-Host "  " -NoNewline; Write-Host "[1]" -NoNewline -ForegroundColor Gray; Write-Host " RAW / JetDirect  (port 9100)  - recommended" -ForegroundColor $MainCol
                     Write-Host "  " -NoNewline; Write-Host "[2]" -NoNewline -ForegroundColor Gray; Write-Host " IPP              (port 631)   - fallback" -ForegroundColor $MainCol
                     Write-Host "  Choice [1]: " -NoNewline -ForegroundColor $LineCol
-                    $protoKey = [Console]::ReadKey($true)
+                    $protoKey = Read-PrintKey
+                    if ($null -eq $protoKey) { return }
                     if ($protoKey.Key -eq [ConsoleKey]::Escape) { $wizStep = 1; continue wizloop }
                     $proto   = $protoKey.KeyChar.ToString()
                     $useIPP  = ($proto -eq '2')
@@ -454,9 +532,33 @@ function Invoke-AddPrinterWizard {
 
                     # --- Install ---
                     Write-Host ""
-                    $portName   = "IP_$targetIP"
-                    $portExists = Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue
+                    $portName = $null
                     try {
+                        if ($useIPP) {
+                            # IPP is HTTP, so a raw TCP/IP port on 631 cannot print. Use the native IPP queue.
+                            if (-not (Test-PrintIppSupported)) {
+                                throw "This Windows build cannot add IPP printers natively (Add-Printer has no -IppURL). Choose RAW (port 9100) or update Windows."
+                            }
+                            $ippUrl = "http://${targetIP}:631/ipp/print"
+                            Write-Host "      > Adding IPP printer '$fname' ($ippUrl, Microsoft IPP Class Driver)..." -ForegroundColor $DimCol
+                            Add-Printer -Name $fname -IppURL $ippUrl -ErrorAction Stop
+                            Write-Host "      > '$fname' installed successfully." -ForegroundColor $OkCol
+                            $script:PrintSuccesses++
+                            Write-Host ""; Write-Host "  Press any key to continue..." -ForegroundColor $DimCol
+                            Read-PrintKey | Out-Null
+                            return
+                        }
+                        # RAW: reuse a same-IP port only when it is a TCP/IP port to this host on 9100.
+                        $portName   = "IP_$targetIP"
+                        $portExists = Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue
+                        if ($portExists -and -not ($portExists.PortNumber -eq $portNum -and $portExists.PrinterHostAddress -eq $targetIP)) {
+                            Write-Host "      > Port $portName exists with different settings, using a separate RAW port." -ForegroundColor $DimCol
+                            $portName   = "IP_${targetIP}_$portNum"
+                            $portExists = Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue
+                            if ($portExists -and -not ($portExists.PortNumber -eq $portNum -and $portExists.PrinterHostAddress -eq $targetIP)) {
+                                throw "Port $portName already exists with different settings. Remove it in Print Server Properties and try again."
+                            }
+                        }
                         if (-not $portExists) {
                             Write-Host "      > Creating port $portName (port $portNum)..." -ForegroundColor $DimCol
                             Add-PrinterPort -Name $portName -PrinterHostAddress $targetIP -PortNumber $portNum -ErrorAction Stop
@@ -477,12 +579,14 @@ function Invoke-AddPrinterWizard {
                         Write-Host "      > Adding printer '$fname'..." -ForegroundColor $DimCol
                         Add-Printer -Name $fname -DriverName $driverName -PortName $portName -ErrorAction Stop
                         Write-Host "      > '$fname' installed successfully." -ForegroundColor $OkCol
+                        $script:PrintSuccesses++
                     } catch {
+                        $script:PrintFailures++
                         Write-Host "      [!] Failed: $($_.Exception.Message)" -ForegroundColor Red
                     }
 
                     Write-Host ""; Write-Host "  Press any key to continue..." -ForegroundColor $DimCol
-                    [Console]::ReadKey($true) | Out-Null
+                    Read-PrintKey | Out-Null
                     return
                 }
             }
@@ -511,8 +615,8 @@ function Invoke-DeletePrinter {
     Write-Host ""
     Write-Host "  Remove '$($target.Name)'? " -NoNewline -ForegroundColor $WarnCol
     Write-Host "[Y/N]: " -NoNewline -ForegroundColor $DimCol
-    $confirmKey = [Console]::ReadKey($true)
-    if ($confirmKey.Key -eq [ConsoleKey]::Escape) { return }
+    $confirmKey = Read-PrintKey
+    if ($null -eq $confirmKey -or $confirmKey.Key -eq [ConsoleKey]::Escape) { return }
     $confirm = $confirmKey.KeyChar.ToString().ToUpper()
     Write-Host $confirm
 
@@ -520,7 +624,9 @@ function Invoke-DeletePrinter {
         try {
             Remove-Printer -Name $target.Name -ErrorAction Stop
             Write-Host "  '$($target.Name)' removed." -ForegroundColor $OkCol
+            $script:PrintSuccesses++
         } catch {
+            $script:PrintFailures++
             Write-Host "  [!] $($_.Exception.Message)" -ForegroundColor Red
         }
         Start-Sleep -Seconds 1
@@ -528,53 +634,106 @@ function Invoke-DeletePrinter {
 }
 #endregion
 
-#region [4] - MAIN LOOP
-if ($Silent) {
-    Write-Banner
-    Get-Printer | Sort-Object Name | Format-Table Name, DriverName, PortName -AutoSize
-    exit $EXIT_SUCCESS
-}
-
-$printers  = @()
-$running   = $true
-$e         = [char]27
-while ($running) {
-    Write-Banner
-    Show-PrinterList -PrinterRef ([ref]$printers)
-    Write-Host ""
-    $script:MenuRow = [Console]::CursorTop
-    Write-HLine
-    Write-Host "  " -NoNewline
-    Write-Host "[A]" -NoNewline -ForegroundColor Gray;  Write-Host " Add   "  -NoNewline -ForegroundColor $MainCol
-    Write-Host "[D]" -NoNewline -ForegroundColor Gray;  Write-Host " Delete   " -NoNewline -ForegroundColor $MainCol
-    Write-Host "[Q]" -NoNewline -ForegroundColor Gray;  Write-Host " Quit"    -ForegroundColor $MainCol
-    Write-Host "  Choice: " -NoNewline -ForegroundColor $LineCol
-    $key    = [Console]::ReadKey($true)
-    $choice = $key.KeyChar.ToString().ToUpper()
-    Write-Host $choice
-
-    if ($key.Key -eq [ConsoleKey]::Escape) { $running = $false; continue }
-
-    switch ($choice) {
-        'A' { Invoke-AddPrinterWizard }
-        'D' { Invoke-DeletePrinter -Printers $printers }
-        'Q' { $running = $false }
-    }
-}
-#endregion
-
-#region [5] - FOOTER
+#region [4] - MAIN
 # ============================================================================
-[Console]::SetCursorPosition(0, $script:MenuRow)
-Write-Host "${e}[0J" -NoNewline  # clear from cursor to end of screen
-$_sfx    = "█"
-$_ftrW   = $script:ArtW + 1
-$_ffillW = $script:Width - $_ftrW - $_sfx.Length
-$_footer = "  PRINT SEQUENCE COMPLETE"
-$_fpad   = " " * ($_ffillW - $_footer.Length - $script:Ver.Length)
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $($script:Art1)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
-Write-Host "$_footer$_fpad$($script:Ver)" -ForegroundColor $MainCol  -NoNewline; Write-Host " $($script:Art2)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $($script:Art3)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
+function Write-PrintFooter {
+    $e = [char]27
+    $top = Get-PrintCursorTop
+    if ($top -ge 0 -and $script:MenuRow -ge 0) {
+        Set-PrintCursor -Left 0 -Top $script:MenuRow
+        Write-Host "${e}[0J" -NoNewline  # clear from cursor to end of screen
+    }
+    $_sfx    = "█"
+    $_ftrW   = $script:ArtW + 1
+    $_ffillW = $script:Width - $_ftrW - $_sfx.Length
+    $_footer = "  PRINT SEQUENCE COMPLETE"
+    $_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $script:Ver.Length))
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $($script:Art1)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
+    Write-Host "$_footer$_fpad$($script:Ver)" -ForegroundColor $MainCol  -NoNewline; Write-Host " $($script:Art2)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $($script:Art3)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
+}
+
+function Invoke-PrintMain {
+    param([switch]$Silent)
+    $script:PrintFailures  = 0
+    $script:PrintSuccesses = 0
+    $script:MenuRow        = -1
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+    if (-not (Test-PrintElevated)) {
+        Write-Warning "Elevation Required: Please run as Administrator."
+        Write-Output "[FAIL] PRINT not elevated, nothing was changed (exit 2)"
+        Exit-KillerScript 2
+        return
+    }
+
+    if ($Silent) {
+        Write-Banner
+        try {
+            $list = @(Get-Printer -ErrorAction Stop | Sort-Object Name)
+        } catch {
+            Write-Output "[FAIL] PRINT could not list printers: $($_.Exception.Message) (exit 1)"
+            Exit-KillerScript 1
+            return
+        }
+        $list | Format-Table Name, DriverName, PortName -AutoSize | Out-String -Width 200 | Write-Host
+        Write-Output "[PASS] PRINT listed $($list.Count) printer(s) (exit 0)"
+        Exit-KillerScript 0
+        return
+    }
+
+    if (-not (Test-PrintInteractive)) {
+        Write-Output "[FAIL] PRINT needs an interactive console. Re-run with -Silent to list printers. Nothing was changed (exit 2)"
+        Exit-KillerScript 2
+        return
+    }
+
+    $printers  = @()
+    $running   = $true
+    while ($running) {
+        Write-Banner
+        Show-PrinterList -PrinterRef ([ref]$printers)
+        Write-Host ""
+        $script:MenuRow = Get-PrintCursorTop
+        Write-HLine
+        Write-Host "  " -NoNewline
+        Write-Host "[A]" -NoNewline -ForegroundColor Gray;  Write-Host " Add   "  -NoNewline -ForegroundColor $MainCol
+        Write-Host "[D]" -NoNewline -ForegroundColor Gray;  Write-Host " Delete   " -NoNewline -ForegroundColor $MainCol
+        Write-Host "[Q]" -NoNewline -ForegroundColor Gray;  Write-Host " Quit"    -ForegroundColor $MainCol
+        Write-Host "  Choice: " -NoNewline -ForegroundColor $LineCol
+        $key = Read-PrintKey
+        if ($null -eq $key) {
+            Write-Output "[FAIL] PRINT lost its console input and stopped (exit 1)"
+            Exit-KillerScript 1
+            return
+        }
+        $choice = $key.KeyChar.ToString().ToUpper()
+        Write-Host $choice
+
+        if ($key.Key -eq [ConsoleKey]::Escape) { $running = $false; continue }
+
+        switch ($choice) {
+            'A' { Invoke-AddPrinterWizard }
+            'D' { Invoke-DeletePrinter -Printers $printers }
+            'Q' { $running = $false }
+        }
+    }
+
+    Write-PrintFooter
+
+    if ($script:PrintFailures -gt 0 -and $script:PrintSuccesses -gt 0) {
+        Write-Output "[WARN] PRINT partial: $($script:PrintSuccesses) change(s) succeeded, $($script:PrintFailures) failed (exit 3)"
+        Exit-KillerScript 3
+        return
+    }
+    if ($script:PrintFailures -gt 0) {
+        Write-Output "[FAIL] PRINT: $($script:PrintFailures) change(s) failed, none succeeded (exit 1)"
+        Exit-KillerScript 1
+        return
+    }
+    Write-Output "[PASS] PRINT complete: $($script:PrintSuccesses) change(s) made (exit 0)"
+    Exit-KillerScript 0
+}
 #endregion
 
-exit $EXIT_SUCCESS
+if (-not $global:KillerScriptsTestMode) { Invoke-PrintMain -Silent:$Silent }
