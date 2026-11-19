@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v17.0
-    Developed by Steve the Killer | Updated: 2026-09-29
+    Advanced Maintenance, Optimization, and Repair Tool (AMORT) v18.0
+    Developed by Steve the Killer | Updated: 2026-11-18
 .DESCRIPTION
     One-step Windows 10/11 disk-space reclamation and integrity repair for MSP
     field and remote use. Built to be safe on personal and business machines
@@ -512,7 +512,7 @@ function Invoke-AmortCleanup {
         [switch]$RemoveRollback
     )
 $TempAgeDays = 2
-$_fver   = "| v17.0"
+$_fver   = "| v18.0"
 #region Pre-Flight Checks
 # ============================================================================
 # Force UTF-8 output so box-drawing characters render correctly
