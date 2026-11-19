@@ -326,3 +326,80 @@ Describe 'Finding 52: the update cache is not wiped while USO is running' {
         Should -Invoke Clear-RecycleBin -Times 1 -Exactly
     }
 }
+
+Describe 'Finding 13: only DEPOT-owned processes are stopped' {
+    BeforeAll {
+        function New-FakeProc {
+            param($ExitCode = 0, [int]$ProcessId = 4242, [bool]$Exits = $true)
+            $p = [pscustomobject]@{ Id = $ProcessId; ExitCode = $ExitCode; Handle = [IntPtr]::Zero; HasExited = $Exits }
+            $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $this.HasExited } -Force
+            $p
+        }
+        function New-Row {
+            param([int]$ProcessId, [int]$ParentId, [string]$Name, [string]$Path = '', [string]$Cmd = '')
+            [pscustomobject]@{ ProcessId = $ProcessId; ParentProcessId = $ParentId; Name = $Name; ExecutablePath = $Path; CommandLine = $Cmd }
+        }
+    }
+
+    BeforeEach {
+        Reset-DepotState
+        $script:Killed = @()
+        $script:Rows = @(
+            (New-Row 100 4   'chrome.exe'   'C:\Program Files\Google\Chrome\Application\chrome.exe' '"chrome.exe"'),
+            (New-Row 101 4   'msiexec.exe'  'C:\Windows\System32\msiexec.exe' 'msiexec.exe /i "C:\Other\LineOfBusiness.msi"'),
+            (New-Row 102 4   'TrustedInstaller.exe' 'C:\Windows\servicing\TrustedInstaller.exe' ''),
+            (New-Row 103 4   '7zFM.exe'     'C:\Program Files\7-Zip\7zFM.exe' '"7zFM.exe"'),
+            (New-Row 200 4   'setup.exe'    'C:\Windows\Temp\ODT\setup.exe' '"C:\Windows\Temp\ODT\setup.exe" /configure x.xml'),
+            (New-Row 201 4   'msiexec.exe'  'C:\Windows\System32\msiexec.exe' 'msiexec.exe /i "C:\Windows\Temp\ChromeEnterprise.msi" /qn'),
+            (New-Row 500 4   'TeamsSetup.exe' 'C:\Windows\Temp\TeamsSetup.exe' ''),
+            (New-Row 501 500 'child.exe'    'C:\Windows\Temp\x\child.exe' ''),
+            (New-Row 502 501 'grandchild.exe' 'C:\Windows\System32\grandchild.exe' '')
+        )
+        Mock Write-Host { }
+        Mock Start-Sleep { }
+        Mock Get-DepotProcessInfo { $script:Rows }
+        Mock Get-Process {
+            $script:Rows | Where-Object { -not $Name -or $_.Name -replace '\.exe$', '' -in $Name } |
+                ForEach-Object { [pscustomobject]@{ Name = ($_.Name -replace '\.exe$', ''); Path = $_.ExecutablePath; Id = $_.ProcessId } }
+        }
+        Mock Stop-Process {
+            if ($Id) { $script:Killed += $Id } elseif ($InputObject) { $script:Killed += $InputObject.Id } elseif ($Name) { $script:Killed += "name:$Name" }
+        }
+        Mock Test-DepotEscPressed { $false }
+        Mock Start-Process { New-FakeProc -ExitCode 0 -ProcessId 500 -Exits $false }
+    }
+
+    It 'the startup cleanup stops only processes running from DEPOT temp files' {
+        Stop-DepotLeftoverProcess
+        ($script:Killed | Sort-Object) -join ',' | Should -Be '200,201,500'
+    }
+
+    It 'cancelling with ESC stops the launched process tree and nothing else' {
+        Mock Test-DepotEscPressed { $true }
+        $r = Start-Installer -FilePath 'C:\Windows\Temp\TeamsSetup.exe' -ArgumentList '/silent'
+        $r | Should -BeNullOrEmpty
+        ($script:Killed | Sort-Object) -join ',' | Should -Be '500,501,502'
+    }
+
+    It 'a timeout stops the launched process tree, not just the root' {
+        $r = Start-Installer -FilePath 'C:\Windows\Temp\TeamsSetup.exe' -ArgumentList '/silent' -TimeoutMinutes 0
+        $r | Should -Be -1
+        ($script:Killed | Sort-Object) -join ',' | Should -Be '500,501,502'
+    }
+
+    It 'the Office and Chrome steps do not stop processes by name' {
+        $script:SavedTemp = $script:DepotTemp
+        $script:DepotTemp = $TestDrive
+        try {
+            Mock Test-Path { $false } -ParameterFilter { "$Path" -notlike "$TestDrive*" }
+            Mock Get-Service { }
+            Mock Get-ItemProperty { }
+            Mock Get-Installer { $false }
+            Mock Write-StatusTag { }
+            Mock Remove-Item { } -ParameterFilter { $true }
+            Install-DepotOffice
+            Install-DepotChrome
+            Should -Invoke Stop-Process -Times 0 -Exactly
+        } finally { $script:DepotTemp = $script:SavedTemp }
+    }
+}

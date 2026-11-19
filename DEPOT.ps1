@@ -135,6 +135,45 @@ function Test-AppInstalled {
         Where-Object { $_.DisplayName -match $Pattern }
     return ($null -ne $found)
 }
+function Stop-DepotProcessTree {
+    # Stops a process and everything it started, children first. Walks Win32_Process parent links
+    # from the given id, so it never touches a process outside that tree.
+    param([int]$RootId)
+    $rows  = @(Get-DepotProcessInfo)
+    $order = New-Object System.Collections.ArrayList
+    $queue = @($RootId)
+    while ($queue.Count -gt 0) {
+        $cur = [int]$queue[0]
+        $queue = @($queue | Select-Object -Skip 1)
+        if ($order.Contains($cur)) { continue }
+        [void]$order.Add($cur)
+        foreach ($r in $rows) {
+            if ([int]$r.ParentProcessId -eq $cur -and [int]$r.ProcessId -ne $cur) { $queue += [int]$r.ProcessId }
+        }
+    }
+    for ($i = $order.Count - 1; $i -ge 0; $i--) {
+        Stop-Process -Id $order[$i] -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-DepotEscPressed {
+    # True when the technician pressed ESC. False with no console, where there is no key to read.
+    try {
+        if ($Host.UI.RawUI.KeyAvailable) {
+            $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            if ($key.VirtualKeyCode -eq 27) { return $true }
+        }
+    } catch { }
+    return $false
+}
+
+function Get-DepotProcessInfo {
+    # Win32_Process rows (ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine). Empty on failure.
+    try {
+        return @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine -ErrorAction Stop)
+    } catch { return @() }
+}
+
 # Helper: run an installer with ESC-to-cancel and a timeout. Returns the child's own exit code,
 # $null when the technician cancelled with ESC, -1 on timeout and -2 when the exit code could not be read.
 # The code comes from the process object we waited on, never from $LASTEXITCODE, which a
@@ -157,21 +196,16 @@ function Start-Installer {
     $spin     = 0
     while (-not $proc.WaitForExit(500)) {
         if ((Get-Date) -gt $deadline) {
-            $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+            # Only the process this helper launched and its descendants. Other installers and the
+            # technician's own browsers or archivers on the machine are left alone.
+            Stop-DepotProcessTree -RootId $proc.Id
             Write-Host " [TIMEOUT after $TimeoutMinutes min]" -ForegroundColor Red
             return -1
         }
-        try {
-        if ($Host.UI.RawUI.KeyAvailable) {
-            $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-            if ($key.VirtualKeyCode -eq 27) {
-                $proc | Stop-Process -Force -ErrorAction SilentlyContinue
-                Get-Process | Where-Object { $_.Name -match "msiexec|setup|OfficeClickToRun|chrome|acro|7z|Zoom" } |
-                    Stop-Process -Force -ErrorAction SilentlyContinue
-                return $null
-            }
+        if (Test-DepotEscPressed) {
+            Stop-DepotProcessTree -RootId $proc.Id
+            return $null
         }
-        } catch { }
         $elapsed  = [int]((Get-Date) - $start).TotalSeconds
         $spinChar = $spinner[$spin % 4]; $spin++
         Write-Host "`r      $spinChar $([math]::Floor($elapsed/60))m$($elapsed % 60)s" -NoNewline -ForegroundColor DarkGray
@@ -244,28 +278,35 @@ function Invoke-DepotReg {
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out | ForEach-Object { "$_" }) }
 }
 
+function Test-DepotOwnedProcess {
+    # True only for a process started from a file DEPOT itself downloaded: the staged installer, the
+    # ODT folder, or an msiexec whose command line names one of the staged files.
+    param($Info)
+    if ([int]$Info.ProcessId -eq $PID) { return $false }
+    $temp = $script:DepotTemp.TrimEnd('\') + '\'
+    $staged = @('ODT.exe', 'TeamsSetup.exe', 'ChromeEnterprise.msi', 'AcrobatReader.exe', '7zip.exe', 'OneDriveSetup.exe', 'ZoomInstaller.msi')
+    $exe = [string]$Info.ExecutablePath
+    if ($exe) {
+        if ($exe.StartsWith($temp + 'ODT\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        foreach ($n in $staged) { if ($exe.Equals($temp + $n, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    }
+    $cmd = [string]$Info.CommandLine
+    if ($cmd) {
+        foreach ($n in $staged) { if ($cmd.IndexOf($temp + $n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
+        if ($cmd.IndexOf($temp + 'ODT\', [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    }
+    return $false
+}
+
 function Stop-DepotLeftoverProcess {
-    # Kill any stale installer/maintenance processes
-    $StaleProcs = @(
-        "winget", "WinGet",
-        "OfficeClickToRun", "OfficeC2RClient", "setup",
-        "msiexec",
-        "TrustedInstaller", "wusa", "wuauclt",
-        "dism", "DismHost",
-        "sfc",
-        "chrome", "ChromeSetup",
-        "AcroRd32", "AcroRdrDC", "Reader_sl",
-        "7zG", "7zFM",
-        "Teams", "Update",
-        "Zoom", "ZoomInstaller"
-    )
+    # Stop leftovers of a previous cancelled or crashed run, and only those: processes running from
+    # DEPOT's own staged files. Processes that merely share a name (chrome, setup, msiexec, Teams...) are
+    # the technician's or Windows' and are left alone.
     $killed = @()
-    foreach ($name in $StaleProcs) {
-        $procs = Get-Process -Name $name -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -notmatch "System32|SysWOW64|WindowsApps" -or $name -match "msiexec|dism|sfc|TrustedInstaller|wusa" }
-        foreach ($p in $procs) {
-            $p | Stop-Process -Force -ErrorAction SilentlyContinue
-            $killed += $p.Name
+    foreach ($info in (Get-DepotProcessInfo)) {
+        if (Test-DepotOwnedProcess $info) {
+            Stop-Process -Id ([int]$info.ProcessId) -Force -ErrorAction SilentlyContinue
+            $killed += $info.Name
         }
     }
     if ($killed.Count -gt 0) {
@@ -548,9 +589,6 @@ function Test-DepotMsiOffice {
 function Install-DepotOffice {
     # --- Microsoft 365 via Office Deployment Tool ---
     Write-Host "      > Installing: Microsoft 365..." -NoNewline -ForegroundColor Gray
-    # Kill any lingering Office/C2R processes from previous runs
-    Get-Process -Name "OfficeClickToRun","OfficeC2RClient","setup" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
     $OfficeInstalled = (Test-Path "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE") -or
                        (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE") -or
                        (Get-Service -Name "ClickToRunSvc" -ErrorAction SilentlyContinue)
@@ -587,7 +625,7 @@ function Install-DepotOffice {
                 Start-Sleep -Milliseconds 500
             }
             if ($extractProc -and -not $extractProc.HasExited) {
-                $extractProc | Stop-Process -Force -ErrorAction SilentlyContinue
+                Stop-DepotProcessTree -RootId $extractProc.Id
             }
             if (-not (Test-Path $setup)) {
                 Write-StatusTag "[FAILED - ODT extract]" "Red"
@@ -682,9 +720,6 @@ function Install-DepotTeams {
 
 function Install-DepotChrome {
     Write-Host "      > Installing: Google Chrome..." -NoNewline -ForegroundColor Gray
-    # Kill any lingering msiexec from previous installs
-    Get-Process -Name "msiexec" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
     $ChromeInstalled = (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe") -or
                        (Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe")
     if ($ChromeInstalled) {
