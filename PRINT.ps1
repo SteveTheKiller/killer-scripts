@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    PRINTER RESPONSE & INTERFACE NETWORK TOOL (PRINT) v1.0
-    Developed by SteveTheKiller | Updated: 2026-03-14
+    PRINTER RESPONSE & INTERFACE NETWORK TOOL (PRINT) v2.0
+    Developed by SteveTheKiller | Updated: 2026-11-19
 .DESCRIPTION
     Printer management utility that inventories, adds, and removes devices. Features a
     multi-threaded network scanner that discovers printers on the local subnet via port
@@ -51,7 +51,7 @@ function Set-PrintCursor {
 #region [0] - HELPERS & THEME
 # ============================================================================
 $script:Width   = 85
-$script:Version = "v1.0"
+$script:Version = "v2.0"
 
 $LineCol   = "Green"
 $MainCol   = "Yellow"
