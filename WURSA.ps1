@@ -407,50 +407,70 @@ function Invoke-WursaWindowsUpdatePass {
 #endregion
 
 #region Third-party software updates
+$script:WursaChocoPublisher = '^CN=Chocolatey Software(,|$)'
 function Get-WursaThirdPartyCatalog {
     # Install detection uses Chocolatey's own local package DB rather than probing
-    # filesystem paths. ChocoID may carry install args after the package id; the id
-    # itself is the first token.
+    # filesystem paths. Id is the bare package id. Args are extra choco arguments, one
+    # array element each, so nothing is ever split or re-parsed from a packed string.
     @(
-        @{ Name = "Google Chrome";   ChocoID = "googlechrome --install-arguments='--system-level' --ignore-checksums"; Process = "chrome" },
-        @{ Name = "Microsoft Edge";  ChocoID = "microsoft-edge";  Process = "msedge" },
-        @{ Name = "Mozilla Firefox"; ChocoID = "firefox";         Process = "firefox" },
-        @{ Name = "Brave";           ChocoID = "brave";           Process = "brave" },
-        @{ Name = "Adobe Acrobat";   ChocoID = "adobereader";     Process = @("Acrobat","AcroRd32") },
-        @{ Name = "Zoom";            ChocoID = "zoom --install-arguments='/quiet /norestart'"; Process = "Zoom" },
-        @{ Name = "Microsoft Teams"; ChocoID = "microsoft-teams"; Process = @("Teams","ms-teams") },
-        @{ Name = "Webex";           ChocoID = "webex";           Process = "CiscoCollabHost" },
-        @{ Name = "Slack";           ChocoID = "slack";           Process = "slack" },
-        @{ Name = "RingCentral";     ChocoID = "ringcentral";     Process = "RingCentral" },
-        @{ Name = "Notepad++";       ChocoID = "notepadplusplus"; Process = "notepad++" },
-        @{ Name = "VLC";             ChocoID = "vlc";             Process = "vlc" },
-        @{ Name = "7-Zip";           ChocoID = "7zip";            Process = "7zFM" },
-        @{ Name = "KillerPDF";       ChocoID = "killerpdf";       Process = "KillerPDF" },
-        @{ Name = "KillerNotes";     ChocoID = "killernotes";     Process = "KillerNotes" },
-        @{ Name = "KillerScan";      ChocoID = "killerscan";      Process = "KillerScan" },
-        @{ Name = "KillerShell";     ChocoID = "killershell";     Process = "KillerShell" },
-        @{ Name = "Killendar";       ChocoID = "killendar";       Process = "Killendar" },
-        @{ Name = "KillerMCP";       ChocoID = "killermcp";       Process = @("KillerMCP", "KillerMCP.Configure", "KillerMCP.Notify") },
-        @{ Name = "KillerShot";      ChocoID = "killershot";      Process = @("KillerShot", "KillerShot.PrintScreen") },
-        @{ Name = "KillerBench";     ChocoID = "killerbench";     Process = "KillerBench" }
+        @{ Name = "Google Chrome"; Id = "googlechrome"; Args = @("--install-arguments='--system-level'", "--ignore-checksums"); Process = "chrome" },
+        @{ Name = "Microsoft Edge"; Id = "microsoft-edge"; Args = @(); Process = "msedge" },
+        @{ Name = "Mozilla Firefox"; Id = "firefox"; Args = @(); Process = "firefox" },
+        @{ Name = "Brave"; Id = "brave"; Args = @(); Process = "brave" },
+        @{ Name = "Adobe Acrobat"; Id = "adobereader"; Args = @(); Process = @("Acrobat","AcroRd32") },
+        @{ Name = "Zoom"; Id = "zoom"; Args = @("--install-arguments='/quiet /norestart'"); Process = "Zoom" },
+        @{ Name = "Microsoft Teams"; Id = "microsoft-teams"; Args = @(); Process = @("Teams","ms-teams") },
+        @{ Name = "Webex"; Id = "webex"; Args = @(); Process = "CiscoCollabHost" },
+        @{ Name = "Slack"; Id = "slack"; Args = @(); Process = "slack" },
+        @{ Name = "RingCentral"; Id = "ringcentral"; Args = @(); Process = "RingCentral" },
+        @{ Name = "Notepad++"; Id = "notepadplusplus"; Args = @(); Process = "notepad++" },
+        @{ Name = "VLC"; Id = "vlc"; Args = @(); Process = "vlc" },
+        @{ Name = "7-Zip"; Id = "7zip"; Args = @(); Process = "7zFM" },
+        @{ Name = "KillerPDF"; Id = "killerpdf"; Args = @(); Process = "KillerPDF" },
+        @{ Name = "KillerNotes"; Id = "killernotes"; Args = @(); Process = "KillerNotes" },
+        @{ Name = "KillerScan"; Id = "killerscan"; Args = @(); Process = "KillerScan" },
+        @{ Name = "KillerShell"; Id = "killershell"; Args = @(); Process = "KillerShell" },
+        @{ Name = "Killendar"; Id = "killendar"; Args = @(); Process = "Killendar" },
+        @{ Name = "KillerMCP"; Id = "killermcp"; Args = @(); Process = @("KillerMCP", "KillerMCP.Configure", "KillerMCP.Notify") },
+        @{ Name = "KillerShot"; Id = "killershot"; Args = @(); Process = @("KillerShot", "KillerShot.PrintScreen") },
+        @{ Name = "KillerBench"; Id = "killerbench"; Args = @(); Process = "KillerBench" }
     )
 }
 
+function New-WursaSecureTempDir {
+    # A fresh, unpredictably named directory with a protected admin-only ACL for downloads that will be
+    # run as an administrator. Returns the path, or $null when a trusted directory cannot be had.
+    param([string]$Base = (Join-Path $env:ProgramData 'WURSA'))
+    $path = Join-Path $Base ([guid]::NewGuid().ToString('N'))
+    $r = Initialize-WursaWorkDir -Path $path
+    if ($r -and $r.Ready) { return $path }
+    return $null
+}
+
 function Install-WursaChocolatey {
-    # Returns $true when choco is available afterwards.
+    # Returns $true when choco is available afterwards. The package is fetched into a private directory and
+    # chocolateyInstall.ps1 runs only when the extracted choco.exe carries a valid Chocolatey signature.
+    $work = $null
     try {
         Set-ExecutionPolicy Bypass -Scope Process -Force
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        $work = New-WursaSecureTempDir
+        if (-not $work) {
+            Write-Host "      [!] Could not create a protected download folder - skipping third-party updates." -ForegroundColor Red
+            return $false
+        }
         $ChocoInstallDir = "$env:ProgramData\chocolatey"
-        $ZipPath = "$env:TEMP\chocolatey.zip"
-        $ExtractPath = "$env:TEMP\chocoInstall"
+        $ZipPath = Join-Path $work 'chocolatey.zip'
+        $ExtractPath = Join-Path $work 'extracted'
         Save-WursaFile -Uri "https://community.chocolatey.org/api/v2/package/chocolatey" -OutFile $ZipPath
         # Extract using pure .NET - bypasses Microsoft.PowerShell.Archive entirely
-        # Clear any leftover extraction folder from a previous failed attempt
-        if (Test-Path $ExtractPath) { Remove-Item $ExtractPath -Recurse -Force }
         Expand-WursaZip -ZipPath $ZipPath -Destination $ExtractPath
-        # Run the embedded install script directly
-        $ChocoInstallScript = Get-ChildItem "$ExtractPath" -Recurse -Filter "chocolateyInstall.ps1" | Select-Object -First 1
+        $exe = Get-ChildItem -LiteralPath $ExtractPath -Recurse -Filter 'choco.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $exe -or -not (Test-WursaSignedBinary -Path $exe.FullName -PublisherPattern $script:WursaChocoPublisher)) {
+            Write-Host "      [!] The downloaded Chocolatey package is not signed by Chocolatey Software - not running its installer." -ForegroundColor Red
+            return $false
+        }
+        $ChocoInstallScript = Get-ChildItem -LiteralPath $ExtractPath -Recurse -Filter 'chocolateyInstall.ps1' -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($ChocoInstallScript) {
             $env:ChocolateyInstall = $ChocoInstallDir
             Invoke-WursaScriptFile -Path $ChocoInstallScript.FullName
@@ -464,20 +484,48 @@ function Install-WursaChocolatey {
         Write-Host "      [!] Chocolatey install failed - skipping third-party updates." -ForegroundColor Red
     } catch {
         Write-Host "      [!] Chocolatey install failed: $($_.Exception.Message)" -ForegroundColor Red
+    } finally {
+        if ($work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
     }
     return $false
 }
 
+function Get-WursaChocoMajor {
+    # Major version of the installed choco, or $null when it cannot be read.
+    try {
+        $r = Invoke-WursaChoco -Arguments @('--version')
+        if ($r.ExitCode -ne 0) { return $null }
+        foreach ($line in $r.Output) {
+            if ($line -match '^\s*(\d+)\.\d+') { return [int]$Matches[1] }
+        }
+    } catch {}
+    return $null
+}
+
 function Get-WursaChocoLocalInventory {
-    # Local package ids installed through Chocolatey, as a hashtable of lowercase ids.
+    # Local package ids installed through Chocolatey, as a hashtable of lowercase ids, or $null when the
+    # inventory cannot be trusted. Chocolatey 1.x lists the remote feed unless --local-only is given;
+    # 2.x and later list local packages only and no longer take that switch.
+    $major = Get-WursaChocoMajor
+    if ($null -eq $major) { return $null }
+    $listArgs = if ($major -lt 2) { @('list', '--local-only', '--limit-output') } else { @('list', '--limit-output') }
     $inv = @{}
     try {
-        $r = Invoke-WursaChoco -Arguments @('list', '--limit-output')
+        $r = Invoke-WursaChoco -Arguments $listArgs
+        if ($r.ExitCode -ne 0) { return $null }
         foreach ($line in $r.Output) {
             if ($line -match '^([^|]+)\|') { $inv[$Matches[1].ToLower()] = $true }
         }
-    } catch {}
+    } catch { return $null }
     $inv
+}
+
+function Get-WursaChocoOutcome {
+    # Classifies a choco exit code: Success, RebootRequired (1641 and 3010 are success plus a restart), or Failed.
+    param([int]$ExitCode)
+    if ($ExitCode -eq 0) { return 'Success' }
+    if ($ExitCode -eq 1641 -or $ExitCode -eq 3010) { return 'RebootRequired' }
+    'Failed'
 }
 
 function Invoke-WursaThirdPartyUpdate {
@@ -525,15 +573,29 @@ function Invoke-WursaThirdPartyUpdate {
     Write-Host "      > " -NoNewline -ForegroundColor $DimCol
     Write-Host "Chocolatey: " -NoNewline -ForegroundColor $DimCol
     $self = Invoke-WursaChoco -Arguments @('upgrade', 'chocolatey', '-y', '--no-progress')
-    $chocoSelfMatch = $self.Output | Select-String -Pattern 'upgraded (\d+)/'
-    if ($chocoSelfMatch -and [int]$chocoSelfMatch.Matches[0].Groups[1].Value -gt 0) {
-        Write-SubResult "[UPDATED]" Green
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    $selfOutcome = Get-WursaChocoOutcome -ExitCode $self.ExitCode
+    if ($selfOutcome -eq 'Failed') {
+        Write-SubResult "[FAILED]" Red
+        $res.Failed++
     } else {
-        Write-SubResult "[ALREADY UPDATED]" Cyan
+        if ($selfOutcome -eq 'RebootRequired') { $res.RebootRequired = $true }
+        $chocoSelfMatch = $self.Output | Select-String -Pattern 'upgraded (\d+)/'
+        if ($chocoSelfMatch -and [int]$chocoSelfMatch.Matches[0].Groups[1].Value -gt 0) {
+            Write-SubResult "[UPDATED]" Green
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        } else {
+            Write-SubResult "[ALREADY UPDATED]" Cyan
+        }
     }
-    # Cache Chocolatey's local package list once. One shell-out per run beats one per app.
+    # Cache Chocolatey's local package list once. One shell-out per run beats one per app. If it cannot be
+    # read, nothing can be told apart from "not installed", so no app is touched and the run counts as partial.
     $ChocoLocal = Get-WursaChocoLocalInventory
+    if ($null -eq $ChocoLocal) {
+        Write-Host "      [!] Could not read Chocolatey's local package inventory - skipping third-party updates." -ForegroundColor Yellow
+        $res.Failed++
+        $res.Status = 'InventoryUnverified'
+        return $res
+    }
     # Cache Add/Remove Programs display names once. If an app is installed outside
     # Chocolatey (MSI, the app's own installer) we still want to upgrade it - the
     # per-app installer's own /silent handler is idempotent, so choco upgrade will
@@ -551,9 +613,7 @@ function Invoke-WursaThirdPartyUpdate {
         } catch {}
     }
     foreach ($App in $ThirdParty) {
-        # The choco package id is the first whitespace-separated token in ChocoID;
-        # anything after is install/upgrade arguments passed straight to choco.
-        $_pkgId = ($App.ChocoID -split '\s+', 2)[0].ToLower()
+        $_pkgId = $App.Id.ToLower()
         $_procs = @($App.Process)
 
         Write-Host "      > " -NoNewline -ForegroundColor Gray
@@ -574,19 +634,28 @@ function Invoke-WursaThirdPartyUpdate {
             Write-SubResult "[IN USE - SKIPPED]" Yellow
             continue
         }
-        $up = Invoke-WursaChoco -Arguments @('upgrade', $App.ChocoID, '-y', '--no-progress')
+        $up = Invoke-WursaChoco -Arguments (@('upgrade', $App.Id) + @($App.Args) + @('-y', '--no-progress'))
+        $outcome = Get-WursaChocoOutcome -ExitCode $up.ExitCode
         if ($App.Name -eq "Google Chrome") {
             $GUpdate = "C:\Program Files (x86)\Google\Update\GoogleUpdate.exe"
             if (Test-Path $GUpdate) {
                 $null = Invoke-WursaNative -FilePath $GUpdate -Arguments @('/ua', '/installsource', 'scheduler')
             }
         }
+        if ($outcome -eq 'Failed') {
+            Write-SubResult "[FAILED]" Red
+            $res.Failed++
+            continue
+        }
+        if ($outcome -eq 'RebootRequired') { $res.RebootRequired = $true }
         $upgradeMatch = $up.Output | Select-String -Pattern 'upgraded (\d+)/'
         $upgradeCount = if ($upgradeMatch) { [int]$upgradeMatch.Matches[0].Groups[1].Value } else { 0 }
         if ($upgradeCount -gt 0) {
             Write-SubResult "[UPDATED]" Green
+            $res.Succeeded++
         } elseif (-not $_inChoco -and $_inArp) {
             Write-SubResult "[ADOPTED]" Green
+            $res.Succeeded++
         } else {
             Write-SubResult "[ALREADY UPDATED]" Cyan
         }

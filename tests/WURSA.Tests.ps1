@@ -377,3 +377,194 @@ Describe 'Installation Assistant verification (finding 36)' {
         @($text.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count | Should -Be 0
     }
 }
+
+Describe 'Third-party catalog and Chocolatey (findings 39, 40, 30b)' {
+    BeforeEach {
+        $script:Lines = New-Object System.Collections.ArrayList
+        Mock Write-Host { [void]$script:Lines.Add([string]$Object) }
+        Mock Write-StepUpdate { }
+        Mock Write-SubResult { param($Tag, $Color) [void]$script:Lines.Add([string]$Tag) }
+        Mock Get-Command { [pscustomobject]@{ Name = 'choco' } } -ParameterFilter { $Name -eq 'choco' }
+        Mock Get-ItemProperty { $null }
+        Mock Get-Process { $null }
+        Mock Get-WursaThirdPartyCatalog { @(@{ Name = 'Zoom'; Id = 'zoom'; Args = @("--install-arguments='/quiet /norestart'"); Process = 'Zoom' }) }
+        $script:Calls = New-Object System.Collections.ArrayList
+        $script:ChocoVersion = '2.4.1'
+        $script:ListExit = 0
+        $script:UpgradeExit = 0
+        $script:SelfExit = 0
+        $script:UpgradeText = 'Chocolatey upgraded 1/1 packages.'
+        Mock Invoke-WursaChoco {
+            [void]$script:Calls.Add([string[]]$Arguments)
+            switch ($Arguments[0]) {
+                '--version' { return [pscustomobject]@{ ExitCode = 0; Output = @($script:ChocoVersion) } }
+                'list'      { return [pscustomobject]@{ ExitCode = $script:ListExit; Output = @('zoom|5.0') } }
+                'upgrade'   {
+                    if ($Arguments[1] -eq 'chocolatey') { return [pscustomobject]@{ ExitCode = $script:SelfExit; Output = @('Chocolatey upgraded 0/1 packages.') } }
+                    return [pscustomobject]@{ ExitCode = $script:UpgradeExit; Output = @($script:UpgradeText) }
+                }
+            }
+        }
+        function Get-UpgradeCall { $script:Calls | Where-Object { $_[0] -eq 'upgrade' -and $_[1] -ne 'chocolatey' } | Select-Object -First 1 }
+    }
+
+    It 'defines the real catalog with whitespace-free Ids and array Args' {
+        $cat = & (Get-Command Get-WursaThirdPartyCatalog -CommandType Function).ScriptBlock
+        $cat.Count | Should -BeGreaterThan 10
+        foreach ($e in $cat) {
+            $e.Id | Should -Not -BeNullOrEmpty
+            $e.Id | Should -Not -Match '\s'
+            ($e.ContainsKey('ChocoID')) | Should -BeFalse
+            @($e.Args) | ForEach-Object { $_ | Should -BeOfType [string] }
+        }
+        $chrome = $cat | Where-Object { $_.Id -eq 'googlechrome' }
+        @($chrome.Args) | Should -Be @("--install-arguments='--system-level'", '--ignore-checksums')
+    }
+
+    It 'passes the package id and its arguments to choco as separate argv elements' {
+        $r = Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x'
+        $call = Get-UpgradeCall
+        $call[0] | Should -Be 'upgrade'
+        $call[1] | Should -Be 'zoom'
+        $call | Should -Contain "--install-arguments='/quiet /norestart'"
+        $call | Should -Contain '-y'
+        ($call | Where-Object { $_ -match '^zoom\s' }) | Should -BeNullOrEmpty
+    }
+
+    It 'lists local packages with --local-only on Chocolatey 1.x' {
+        $script:ChocoVersion = '1.4.0'
+        Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x' | Out-Null
+        $list = $script:Calls | Where-Object { $_[0] -eq 'list' } | Select-Object -First 1
+        $list | Should -Contain '--local-only'
+    }
+
+    It 'lists local packages without --local-only on Chocolatey 2.x' {
+        $script:ChocoVersion = '2.4.1'
+        Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x' | Out-Null
+        $list = $script:Calls | Where-Object { $_[0] -eq 'list' } | Select-Object -First 1
+        $list | Should -Not -Contain '--local-only'
+    }
+
+    It 'treats a failed inventory as unverified: no upgrades, a warning, and a counted failure' {
+        $script:ListExit = 1
+        $r = Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x'
+        Get-UpgradeCall | Should -BeNullOrEmpty
+        $r.Failed | Should -BeGreaterThan 0
+        $r.Status | Should -Be 'InventoryUnverified'
+        ($script:Lines -join "`n") | Should -Match 'inventory'
+    }
+
+    It 'treats an unreadable Chocolatey version as an unverified inventory' {
+        $script:ChocoVersion = 'garbage'
+        $r = Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x'
+        Get-UpgradeCall | Should -BeNullOrEmpty
+        $r.Status | Should -Be 'InventoryUnverified'
+        $r.Failed | Should -BeGreaterThan 0
+    }
+
+    It 'reports a failed app upgrade as FAILED and counts it, not as already updated' {
+        $script:UpgradeExit = 1
+        $script:UpgradeText = 'Chocolatey upgraded 0/1 packages. 1 packages failed.'
+        $r = Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x'
+        $r.Failed | Should -Be 1
+        ($script:Lines -join "`n") | Should -Match '\[FAILED\]'
+        # The only ALREADY UPDATED line belongs to the Chocolatey self-upgrade, not to the failed app.
+        @($script:Lines | Where-Object { $_ -eq '[ALREADY UPDATED]' }).Count | Should -Be 1
+        ($script:Lines -join "`n") | Should -Not -Match 'ADOPTED'
+    }
+
+    It 'treats exit 3010 and 1641 as success with a reboot request' -ForEach @(@{ Code = 3010 }, @{ Code = 1641 }) {
+        $script:UpgradeExit = $Code
+        $r = Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x'
+        $r.Failed | Should -Be 0
+        $r.Succeeded | Should -Be 1
+        $r.RebootRequired | Should -BeTrue
+    }
+
+    It 'does not adopt a non-choco app when the upgrade command failed' {
+        $script:UpgradeExit = 1
+        Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = 'Zoom Workplace' } }
+        Mock Invoke-WursaChoco {
+            [void]$script:Calls.Add([string[]]$Arguments)
+            switch ($Arguments[0]) {
+                '--version' { [pscustomobject]@{ ExitCode = 0; Output = @('2.4.1') } }
+                'list'      { [pscustomobject]@{ ExitCode = 0; Output = @() } }
+                'upgrade'   { if ($Arguments[1] -eq 'chocolatey') { [pscustomobject]@{ ExitCode = 0; Output = @() } } else { [pscustomobject]@{ ExitCode = 1; Output = @('failed') } } }
+            }
+        }
+        $r = Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x'
+        $r.Failed | Should -Be 1
+        ($script:Lines -join "`n") | Should -Not -Match 'ADOPTED'
+    }
+
+    It 'reports a failed Chocolatey self-upgrade instead of calling it already updated' {
+        $script:SelfExit = 1
+        $r = Invoke-WursaThirdPartyUpdate -Skip $false -AutoConfirm $true -AutoFlag 'x'
+        $r.Failed | Should -BeGreaterThan 0
+        ($script:Lines -join "`n") | Should -Match '\[FAILED\]'
+    }
+}
+
+Describe 'Chocolatey bootstrap (finding 66)' {
+    BeforeEach {
+        $script:Base = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:Base | Out-Null
+        Mock Write-Host { }
+        $script:ScriptRan = $false
+        $script:Saved = $null
+        Mock New-WursaSecureTempDir { $script:Base }
+        Mock Save-WursaFile { $script:Saved = $OutFile }
+        Mock Expand-WursaZip { }
+        Mock Get-ChildItem { [pscustomobject]@{ FullName = (Join-Path $script:Base 'tools\chocolateyInstall\choco.exe') } } -ParameterFilter { $Filter -eq 'choco.exe' }
+        Mock Get-ChildItem { [pscustomobject]@{ FullName = (Join-Path $script:Base 'tools\chocolateyInstall.ps1') } } -ParameterFilter { $Filter -eq 'chocolateyInstall.ps1' }
+        Mock Invoke-WursaScriptFile { $script:ScriptRan = $true }
+        Mock Get-Command { if ($script:ScriptRan) { [pscustomobject]@{ Name = 'choco' } } else { $null } } -ParameterFilter { $Name -eq 'choco' }
+    }
+
+    It 'downloads into a private directory, never into the shared TEMP folder' {
+        Mock Test-WursaSignedBinary { $true }
+        Install-WursaChocolatey | Should -BeTrue
+        $script:Saved | Should -BeLike "$script:Base*"
+    }
+
+    It 'refuses to run the installer when choco.exe is not signed by Chocolatey Software' {
+        Mock Test-WursaSignedBinary { $false }
+        Install-WursaChocolatey | Should -BeFalse
+        $script:ScriptRan | Should -BeFalse
+    }
+
+    It 'checks the signer against the Chocolatey publisher and runs the installer when valid' {
+        Mock Test-WursaSignedBinary { $true }
+        Install-WursaChocolatey | Should -BeTrue
+        $script:ScriptRan | Should -BeTrue
+        Should -Invoke Test-WursaSignedBinary -ParameterFilter { $PublisherPattern -match 'Chocolatey Software' }
+    }
+
+    It 'does not download anything when a private directory cannot be created' {
+        Mock New-WursaSecureTempDir { $null }
+        Install-WursaChocolatey | Should -BeFalse
+        Should -Invoke Save-WursaFile -Times 0
+    }
+
+    It 'removes its private directory afterwards' {
+        Mock Test-WursaSignedBinary { $true }
+        Install-WursaChocolatey | Out-Null
+        Test-Path -LiteralPath $script:Base | Should -BeFalse
+    }
+}
+
+Describe 'Secure temp directory (finding 66)' {
+    It 'creates a unique protected directory for each call and returns its path' {
+        Mock Initialize-WursaWorkDir { [pscustomobject]@{ Ready = $true; Reason = ''; MovedAside = $null } }
+        $a = New-WursaSecureTempDir -Base 'C:\ProgramData\WURSA'
+        $b = New-WursaSecureTempDir -Base 'C:\ProgramData\WURSA'
+        $a | Should -Not -Be $b
+        $a | Should -BeLike 'C:\ProgramData\WURSA\*'
+        Should -Invoke Initialize-WursaWorkDir -Times 2
+    }
+
+    It 'returns nothing when the directory cannot be trusted' {
+        Mock Initialize-WursaWorkDir { [pscustomobject]@{ Ready = $false; Reason = 'nope'; MovedAside = $null } }
+        New-WursaSecureTempDir -Base 'C:\ProgramData\WURSA' | Should -BeNullOrEmpty
+    }
+}
