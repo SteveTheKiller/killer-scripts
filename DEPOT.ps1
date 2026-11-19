@@ -506,6 +506,26 @@ function Get-DepotWebText {
     return $wc.DownloadString($Url)
 }
 
+function Test-DepotMsiOffice {
+    # True when a Windows Installer (MSI) Office product is installed. The Click-to-Run support
+    # components are MSI packages too, so they are excluded by name.
+    $uninstall = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    $msi = Get-ItemProperty $uninstall -ErrorAction SilentlyContinue | Where-Object {
+        $_.WindowsInstaller -eq 1 -and
+        $_.DisplayName -match '^Microsoft (Office|Visio|Project|Word|Excel|PowerPoint|Outlook|Access|OneNote|Publisher|InfoPath|SharePoint Designer|Skype for Business|Lync)' -and
+        $_.DisplayName -notmatch 'Click-to-Run'
+    }
+    if ($msi) { return $true }
+    # MSI Office keeps its files in Office11 to Office16, outside the Click-to-Run "root" folder.
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($pf -and (Test-Path (Join-Path $pf 'Microsoft Office\Office1?\WINWORD.EXE'))) { return $true }
+    }
+    return $false
+}
+
 function Install-DepotOffice {
     # --- Microsoft 365 via Office Deployment Tool ---
     Write-Host "      > Installing: Microsoft 365..." -NoNewline -ForegroundColor Gray
@@ -572,20 +592,26 @@ function Install-DepotOffice {
 "@ | Set-Content "$ODTDir\config.xml"
                 Unblock-File $setup -ErrorAction SilentlyContinue
                 Unblock-File "$ODTDir\config.xml" -ErrorAction SilentlyContinue
-                # Scrub leftover C2R registry keys and folders before install
-                $C2RKeys = @(
-                    "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun",
-                    "HKLM:\SOFTWARE\Microsoft\Office\16.0",
-                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\16.0",
-                    "HKLM:\SOFTWARE\Microsoft\AppVISV"
-                )
-                foreach ($key in $C2RKeys) { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue }
-                @(
-                    "C:\Program Files\Microsoft Office",
-                    "C:\Program Files (x86)\Microsoft Office",
-                    "C:\Program Files\Common Files\Microsoft Shared\ClickToRun",
-                    "C:\ProgramData\Microsoft\ClickToRun"
-                ) | ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
+                if (Test-DepotMsiOffice) {
+                    # The config above carries <RemoveMSI/>, so ODT owns removal of MSI Office. Deleting its
+                    # files and keys here would break the existing install if ODT then fails.
+                    Write-Host " MSI Office found, ODT will remove it..." -NoNewline -ForegroundColor DarkGray
+                } else {
+                    # Scrub leftover C2R registry keys and folders before install
+                    $C2RKeys = @(
+                        "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun",
+                        "HKLM:\SOFTWARE\Microsoft\Office\16.0",
+                        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\16.0",
+                        "HKLM:\SOFTWARE\Microsoft\AppVISV"
+                    )
+                    foreach ($key in $C2RKeys) { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue }
+                    @(
+                        "C:\Program Files\Microsoft Office",
+                        "C:\Program Files (x86)\Microsoft Office",
+                        "C:\Program Files\Common Files\Microsoft Shared\ClickToRun",
+                        "C:\ProgramData\Microsoft\ClickToRun"
+                    ) | ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
+                }
                 Write-Installing
                 $ExitCode = Start-Installer -FilePath $setup -ArgumentList "/configure `"$ODTDir\config.xml`"" -TimeoutMinutes 90
                 Show-Result $ExitCode

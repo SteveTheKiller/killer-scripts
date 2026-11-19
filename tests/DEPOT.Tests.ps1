@@ -235,3 +235,69 @@ Describe 'Installers' {
         }
     }
 }
+
+Describe 'Finding 51: MSI Office is left for ODT RemoveMSI to remove' {
+    BeforeAll {
+        function New-FakeProc {
+            param($ExitCode = 0, [int]$ProcessId = 4242)
+            $p = [pscustomobject]@{ Id = $ProcessId; ExitCode = $ExitCode; Handle = [IntPtr]::Zero; HasExited = $true }
+            $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $true } -Force
+            $p
+        }
+    }
+
+    BeforeEach {
+        Reset-DepotState
+        $script:SavedTemp = $script:DepotTemp
+        $script:DepotTemp = $TestDrive
+        Mock Start-Sleep { }
+        Mock Get-Process { }
+        Mock Get-Service { }
+        Mock Get-ItemProperty { }
+        Mock Remove-Item { } -ParameterFilter { $true }
+        Mock Write-Host { }
+        Mock Write-StatusTag { }
+        Mock Get-DepotWebText { throw 'no network in tests' }
+        Mock New-Object { throw 'no network in tests' } -ParameterFilter { $TypeName -match 'WebClient' }
+        Mock Test-Path { $false } -ParameterFilter { "$Path" -notlike "$TestDrive*" }
+        Mock Get-Installer { $true }
+        Mock Start-Process {
+            if ("$FilePath" -match 'ODT\.exe$') {
+                New-Item -ItemType Directory -Path (Join-Path $TestDrive 'ODT') -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path $TestDrive 'ODT\setup.exe') -Value 'stub'
+            }
+            New-FakeProc -ExitCode 0
+        }
+    }
+
+    AfterEach {
+        $script:DepotTemp = $script:SavedTemp
+        Remove-Item -LiteralPath (Join-Path $TestDrive 'ODT') -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'does not delete Program Files\Microsoft Office or the Office 16.0 keys when an MSI Office product is installed' {
+        Mock Get-ItemProperty {
+            [pscustomobject]@{ DisplayName = 'Microsoft Office Professional Plus 2016'; WindowsInstaller = 1 }
+        }
+        Install-DepotOffice
+        Should -Invoke Remove-Item -Times 0 -Exactly -ParameterFilter { "$Path" -match 'Microsoft Office|\\Office\\16\.0|ClickToRun|AppVISV' }
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { "$FilePath" -match 'setup\.exe$' }
+        (Get-Content -LiteralPath (Join-Path $TestDrive 'ODT\config.xml') -Raw) | Should -Match '<RemoveMSI/>'
+    }
+
+    It 'treats an Office1x WINWORD.EXE outside the Click-to-Run root as MSI Office even without an Uninstall entry' {
+        Mock Test-Path { $true } -ParameterFilter { "$Path" -like '*Microsoft Office\Office1?\WINWORD.EXE' }
+        Install-DepotOffice
+        Should -Invoke Remove-Item -Times 0 -Exactly -ParameterFilter { "$Path" -match 'Microsoft Office|\\Office\\16\.0|ClickToRun|AppVISV' }
+    }
+
+    It 'still scrubs leftover Click-to-Run remnants when no MSI Office is present' {
+        Mock Get-ItemProperty {
+            [pscustomobject]@{ DisplayName = 'Microsoft Office 16 Click-to-Run Extensibility Component'; WindowsInstaller = 1 }
+            [pscustomobject]@{ DisplayName = 'Contoso Agent'; WindowsInstaller = 1 }
+        }
+        Install-DepotOffice
+        Should -Invoke Remove-Item -Times 1 -Exactly -ParameterFilter { "$Path" -match 'Office\\ClickToRun$' }
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { "$FilePath" -match 'setup\.exe$' }
+    }
+}
