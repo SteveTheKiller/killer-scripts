@@ -34,6 +34,75 @@ function Set-FactsCursor {
 }
 function Clear-FactsScreen { try { Clear-Host -ErrorAction Stop } catch { } }
 
+# --- 64-bit registry helpers ---
+# These read and write HKLM through the 64-bit view, so a 32-bit host (some RMM agents launch one)
+# sees the same Foxit state as a 64-bit host instead of the redirected WOW6432Node view. They are
+# also copied into the hourly task, so they must not depend on anything else in this file.
+function Open-FactsHklm64 {
+    [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+}
+function Get-FactsFoxitApps {
+    # Ok is false when the software list could not be read, so a read failure is never taken for "no Foxit".
+    $names = New-Object System.Collections.ArrayList
+    $ok = $true
+    $base = $null
+    try {
+        $base = Open-FactsHklm64
+        foreach ($p in @('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+            $u = $base.OpenSubKey($p)
+            if (-not $u) { continue }
+            foreach ($n in $u.GetSubKeyNames()) {
+                $k = $u.OpenSubKey($n)
+                if (-not $k) { continue }
+                $d = $k.GetValue('DisplayName')
+                if ($d -and ([string]$d -like '*Foxit*')) { [void]$names.Add([string]$d) }
+                $k.Close()
+            }
+            $u.Close()
+        }
+    } catch { $ok = $false } finally { if ($base) { $base.Close() } }
+    [pscustomobject]@{ Ok = $ok; Names = @($names.ToArray()) }
+}
+function Add-FactsUpdaterKeys {
+    param($Base, [string]$Path, $Out)
+    $k = $Base.OpenSubKey($Path)
+    if (-not $k) { return }
+    try {
+        foreach ($n in $k.GetSubKeyNames()) {
+            $child = "$Path\$n"
+            if ($n -eq 'Updater') { [void]$Out.Add($child) }
+            Add-FactsUpdaterKeys -Base $Base -Path $child -Out $Out
+        }
+    } finally { $k.Close() }
+}
+function Get-FactsUpdaterKeys {
+    # Every Updater key under the Foxit Software hives, as a path below HKLM in the 64-bit view.
+    $out = New-Object System.Collections.ArrayList
+    $base = $null
+    try {
+        $base = Open-FactsHklm64
+        foreach ($hive in @('SOFTWARE\Foxit Software', 'SOFTWARE\WOW6432Node\Foxit Software')) {
+            Add-FactsUpdaterKeys -Base $base -Path $hive -Out $out
+        }
+    } catch { } finally { if ($base) { $base.Close() } }
+    @($out.ToArray())
+}
+function Set-FactsUpdaterValues {
+    # Writes the two blocking values and reads them back. True only when both are in place.
+    param([string]$Path)
+    $base = $null
+    try {
+        $base = Open-FactsHklm64
+        $k = $base.OpenSubKey($Path, $true)
+        if (-not $k) { return $false }
+        $k.SetValue('UpdateMode', '0', [Microsoft.Win32.RegistryValueKind]::String)
+        $k.SetValue('bNoUpdate', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $ok = ([string]$k.GetValue('UpdateMode') -eq '0') -and ([int]$k.GetValue('bNoUpdate') -eq 1)
+        $k.Close()
+        return $ok
+    } catch { return $false } finally { if ($base) { $base.Close() } }
+}
+
 $script:StepRow = -1
 $script:StepMsg = ""
 $script:Width   = 85
@@ -150,14 +219,15 @@ function Invoke-FactsMain {
     #region 1. Audit & Discovery
     # ============================================================================
     Write-StepUpdate "[1/4] Auditing Foxit Installations..."
-    $FoxitRegistryPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-    )
-
-    $FoundApps = Get-ItemProperty $FoxitRegistryPaths | Where-Object { $_.DisplayName -like "*Foxit*" }
-    if ($FoundApps) {
-        Write-StepUpdate -Success -CustomInfo "($(@($FoundApps).Count) Found)"
+    $Audit = Get-FactsFoxitApps
+    if (-not $Audit.Ok) {
+        Write-Host " [FAILED]" -ForegroundColor Red
+        Write-Output "[FAIL] FACTS could not read the installed software list, nothing was changed (exit 1)"
+        Exit-KillerScript 1
+    }
+    $FoundApps = @($Audit.Names)
+    if ($FoundApps.Count -gt 0) {
+        Write-StepUpdate -Success -CustomInfo "($($FoundApps.Count) Found)"
     } else {
         Write-StepUpdate -Success -CustomInfo "(None Detected)"
     }
@@ -165,17 +235,10 @@ function Invoke-FactsMain {
 
     #region 2. Universal Registry Hardening
     # ============================================================================
-    if ($FoundApps) {
+    if ($FoundApps.Count -gt 0) {
         Write-StepUpdate "[2/4] Applying Recursive Registry Blocks..."
-        $MachineHives = @("HKLM:\SOFTWARE\Foxit Software", "HKLM:\SOFTWARE\WOW6432Node\Foxit Software")
-        foreach ($Hive in $MachineHives) {
-            if (Test-Path $Hive) {
-                $UpdaterKeys = Get-ChildItem -Path $Hive -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -eq "Updater" }
-                foreach ($Key in $UpdaterKeys) {
-                    New-ItemProperty -Path $Key.PSPath -Name "UpdateMode" -Value "0" -PropertyType String -Force | Out-Null
-                    New-ItemProperty -Path $Key.PSPath -Name "bNoUpdate" -Value 1 -PropertyType DWord -Force | Out-Null
-                }
-            }
+        foreach ($Key in @(Get-FactsUpdaterKeys)) {
+            [void](Set-FactsUpdaterValues -Path $Key)
         }
         Write-StepUpdate -Success
     } else {
@@ -185,7 +248,7 @@ function Invoke-FactsMain {
 
     #region 3. Service & Task Enforcement
     # ============================================================================
-    if ($FoundApps) {
+    if ($FoundApps.Count -gt 0) {
         Write-StepUpdate "[3/4] Disabling Native Services and Tasks..."
         Get-Service | Where-Object { $_.Name -like "*Foxit*Update*" } | ForEach-Object {
             Set-Service -Name $_.Name -StartupType Disabled
@@ -203,7 +266,7 @@ function Invoke-FactsMain {
 
     #region 4. Hourly Self-Healing Task
     # ============================================================================
-    if ($FoundApps) {
+    if ($FoundApps.Count -gt 0) {
         Write-StepUpdate "[4/4] Configuring Persistence (Hourly Task)..."
         $MaintenanceScript = {
             $AuditPaths = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
