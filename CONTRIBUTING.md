@@ -60,3 +60,37 @@ Be prepared to revise an approved contribution after review. Contributions must 
 ## Project-specific guidance
 
 Describe the machine changes a script makes and how failures are handled. Use a disposable environment for scripts that change system settings or remove software or data.
+
+### Runtime contract
+
+Every script must keep working on Windows PowerShell 5.1 and in Kaseya LiveConnect and other RMM consoles. That covers `-File`, `-Command`, `-EncodedCommand`, pasted input, running as SYSTEM and the 32-bit host. Keep each script a single self-contained file with no module dependencies and no syntax newer than 5.1. Prompts must not hang without a console, and an unanswered destructive choice must default to doing nothing.
+
+### Entry point and exit codes
+
+Each script keeps its body in `Invoke-<Name>Main` and ends with:
+
+```powershell
+if (-not $global:KillerScriptsTestMode) { Invoke-<Name>Main }
+```
+
+Exit through `Exit-KillerScript <code>` instead of calling `exit` directly. In test mode it throws `KILLERSCRIPT_EXIT:<code>` so tests can load a script without running it.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Failure |
+| 2 | Not elevated, or a precondition failed |
+| 3 | Partial success |
+| 3010 | Success, reboot required |
+
+The final status line must agree with the exit code.
+
+### Running the tests
+
+The tests use Pester 5 under both editions. Shipped scripts never load it. Run the suite with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
+```
+
+Test files dot-source `tests\TestHelpers.ps1` and call `Initialize-KillerSafetyNet` in `BeforeAll`. Any destructive cmdlet, native tool or network call the test hasn't mocked then throws, and file and registry writes are allowed only in `TestDrive` and `TestRegistry`. Real Windows behavior is checked in a disposable VM.
