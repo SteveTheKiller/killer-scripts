@@ -648,12 +648,23 @@ function Get-GraphToken {
     if (-not $query) { Write-StepUpdate "No authorization response obtained: aborting auth" FAIL; return $null }
 
     # Extract code (guard UnescapeDataString so a stray % can't throw). [?&] anchor skips session_state.
+    # The returned state is mandatory and must be exactly the one BEAM issued, exactly once. A missing,
+    # empty, repeated or different state aborts before anything is sent to the token endpoint. Checked
+    # for both the loopback redirect and a pasted clipboard URL, and before an error is reported.
+    $stateVals = @([regex]::Matches($query, '[?&]state=([^&\s]*)') | ForEach-Object { $_.Groups[1].Value })
+    $stateOk = $false
+    if ($stateVals.Count -eq 1) {
+        $got = $stateVals[0]
+        try { $got = [Uri]::UnescapeDataString($got) } catch { }
+        $stateOk = ($got -ceq $state)
+    }
+    if (-not $stateOk) {
+        Write-StepUpdate "OAuth state missing or not the one BEAM issued: aborting auth" FAIL; return $null
+    }
+
     $code = $null
     if ($query -match '[?&]code=([^&\s]+)') {
         try { $code = [Uri]::UnescapeDataString($matches[1]) } catch { $code = $matches[1] }
-        if ($query -match '[?&]state=([^&\s]+)' -and $matches[1] -ne $state) {
-            Write-StepUpdate "OAuth state mismatch: aborting auth" FAIL; return $null
-        }
     } elseif ($query -match 'error=([^&\s]+)') {
         Write-StepUpdate "Authorization failed: $([Uri]::UnescapeDataString($matches[1]))" FAIL; return $null
     }

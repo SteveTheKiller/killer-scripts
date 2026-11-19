@@ -911,4 +911,90 @@ Context 'Finding 63: IntuneWinAppUtil is pinned to a release and its Microsoft s
         Mock Invoke-WebRequest { throw 'The remote server returned an error: (404) Not Found.' }
         Initialize-BeamToolReal | Should -BeNullOrEmpty
     }
+}
+
+Context 'Finding 37: the redirect must return the state BEAM issued before the code is exchanged' {
+    BeforeAll {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Get-KillerScriptPath BEAM), [ref]$null, [ref]$null)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-GraphToken' }, $true)
+        Invoke-Expression ($fn.Extent.Text -replace 'function Get-GraphToken', 'function Get-GraphTokenReal')
+    }
+    BeforeEach {
+        $script:TokenCalls = 0
+        $script:AuthUrl = $null
+        $script:Redirect = { param($state) "?code=abc123&state=$state&session_state=zzz" }
+        $script:Clip = $null
+        Mock Open-BeamListener { [pscustomobject]@{ Listener = $null; Port = 8400 } }
+        Mock Start-BeamBrowser { $script:AuthUrl = $Url }
+        Mock Receive-BeamRedirect {
+            $s = ([regex]::Match($script:AuthUrl, '[?&]state=([^&]+)')).Groups[1].Value
+            [pscustomobject]@{ Cancelled = $false; Query = (& $script:Redirect $s) }
+        }
+        Mock Get-BeamClipboardText { $script:Clip }
+        Mock Invoke-RestMethod { $script:TokenCalls++; [pscustomobject]@{ access_token = 'tok' } }
+    }
+
+    It 'issues a state value in the authorization URL' {
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Out-Null
+        $script:AuthUrl | Should -Match '[?&]state=[0-9a-f]{32}(&|$)'
+    }
+
+    It 'exchanges the code when the returned state matches' {
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -Be 'tok'
+        $script:TokenCalls | Should -Be 1
+    }
+
+    It 'aborts without calling the token endpoint when the returned state differs' {
+        $script:Redirect = { param($state) '?code=abc123&state=attacker' }
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -BeNullOrEmpty
+        $script:TokenCalls | Should -Be 0
+        ($script:Log -join "`n") | Should -Match 'state'
+    }
+
+    It 'aborts without calling the token endpoint when the redirect carries no state at all' {
+        $script:Redirect = { param($state) '?code=abc123' }
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -BeNullOrEmpty
+        $script:TokenCalls | Should -Be 0
+    }
+
+    It 'aborts when the state parameter is present but empty' {
+        $script:Redirect = { param($state) '?code=abc123&state=' }
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -BeNullOrEmpty
+        $script:TokenCalls | Should -Be 0
+    }
+
+    It 'aborts when the state is repeated, even if one copy matches' {
+        $script:Redirect = { param($state) "?code=abc123&state=$state&state=attacker" }
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -BeNullOrEmpty
+        $script:TokenCalls | Should -Be 0
+    }
+
+    It 'does not treat session_state as the state' {
+        $script:Redirect = { param($state) "?code=abc123&session_state=$state" }
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -BeNullOrEmpty
+        $script:TokenCalls | Should -Be 0
+    }
+
+    It 'applies the same check to a redirect URL pasted from the clipboard' {
+        $script:Redirect = { param($state) $null }
+        $script:Clip = 'http://localhost:8400/?code=abc123'
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -BeNullOrEmpty
+        $script:TokenCalls | Should -Be 0
+    }
+
+    It 'accepts a clipboard redirect that carries the issued state' {
+        $script:Redirect = { param($state) $null }
+        Mock Get-BeamClipboardText {
+            $s = ([regex]::Match($script:AuthUrl, '[?&]state=([^&]+)')).Groups[1].Value
+            "http://localhost:8400/?code=abc123&state=$s"
+        }
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -Be 'tok'
+        $script:TokenCalls | Should -Be 1
+    }
+
+    It 'aborts on an error redirect without calling the token endpoint' {
+        $script:Redirect = { param($state) "?error=access_denied&state=$state" }
+        Get-GraphTokenReal -TenantId '11111111-2222-3333-4444-555555555555' | Should -BeNullOrEmpty
+        $script:TokenCalls | Should -Be 0
+    }
 }}
