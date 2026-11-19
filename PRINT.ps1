@@ -232,6 +232,16 @@ function Find-PrinterDriver {
 }
 #endregion
 
+function Resolve-PrintDriverChoice {
+    # Maps a typed 1-based driver ID to a driver. Empty, 0, non-numeric or out-of-range input returns $null
+    # so the caller keeps the suggested driver instead of indexing -1 (the last driver).
+    param([object[]]$Drivers, [string]$Raw)
+    $n = 0
+    if (-not [int]::TryParse(("$Raw").Trim(), [ref]$n)) { return $null }
+    if ($n -lt 1 -or $n -gt @($Drivers).Count) { return $null }
+    return @($Drivers)[$n - 1]
+}
+
 #region [2] - ADD WIZARD
 # ============================================================================
 function Invoke-AddPrinterWizard {
@@ -408,7 +418,7 @@ function Invoke-AddPrinterWizard {
                             Write-Host "  Select driver ID: " -NoNewline -ForegroundColor $LineCol
                             $drvRaw = Read-Input
                             if ($null -eq $drvRaw) { continue wizloop }
-                            $drvSel = $allDrivers[[int]$drvRaw - 1]
+                            $drvSel = Resolve-PrintDriverChoice -Drivers $allDrivers -Raw $drvRaw
                             if ($drvSel) { $driverName = $drvSel.Name } else { Write-Host "  Invalid - using suggested." -ForegroundColor $WarnCol }
                         }
                     } elseif ($drvChoice -eq 'P') {

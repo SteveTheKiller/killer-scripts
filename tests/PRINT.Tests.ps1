@@ -143,4 +143,27 @@ Describe 'PRINT' {
             $r.Text | Should -Match '\[FAIL\].*exit 1'
         }
     }
+
+    Context 'finding 74: installed-driver menu' {
+        BeforeEach {
+            # Add menu 2 (manual IP), driver step C, then protocol 1 (RAW). Drivers sort to Acme, Microsoft, Zeta.
+            foreach ($k in @('2','c')) { $script:Keys.Enqueue((New-Key $k)) }
+            $script:Keys.Enqueue((New-Key '1'))
+        }
+        It '<Entry> keeps the suggested driver' -ForEach @(
+            @{ Entry = 'an empty entry'; Raw = '' },
+            @{ Entry = '0'; Raw = '0' },
+            @{ Entry = 'an out-of-range number'; Raw = '99' },
+            @{ Entry = 'non-numeric text'; Raw = 'abc' }
+        ) {
+            foreach ($i in @('10.0.0.5', $Raw, '')) { $script:Inputs.Enqueue($i) }
+            Invoke-AddPrinterWizard
+            Should -Invoke Add-Printer -Times 1 -Exactly -ParameterFilter { $DriverName -eq 'Acme X100 PCL' }
+        }
+        It 'picks the driver whose number was entered' {
+            foreach ($i in @('10.0.0.5', '3', '')) { $script:Inputs.Enqueue($i) }
+            Invoke-AddPrinterWizard
+            Should -Invoke Add-Printer -Times 1 -Exactly -ParameterFilter { $DriverName -eq 'Zeta Z1' }
+        }
+    }
 }
