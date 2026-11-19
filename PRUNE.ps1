@@ -24,8 +24,10 @@
       LastUseTime is the most reliable staleness signal - it is OS-managed
       and updated on every profile load/unload, not affected by file-system
       activity. Thresholds used by this tool: >90d = stale, >365d = old.
-      Orphaned profiles (SID no longer resolves to any account) are almost
-      always safe to remove. Profiles marked [LIVE] are currently loaded
+      Orphaned profiles (a SID from this machine whose account is gone) are
+      almost always safe to remove. Unresolved profiles (a domain or Entra ID
+      SID that did not translate, for example off VPN) are not known to be
+      orphaned and are flagged for a closer look. Profiles marked [LIVE] are currently loaded
       and cannot be removed without a reboot or logoff.
 #>
 param(
@@ -153,9 +155,25 @@ function Resolve-SIDToAccount {
     } catch { return $null }
 }
 
+function Get-PruneMachineSid {
+    # The local machine's account-domain SID (S-1-5-21-a-b-c), or $null when it cannot be read.
+    try {
+        $any = @(Get-LocalUser -ErrorAction Stop | Select-Object -First 1)
+        if ($any.Count -gt 0 -and $any[0].SID -and $any[0].SID.AccountDomainSid) { return $any[0].SID.AccountDomainSid.Value }
+    } catch { }
+    return $null
+}
+
 function Get-AccountStatus {
     param([string]$SID, [string]$AccountName)
-    if (-not $AccountName) { return "Orphaned" }
+    if (-not $AccountName) {
+        # A SID that does not translate is only Orphaned when it belongs to this machine, because then
+        # the local account is truly gone. A domain or Entra ID SID fails the same way whenever the
+        # directory cannot be reached (laptop off VPN), so it is Unresolved, never safe to call Orphaned.
+        $machine = Get-PruneMachineSid
+        if ($machine -and $SID -match '^S-1-5-21-(\d+-\d+-\d+)-\d+$' -and ('S-1-5-21-' + $Matches[1]) -ieq $machine) { return "Orphaned" }
+        return "Unresolved"
+    }
     $domainPart = if ($AccountName -like "*\*") { ($AccountName -split "\\")[0] } else { $null }
     $userPart   = if ($AccountName -like "*\*") { ($AccountName -split "\\")[1] } else { $AccountName }
     $isLocal    = (-not $domainPart) -or ($domainPart -ieq $env:COMPUTERNAME)
@@ -215,7 +233,7 @@ function Show-Footer {
 function Get-StatusColor {
     param([string]$Status)
     switch ($Status) {
-        "Orphaned" { "Red" } "Disabled" { $script:WarnCol } "Local" { $script:MainCol } "Domain" { $script:AccentCol } default { $script:DimCol }
+        "Orphaned" { "Red" } "Unresolved" { $script:WarnCol } "Disabled" { $script:WarnCol } "Local" { $script:MainCol } "Domain" { $script:AccentCol } default { $script:DimCol }
     }
 }
 #endregion
@@ -733,6 +751,7 @@ function Invoke-PruneSession {
         $flags = @()
         if ($p.Status -eq "Orphaned")      { $flags += "orphaned" }
         if ($p.Status -eq "Disabled")      { $flags += "disabled" }
+        if ($p.Status -eq "Unresolved")    { $flags += "unresolved, account not verified" }
         if ($p.Status -eq "LookupFailed")  { $flags += "account lookup failed" }
         if (-not $p.FolderExists)          { $flags += "no folder on disk" }
         $flagStr = if ($flags.Count -gt 0) { "  [$($flags -join ', ')]" } else { "" }

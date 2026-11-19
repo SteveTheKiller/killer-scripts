@@ -270,3 +270,55 @@ Describe 'Finding 22: principal resolution' {
         Resolve-PrunePrincipalSid -Name 'S-1-5-21-111-222-333-1010' | Should -Be 'S-1-5-21-111-222-333-1010'
     }
 }
+
+Describe 'Finding 68: Unresolved is reported apart from Orphaned' {
+    BeforeAll {
+        $script:MachineSid = 'S-1-5-21-111-222-333'
+    }
+
+    BeforeEach {
+        Mock Get-LocalUser { [pscustomobject]@{ Name = 'Administrator'; Enabled = $true; SID = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-111-222-333-500')) } }
+    }
+
+    It 'labels a SID from this machine that no longer resolves as Orphaned' {
+        Get-AccountStatus -SID 'S-1-5-21-111-222-333-1020' -AccountName $null | Should -Be 'Orphaned'
+    }
+
+    It 'labels a domain SID that does not resolve (laptop off VPN) as Unresolved, never Orphaned' {
+        Get-AccountStatus -SID 'S-1-5-21-900-800-700-1500' -AccountName $null | Should -Be 'Unresolved'
+    }
+
+    It 'labels an Entra ID SID that does not resolve as Unresolved' {
+        Get-AccountStatus -SID 'S-1-12-1-1111-2222-3333-4444' -AccountName $null | Should -Be 'Unresolved'
+    }
+
+    It 'labels the SID Unresolved, not Orphaned, when this machine SID cannot be determined' {
+        Mock Get-LocalUser { throw 'The service is not running' }
+        Get-AccountStatus -SID 'S-1-5-21-111-222-333-1020' -AccountName $null | Should -Be 'Unresolved'
+    }
+
+    It 'flags an Unresolved profile in the delete list as unverified, not as orphaned' {
+        $script:Fake = [pscustomobject]@{
+            Profiles = @((New-FakeProfile -Sid 'S-1-5-21-900-800-700-1500' -Path 'C:\Users\vpnuser'))
+            Gone     = New-Object System.Collections.ArrayList
+        }
+        Mock Test-PruneElevated { $true }
+        Mock Clear-Host { }
+        Mock Get-PruneCursorTop { -1 }
+        Mock Set-PruneCursor { $false }
+        Mock Get-CimInstance {
+            if ($ClassName -eq 'Win32_UserProfile') { return @($script:Fake.Profiles) }
+        }
+        Mock Remove-CimInstance { }  -RemoveParameterType InputObject
+        Mock Test-Path { $false }
+        Mock Resolve-SIDToAccount { $null }
+        Mock Read-PruneLine {
+            if ($Prompt -like '*Selection*') { return '1' }
+            return $null
+        }
+        $r = Get-Run
+        $r.Text | Should -Match 'unresolved'
+        $r.Text | Should -Not -Match '\[orphaned'
+        Should -Invoke Remove-CimInstance -Times 0 -Exactly
+    }
+}
