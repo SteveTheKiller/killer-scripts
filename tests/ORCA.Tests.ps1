@@ -14,6 +14,7 @@ BeforeAll {
     . (Get-KillerScriptPath ORCA)
     # The real profile reader, kept before any test mocks Get-OrcaProfile.
     $script:RealGetOrcaProfile = ${function:Get-OrcaProfile}
+    $script:RealReadOrcaKey = ${function:Read-OrcaKey}
 
     function New-OrcaKey {
         param([string]$Key = 'Enter', [string]$Char = "`r")
@@ -92,6 +93,12 @@ Describe 'ORCA' {
         It 'loads without running (test mode guard)' {
             Get-Command Invoke-OrcaMain -ErrorAction Stop | Should -Not -BeNullOrEmpty
             Get-Command Exit-KillerScript -ErrorAction Stop | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Read-OrcaKey reads the console and does not call itself' {
+            $body = $script:RealReadOrcaKey.ToString()
+            $body | Should -Match '\[Console\]::ReadKey'
+            $body | Should -Not -Match '(?m)^\s*Read-OrcaKey\s*$'
         }
 
         It 'Exit-KillerScript throws KILLERSCRIPT_EXIT in test mode' {

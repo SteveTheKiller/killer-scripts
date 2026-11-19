@@ -82,8 +82,8 @@ function Get-OrcaProfile {
 }
 
 function Read-OrcaKey {
-    # Throws when there is no console, which sends the caller to its Read-Host fallback.
-    Read-OrcaKey
+    # Throws when there is no console, which sends the caller to its fallback.
+    [Console]::ReadKey($true)
 }
 
 function Get-OrcaTempRoot { $env:TEMP }
