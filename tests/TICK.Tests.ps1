@@ -39,23 +39,26 @@ Describe 'TICK' {
             try { Invoke-TickMain -Silent:$Silent -NtpServer $NtpServer *>&1 | ForEach-Object { [void]$lines.Add([string]$_) } } catch {
                 if ($_.Exception.Message -match 'KILLERSCRIPT_EXIT:(\d+)') { $code = [int]$Matches[1] } else { throw }
             }
-            [pscustomobject]@{ Code = $code; Text = ($lines -join "`n") }
+            [pscustomobject]@{ Code = $code; Text = ($lines -join "`n"); HostText = ($script:HostLines -join "`n") }
         }
         function New-W32Result {
             param([int]$Code = 0, [string[]]$Lines = @())
             [pscustomobject]@{ ExitCode = $Code; Output = $Lines }
         }
-        $script:EnglishStatus = @(
+        function Get-EnglishStatus {
+            param([datetime]$LastSync = (Get-Date), [string]$Source = 'time.google.com,0x8')
+            @(
             'Leap Indicator: 0(no warning)',
             'Stratum: 3 (secondary reference - syncd by (S)NTP)',
             'Precision: -23 (119.209ns per tick)',
             'Root Delay: 0.0312500s',
             'Root Dispersion: 0.0500000s',
             'ReferenceId: 0x0A0A0A01 (source IP:  10.10.10.1)',
-            'Last Successful Sync Time: 11/19/2026 9:00:00 AM',
-            'Source: time.google.com,0x8',
+            ('Last Successful Sync Time: ' + $LastSync.ToString()),
+            ('Source: ' + $Source),
             'Poll Interval: 6 (64s)'
-        )
+            )
+        }
     }
     AfterAll { Disable-KillerTestMode }
 
@@ -65,9 +68,10 @@ Describe 'TICK' {
         $script:Keys = New-Object System.Collections.Queue
         $script:Lines = New-Object System.Collections.Queue
         $script:SourceReply = 'time.google.com,0x8'
-        $script:StatusLines = $script:EnglishStatus
+        $script:StatusLines = Get-EnglishStatus
+        $script:HostLines = New-Object System.Collections.ArrayList
         # Console boundaries
-        Mock Write-Host {}
+        Mock Write-Host { [void]$script:HostLines.Add([string]$Object) }
         Mock Clear-Host {}
         Mock Write-HLine {}
         Mock Write-Banner {}
@@ -112,6 +116,17 @@ Describe 'TICK' {
             $script:SourceReply = 'time.cloudflare.com,0x8'
             $null = Get-Run -Silent
             $script:W32Calls | Should -Contain '/config /manualpeerlist:time.cloudflare.com,0x8 /syncfromflags:manual /reliable:yes /update'
+        }
+    }
+    Context 'finding 69: not elevated' {
+        It 'exits 2 with a FAIL line and touches nothing' {
+            Mock Test-TickElevated { $false }
+            $r = Get-Run -Silent
+            $r.Code | Should -Be 2
+            $r.Text | Should -Match '\[FAIL\].*exit 2'
+            Should -Invoke Invoke-TickW32tm -Times 0 -Exactly
+            Should -Invoke Stop-Service -Times 0 -Exactly
+            Should -Invoke Start-Service -Times 0 -Exactly
         }
     }
 }

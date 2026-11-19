@@ -142,7 +142,8 @@ function Invoke-TickMain {
     param([switch]$Silent, [string]$NtpServer)
     if (-not (Test-TickElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Exit-KillerScript 0
+        Write-Output "[FAIL] TICK not elevated, nothing was changed (exit 2)"
+        Exit-KillerScript 2
     }
     Clear-TickScreen
     Write-Banner
