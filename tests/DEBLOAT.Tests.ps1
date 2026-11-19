@@ -103,6 +103,9 @@ Describe 'DEBLOAT' {
         Mock New-Item {} -ParameterFilter { "$Path" -like 'HKLM:*' -or "$Path" -like 'Registry::*' }
         Mock Set-ItemProperty {} -ParameterFilter { "$Path" -like 'HKLM:*' -or "$Path" -like 'Registry::*' }
         Mock Remove-Item {} -ParameterFilter { "$Path" -like 'HKLM:*' -or "$Path" -like 'Registry::*' }
+        # No hive is mounted unless a test says so.
+        Mock Test-Path { $false } -ParameterFilter { "$Path" -match '^Registry::HKEY_USERS\\(TempHive_\w+|DefaultUser)$' }
+        Mock Start-Sleep {}
         Mock Invoke-RegExe { 0 }
         Mock Get-LoadedUserSidMap { @{} }
         Mock Get-UserFolder { Get-ChildItem -LiteralPath $script:Users -Directory }
@@ -214,6 +217,77 @@ Describe 'DEBLOAT' {
         It 'never deletes System32\drivers\RivetNetworks on any other manufacturer' {
             Get-Exit | Should -Be 0
             Should -Invoke Remove-Item -Times 0 -Exactly -ParameterFilter { "$Path" -like '*RivetNetworks*' }
+        }
+    }
+
+    Context 'finding 09: temporary hives are always released, and only ours' {
+        BeforeEach {
+            $script:Sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        }
+
+        It 'unloads every hive it loaded on a healthy run, exactly once each' {
+            Get-Exit | Should -Be 0
+            foreach ($h in 'DefaultUser', 'TempHive_alice', 'TempHive_bob') {
+                Should -Invoke Invoke-RegExe -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'load' -and $Arguments[1] -eq "HKU\$h" }
+                Should -Invoke Invoke-RegExe -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq "HKU\$h" }
+            }
+        }
+
+        It 'unloads a profile hive when an operation throws, keeps going, and exits 3' {
+            Mock Set-UserRegValue { throw 'simulated terminating error' } -ParameterFilter { "$Path" -like '*TempHive_alice*' }
+            $r = Get-Run
+            $r.Code | Should -Be 3
+            $r.Text | Should -Match '\[WARN\] DEBLOAT partial.*\(exit 3\)'
+            Should -Invoke Invoke-RegExe -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\TempHive_alice' }
+            Should -Invoke Invoke-RegExe -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'load' -and $Arguments[1] -eq 'HKU\TempHive_bob' }
+            Should -Invoke Invoke-RegExe -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\TempHive_bob' }
+        }
+
+        It 'unloads the Default User hive when an operation throws against it' {
+            Mock Set-UserRegValue { throw 'simulated terminating error' } -ParameterFilter { "$Path" -like '*DefaultUser*' }
+            Get-Exit | Should -Be 3
+            Should -Invoke Invoke-RegExe -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\DefaultUser' }
+            Should -Invoke Invoke-RegExe -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\TempHive_bob' }
+        }
+
+        It 'never loads, writes to or unloads a hive somebody else already mounted' {
+            Mock Test-Path { $true } -ParameterFilter { "$Path" -eq 'Registry::HKEY_USERS\TempHive_alice' }
+            Get-Exit | Should -Be 3
+            Should -Invoke Invoke-RegExe -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'HKU\TempHive_alice' }
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly -ParameterFilter { "$Path" -like '*TempHive_alice*' }
+            Should -Invoke Invoke-RegExe -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\TempHive_bob' }
+        }
+
+        It 'never unloads a hive that failed to load, and reports the skipped profile (exit 3)' {
+            Mock Invoke-RegExe { 1 } -ParameterFilter { $Arguments[0] -eq 'load' -and $Arguments[1] -eq 'HKU\TempHive_alice' }
+            $r = Get-Run
+            $r.Code | Should -Be 3
+            $r.Text | Should -Match 'alice'
+            Should -Invoke Invoke-RegExe -Times 0 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\TempHive_alice' }
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly -ParameterFilter { "$Path" -like '*TempHive_alice*' }
+        }
+
+        It 'does not write into HKU\DefaultUser when the template hive failed to load' {
+            Mock Invoke-RegExe { 1 } -ParameterFilter { $Arguments[0] -eq 'load' -and $Arguments[1] -eq 'HKU\DefaultUser' }
+            Get-Exit | Should -Be 3
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly -ParameterFilter { "$Path" -like '*HKEY_USERS\DefaultUser*' }
+            Should -Invoke New-Item -Times 0 -Exactly -ParameterFilter { "$Path" -like '*HKEY_USERS\DefaultUser*' }
+            Should -Invoke Invoke-RegExe -Times 0 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\DefaultUser' }
+        }
+
+        It 'retries a refused unload, then reports the stuck hive instead of claiming success' {
+            Mock Invoke-RegExe { 1 } -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\TempHive_alice' }
+            $r = Get-Run
+            $r.Code | Should -Be 3
+            $r.Text | Should -Match 'TempHive_alice'
+            Should -Invoke Invoke-RegExe -Times 3 -Exactly -ParameterFilter { $Arguments[0] -eq 'unload' -and $Arguments[1] -eq 'HKU\TempHive_alice' }
+        }
+
+        It 'writes through the SID for a signed-in user and never loads or unloads that hive' {
+            Mock Get-LoadedUserSidMap { @{ alice = $script:Sid } }
+            Get-Exit | Should -Be 0
+            Should -Invoke Invoke-RegExe -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'HKU\TempHive_alice' }
+            Should -Invoke Set-ItemProperty -ParameterFilter { "$Path" -like "*HKEY_USERS\$($script:Sid)\*" }
         }
     }
 }

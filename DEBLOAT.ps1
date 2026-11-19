@@ -185,6 +185,49 @@ function Get-LoadedUserSidMap {
     return $map
 }
 
+# Loads one offline hive, runs every operation against it and always releases it. Only a hive this
+# call loaded itself is ever unloaded: a hive that is already mounted (a signed-in profile, or one
+# left behind by another process) is skipped untouched. Returns $true when the hive was processed.
+function Invoke-OnOwnedHive {
+    param(
+        [Parameter(Mandatory)][string]$HiveName,
+        [Parameter(Mandatory)][string]$HivePath,
+        [Parameter(Mandatory)][string]$Label,
+        [scriptblock[]]$RegistryOperations
+    )
+    if (Test-Path "Registry::HKEY_USERS\$HiveName") {
+        Add-DebloatFailure "Skipped ${Label}: HKU\$HiveName is already mounted by something else. Left untouched."
+        return $false
+    }
+    $rc = Invoke-RegExe @("load", "HKU\$HiveName", $HivePath)
+    if ($rc -ne 0) {
+        Add-DebloatFailure "Skipped ${Label}: hive in use or inaccessible (reg load exit $rc)."
+        return $false
+    }
+    $done = $true
+    try {
+        foreach ($Op in $RegistryOperations) {
+            Invoke-Command -ScriptBlock $Op -ArgumentList $HiveName
+        }
+    } catch {
+        $done = $false
+        Add-DebloatFailure "Cleanup of $Label stopped early: $($_.Exception.Message)"
+    } finally {
+        # Runs on errors and on Ctrl-C or a stopped pipeline, so the hive is never left mounted.
+        $unloaded = $false
+        for ($try = 1; $try -le 3 -and -not $unloaded; $try++) {
+            [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+            if ((Invoke-RegExe @("unload", "HKU\$HiveName")) -eq 0) { $unloaded = $true }
+            elseif ($try -lt 3) { Start-Sleep -Milliseconds 500 }
+        }
+        if (-not $unloaded) {
+            Add-DebloatFailure "Could not unload HKU\$HiveName after 3 tries. Run: reg unload HKU\$HiveName"
+            $done = $false
+        }
+    }
+    return $done
+}
+
 # Per-user hive cleanup. Loads each profile (or targets already-loaded SIDs
 # for logged-in users), runs each provided scriptblock against the hive,
 # then unloads. Safe to call multiple times; loaded hives are detected.
@@ -193,12 +236,7 @@ function Invoke-ComprehensiveUserCleanup {
 
     # 1. Target the Default User (Template for all FUTURE users)
     Write-Host "[*]   Updating Default User Template..." -ForegroundColor $WarnCol
-    [void](Invoke-RegExe @("load", "HKU\DefaultUser", (Get-DefaultUserHivePath)))
-    foreach ($Op in $RegistryOperations) {
-        Invoke-Command -ScriptBlock $Op -ArgumentList "DefaultUser"
-    }
-    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-    [void](Invoke-RegExe @("unload", "HKU\DefaultUser"))
+    [void](Invoke-OnOwnedHive -HiveName "DefaultUser" -HivePath (Get-DefaultUserHivePath) -Label "Default User template" -RegistryOperations $RegistryOperations)
 
     # 2. Map loaded hives by username so we can target logged-in users by SID
     #    instead of trying to reg-load their in-use NTUSER.DAT.
@@ -212,24 +250,18 @@ function Invoke-ComprehensiveUserCleanup {
             # Hive is already loaded (user logged in). Write through SID; no load/unload.
             $HiveName = $LoadedHives[$Folder.Name]
             Write-Host "[*]   Cleaning Profile (live): $($Folder.Name)..." -ForegroundColor $WarnCol
-            foreach ($Op in $RegistryOperations) {
-                Invoke-Command -ScriptBlock $Op -ArgumentList $HiveName
+            try {
+                foreach ($Op in $RegistryOperations) {
+                    Invoke-Command -ScriptBlock $Op -ArgumentList $HiveName
+                }
+            } catch {
+                Add-DebloatFailure "Cleanup of $($Folder.Name) stopped early: $($_.Exception.Message)"
             }
         } else {
             $NTUserPath = "$($Folder.FullName)\NTUSER.DAT"
             if (Test-Path $NTUserPath) {
-                $HiveName = "TempHive_$($Folder.Name)"
                 Write-Host "[*]   Cleaning Profile: $($Folder.Name)..." -ForegroundColor $WarnCol
-                $rc = Invoke-RegExe @("load", "HKU\$HiveName", $NTUserPath)
-                if ($rc -eq 0) {
-                    foreach ($Op in $RegistryOperations) {
-                        Invoke-Command -ScriptBlock $Op -ArgumentList $HiveName
-                    }
-                    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-                    [void](Invoke-RegExe @("unload", "HKU\$HiveName"))
-                } else {
-                    Write-Host "[!]   Skipped $($Folder.Name): hive in use or inaccessible." -ForegroundColor $DimCol
-                }
+                [void](Invoke-OnOwnedHive -HiveName "TempHive_$($Folder.Name)" -HivePath $NTUserPath -Label $Folder.Name -RegistryOperations $RegistryOperations)
             }
         }
     }
@@ -818,7 +850,8 @@ function Invoke-DebloatMain {
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host "█" -ForegroundColor $LineCol
 
     if ($script:DebloatFailures.Count -gt 0) {
-        Write-Output ("[WARN] DEBLOAT partial: {0} problem(s), see [!] lines above (exit 3)" -f $script:DebloatFailures.Count)
+        foreach ($m in $script:DebloatFailures) { Write-Output "[!]   $m" }
+        Write-Output ("[WARN] DEBLOAT partial: {0} problem(s) listed above (exit 3)" -f $script:DebloatFailures.Count)
         Exit-KillerScript 3
     }
     if ($script:DebloatReboot) {
