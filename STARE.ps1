@@ -10,17 +10,57 @@
     your selections in view at every step.
 #>
 
-$EXIT_SUCCESS = 0
-$EXIT_DENIED  = 3
+#region [0] - EXIT, SYSTEM BOUNDARIES
+# ============================================================================
 
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Warning "Elevation Required: Please run as Administrator."
-    Exit $EXIT_DENIED
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
 }
 
-# Force UTF-8 output so box-drawing characters (━ etc.) render correctly
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding            = [System.Text.Encoding]::UTF8
+function Exit-StareRun {
+    # One exit point. The final line goes to the success stream so an RMM captures it, and it
+    # always agrees with the exit code.
+    param([int]$Code, [string]$Text)
+    Write-Output "STARE RESULT: exit code $Code - $Text"
+    Exit-KillerScript $Code
+}
+
+# System boundaries. Tests mock these.
+function Test-StareElevated {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+}
+
+function Test-StareConsole {
+    # True when a person can answer key prompts. False for RMM consoles, redirected input and no console.
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+        $null = [Console]::KeyAvailable
+        return $true
+    } catch { return $false }
+}
+
+function Read-StareKey {
+    [Console]::ReadKey($true)
+}
+
+function Get-StareCursor {
+    # Current cursor position, or $null when the host has no cursor to move.
+    try { $p = $Host.UI.RawUI.CursorPosition; return [pscustomobject]@{ X = [int]$p.X; Y = [int]$p.Y } } catch { return $null }
+}
+
+function Move-StareCursor {
+    param([int]$X, [int]$Y)
+    try { $Host.UI.RawUI.CursorPosition = New-Object System.Management.Automation.Host.Coordinates($X, $Y) } catch { }
+}
+
+function Get-StareScheduleService {
+    $svc = New-Object -ComObject "Schedule.Service"
+    $svc.Connect()
+    $svc
+}
+#endregion
 
 #region [1] - BANNER & DISPLAY HELPERS
 # ============================================================================
@@ -203,7 +243,7 @@ function Invoke-TaskCreationWizard {
         Write-Host "Run a script" -ForegroundColor $script:ValueFG
         Write-Host "Selection: " -ForegroundColor $script:LabelFG -NoNewline
 
-        $keyInfo = [Console]::ReadKey($true)
+        $keyInfo = Read-StareKey
         if ($keyInfo.Key -eq [ConsoleKey]::Escape) { return } # Exit wizard
         $choice = $keyInfo.KeyChar.ToString()
 
@@ -314,7 +354,7 @@ function Invoke-TaskCreationWizard {
         Write-Host "  [4] " -ForegroundColor $script:MainTextFG -NoNewline; Write-Host "Startup" -ForegroundColor $script:ValueFG
         Write-Host "Selection: " -ForegroundColor $script:LabelFG -NoNewline
 
-        $key = [Console]::ReadKey($true)
+        $key = Read-StareKey
         if ($key.Key -eq [ConsoleKey]::Escape) { return }
         $sched = $key.KeyChar
 
@@ -416,8 +456,7 @@ function Invoke-TaskCreationWizard {
                         $startM = [int]($t.Split(':')[1])
                         $startBoundary = (Get-Date -Hour $startH -Minute $startM -Second 0).ToString("yyyy-MM-ddTHH:mm:ss")
 
-                        $comSched = New-Object -ComObject "Schedule.Service"
-                        $comSched.Connect()
+                        $comSched = Get-StareScheduleService
                         $rootFolder = $comSched.GetFolder("\")
                         $taskDef = $comSched.NewTask(0)
 
@@ -453,9 +492,10 @@ function Invoke-TaskCreationWizard {
                         $taskRegistered = $true
                         $trigger = $true  # sentinel to exit schedule loop
                     } catch {
+                        $script:StareFailures++
                         Write-Host "`n[ERR] $($_.Exception.GetType().Name): $($_.Exception.Message)" -ForegroundColor Red
                         Write-Host "Press any key to go back..." -ForegroundColor DarkGray
-                        $null = [Console]::ReadKey($true)
+                        $null = Read-StareKey
                     }
                     break
                 }
@@ -474,6 +514,7 @@ function Invoke-TaskCreationWizard {
         -WizardLines $finalWizardLines
 
     if ($taskRegistered) {
+        $script:StareChanges++
         Write-Host "[!] Task '$taskName' Created Successfully!" -ForegroundColor $script:DoneFG
     } else {
         try {
@@ -481,206 +522,230 @@ function Invoke-TaskCreationWizard {
                 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
             }
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger) -User "SYSTEM" -RunLevel Highest -Force -ErrorAction Stop | Out-Null
+            $script:StareChanges++
             Write-Host "[!] Task '$taskName' Created Successfully!" -ForegroundColor $script:DoneFG
         } catch {
+            $script:StareFailures++
             Write-Host "[!] Error creating task: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 
     Write-Host "Press any key to return to the list..." -ForegroundColor $script:MutedFG
-    $null = [Console]::ReadKey($true)
+    $null = Read-StareKey
 }
 #endregion
 
 #region [3] - MAIN LOOP
 # ============================================================================
 
-$script:TaskAction      = "List"
-$script:mainLoop        = $true
-$script:RefreshRequired = $true
+function Invoke-StareMain {
+    $script:StareChanges  = 0
+    $script:StareFailures = 0
+    $script:MenuPos       = $null
 
-while ($script:mainLoop) {
+    if (-not (Test-StareElevated)) {
+        Write-Warning "Elevation Required: Please run as Administrator."
+        Exit-StareRun 2 "not elevated, nothing was changed"
+    }
 
-    if ($script:TaskAction -eq "List") {
+    # Force UTF-8 output so box-drawing characters render correctly. Hosts with no console reject this.
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+    try { $global:OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
-        if ($script:RefreshRequired) {
-            Clear-Host
-            Write-Banner
-            Write-StatusHeader
+    if (-not (Test-StareConsole)) {
+        Exit-StareRun 2 "STARE is an interactive wizard and needs a console to answer its prompts, nothing was changed"
+    }
 
-            $tasks = Get-ScheduledTask |
-                     Where-Object { $_.TaskPath -notlike "\Microsoft\*" } |
-                     Sort-Object { $_.TaskName }
+    $script:TaskAction      = "List"
+    $script:mainLoop        = $true
+    $script:RefreshRequired = $true
 
-            $nameColWidth = $script:Width - 34
-            Write-Host ("{0,-4}"                    -f "#")          -ForegroundColor $script:SubLabelFG -NoNewline
-            Write-Host (" {0,-$nameColWidth} "      -f "Task Name") -ForegroundColor $script:SubLabelFG -NoNewline
-            Write-Host ("{0,-8} "                   -f "State")     -ForegroundColor $script:SubLabelFG -NoNewline
-            Write-Host "Next Run"                                    -ForegroundColor $script:SubLabelFG
+    while ($script:mainLoop) {
 
-            $i = 0
-            $script:colorIndex = 0
+        if ($script:TaskAction -eq "List") {
 
-            Write-HLine -Style dashed
+            if ($script:RefreshRequired) {
+                Clear-Host
+                Write-Banner
+                Write-StatusHeader
 
-            for ($i = 0; $i -lt $tasks.Count; $i++) {
-                $t = $tasks[$i]
-                $taskInfo = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue
-                $nextRun = if ($taskInfo.NextRunTime -and $taskInfo.NextRunTime -ne [datetime]::MinValue) {
-                    $taskInfo.NextRunTime.ToString("yyyy-MM-dd HH:mm:ss")
-                } else { "N/A" }
+                $tasks = @(Get-ScheduledTask |
+                         Where-Object { $_.TaskPath -notlike "\Microsoft\*" } |
+                         Sort-Object { $_.TaskName })
 
-                $displayName  = $t.TaskName
-                if ($displayName.Length -gt ($nameColWidth - 3)) { $displayName = $displayName.Substring(0, ($nameColWidth - 3)) + "..." }
-                $stateColor = if ($t.State -eq 'Ready') { $script:DoneFG } else { "Red" }
+                $nameColWidth = $script:Width - 34
+                Write-Host ("{0,-4}"                    -f "#")          -ForegroundColor $script:SubLabelFG -NoNewline
+                Write-Host (" {0,-$nameColWidth} "      -f "Task Name") -ForegroundColor $script:SubLabelFG -NoNewline
+                Write-Host ("{0,-8} "                   -f "State")     -ForegroundColor $script:SubLabelFG -NoNewline
+                Write-Host "Next Run"                                    -ForegroundColor $script:SubLabelFG
 
-                Write-Host (" {0,2} "   -f ($i + 1))      -ForegroundColor $script:MainTextFG -NoNewline
-                Write-Host (" {0,-$nameColWidth} " -f $displayName) -ForegroundColor $script:ValueFG    -NoNewline
-                Write-Host ("{0,-8} "   -f $t.State)     -ForegroundColor $stateColor        -NoNewline
-                Write-Host $nextRun -ForegroundColor $script:MutedFG
-            }
+                $i = 0
+                $script:colorIndex = 0
 
-            # Anchor the top of the footer (the dashed line) ONLY the first time
-            if ($null -eq $script:MenuPos) { 
-                $script:MenuPos = $Host.UI.RawUI.CursorPosition 
-            }
-            
-            # Move to the locked anchor and draw the dashed line
-            $Host.UI.RawUI.CursorPosition = $script:MenuPos
-            Write-HLine -Style dashed
-            
-            # Create a NEW coordinate object so we don't ruin the anchor
-            $optionsPos = New-Object System.Management.Automation.Host.Coordinates($script:MenuPos.X, ($script:MenuPos.Y + 1))
-            $Host.UI.RawUI.CursorPosition = $optionsPos
-            
-            $script:RefreshRequired = $false
-
-            Write-Host " " -NoNewline
-            Write-Host "[" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host "C" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host "]" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host " Create  " -ForegroundColor $script:ValueFG -NoNewline
-
-            Write-Host "[" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host "D" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host "]" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host " Delete  " -ForegroundColor $script:ValueFG -NoNewline
-
-            Write-Host "[" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host "Q" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host "]" -ForegroundColor $script:MainTextFG -NoNewline
-            Write-Host " Quit (or ESC)" -ForegroundColor $script:ValueFG
-
-            Write-Host "Selection: " -ForegroundColor $script:LabelFG -NoNewline
-        }
-
-        $keyInfo = [Console]::ReadKey($true)
-        $choice  = if ($keyInfo.Key -eq [ConsoleKey]::Escape) { "Q" } else { $keyInfo.KeyChar.ToString() }
-
-        if ($choice.ToUpper() -eq "Q") {
-            $script:mainLoop = $false
-        }
-        elseif ($choice.ToUpper() -eq "C") {
-            $script:TaskAction      = "Create"
-            $script:RefreshRequired = $true
-        }
-        elseif ($choice.ToUpper() -eq "D") {
-            $pos = $script:MenuPos
-            
-            # Clear the dashed separator, [C][D][Q] line, and "Selection: " line
-            $Host.UI.RawUI.CursorPosition = $pos
-            Write-Host (" " * $script:Width)
-            $nextPos = $pos; $nextPos.Y += 1
-            $Host.UI.RawUI.CursorPosition = $nextPos
-            Write-Host (" " * $script:Width)
-            $nextPos2 = $pos; $nextPos2.Y += 2
-            $Host.UI.RawUI.CursorPosition = $nextPos2
-            Write-Host (" " * $script:Width)
-
-            $waitingForDelete = $true
-            while ($waitingForDelete) {
-                $deletePromptPos = New-Object System.Management.Automation.Host.Coordinates($pos.X, ($pos.Y + 1))
-                $Host.UI.RawUI.CursorPosition = $deletePromptPos
-                Write-Host (" " * $script:Width) -NoNewline
-                $Host.UI.RawUI.CursorPosition = $pos
                 Write-HLine -Style dashed
 
-                Write-Host "Task Number to Delete: " -ForegroundColor $script:LabelFG -NoNewline
-                $idx = Read-Esc ""
+                for ($i = 0; $i -lt $tasks.Count; $i++) {
+                    $t = $tasks[$i]
+                    $taskInfo = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue
+                    $nextRun = if ($taskInfo.NextRunTime -and $taskInfo.NextRunTime -ne [datetime]::MinValue) {
+                        $taskInfo.NextRunTime.ToString("yyyy-MM-dd HH:mm:ss")
+                    } else { "N/A" }
 
-                if ($null -eq $idx) {
-                    $waitingForDelete = $false
-                    $script:RefreshRequired = $false # Bypass the slow list refresh
+                    $displayName  = $t.TaskName
+                    if ($displayName.Length -gt ($nameColWidth - 3)) { $displayName = $displayName.Substring(0, ($nameColWidth - 3)) + "..." }
+                    $stateColor = if ($t.State -eq 'Ready') { $script:DoneFG } else { "Red" }
+
+                    Write-Host (" {0,2} "   -f ($i + 1))      -ForegroundColor $script:MainTextFG -NoNewline
+                    Write-Host (" {0,-$nameColWidth} " -f $displayName) -ForegroundColor $script:ValueFG    -NoNewline
+                    Write-Host ("{0,-8} "   -f $t.State)     -ForegroundColor $stateColor        -NoNewline
+                    Write-Host $nextRun -ForegroundColor $script:MutedFG
                 }
-                elseif ($idx -match '^\d+$' -and $tasks[([int]$idx) - 1]) {
-                    $delTaskName = $tasks[([int]$idx) - 1].TaskName
-                    Write-Host " Delete '$delTaskName'? [Y/N]: " -ForegroundColor $script:WarnFG -NoNewline
-                    $confirmKey = [Console]::ReadKey($true)
-                    if ($confirmKey.Key -eq [ConsoleKey]::Y) {
-                        Unregister-ScheduledTask -TaskName $delTaskName -Confirm:$false -ErrorAction SilentlyContinue
-                        Write-Host "Deleted." -ForegroundColor $script:DoneFG
-                        Start-Sleep -Seconds 1
-                        $script:RefreshRequired = $true
-                        $waitingForDelete = $false
-                    } else {
-                        Write-Host "Cancelled." -ForegroundColor $script:MutedFG
-                        Start-Sleep -Milliseconds 600
-                        $waitingForDelete = $false
-                        $script:RefreshRequired = $false
-                    }
+
+                # Anchor the top of the footer (the dashed line) ONLY the first time
+                if ($null -eq $script:MenuPos) {
+                    $script:MenuPos = Get-StareCursor
+                    if ($null -eq $script:MenuPos) { $script:MenuPos = [pscustomobject]@{ X = 0; Y = 0 } }
                 }
-                else {
-                    Write-Host " Invalid Selection!" -ForegroundColor $script:WarnFG -NoNewline
-                    Start-Sleep -Milliseconds 800
-                }
-                # Scrub the 3rd line (where the delete prompt was)
-                $promptPos = New-Object System.Management.Automation.Host.Coordinates($script:MenuPos.X, ($script:MenuPos.Y + 2))
-                $Host.UI.RawUI.CursorPosition = $promptPos
-                Write-Host (" " * $Host.UI.RawUI.WindowSize.Width)
+
+                # Move to the locked anchor and draw the dashed line, then the options line below it
+                Move-StareCursor $script:MenuPos.X $script:MenuPos.Y
+                Write-HLine -Style dashed
+                Move-StareCursor $script:MenuPos.X ($script:MenuPos.Y + 1)
+
+                $script:RefreshRequired = $false
+
+                Write-Host " " -NoNewline
+                Write-Host "[" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host "C" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host "]" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host " Create  " -ForegroundColor $script:ValueFG -NoNewline
+
+                Write-Host "[" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host "D" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host "]" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host " Delete  " -ForegroundColor $script:ValueFG -NoNewline
+
+                Write-Host "[" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host "Q" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host "]" -ForegroundColor $script:MainTextFG -NoNewline
+                Write-Host " Quit (or ESC)" -ForegroundColor $script:ValueFG
+
+                Write-Host "Selection: " -ForegroundColor $script:LabelFG -NoNewline
             }
-            
-            # Final Cleanup: Clear the dashed line and "Task Number" line before returning
-            $Host.UI.RawUI.CursorPosition = $pos
-            Write-Host (" " * $script:Width)
-            $Host.UI.RawUI.CursorPosition = New-Object System.Management.Automation.Host.Coordinates($pos.X, ($pos.Y + 1))
-            Write-Host (" " * $script:Width)
-            # Add this to ensure the cursor is back at the anchor for the next redraw
-            $Host.UI.RawUI.CursorPosition = $script:MenuPos 
-            $script:RefreshRequired = $true
+
+            $keyInfo = Read-StareKey
+            $choice  = if ($keyInfo.Key -eq [ConsoleKey]::Escape) { "Q" } else { $keyInfo.KeyChar.ToString() }
+
+            if ($choice.ToUpper() -eq "Q") {
+                $script:mainLoop = $false
+            }
+            elseif ($choice.ToUpper() -eq "C") {
+                $script:TaskAction      = "Create"
+                $script:RefreshRequired = $true
+            }
+            elseif ($choice.ToUpper() -eq "D") {
+                $pos = $script:MenuPos
+
+                # Clear the dashed separator, [C][D][Q] line, and "Selection: " line
+                foreach ($row in 0..2) {
+                    Move-StareCursor $pos.X ($pos.Y + $row)
+                    Write-Host (" " * $script:Width) -NoNewline
+                }
+
+                $waitingForDelete = $true
+                while ($waitingForDelete) {
+                    Move-StareCursor $pos.X ($pos.Y + 1)
+                    Write-Host (" " * $script:Width) -NoNewline
+                    Move-StareCursor $pos.X $pos.Y
+                    Write-HLine -Style dashed
+
+                    Write-Host "Task Number to Delete: " -ForegroundColor $script:LabelFG -NoNewline
+                    $idx = Read-Esc ""
+
+                    if ($null -eq $idx) {
+                        $waitingForDelete = $false
+                        $script:RefreshRequired = $false # Bypass the slow list refresh
+                    }
+                    elseif ($idx -match '^\d+$' -and $tasks[([int]$idx) - 1]) {
+                        $delTaskName = $tasks[([int]$idx) - 1].TaskName
+                        Write-Host " Delete '$delTaskName'? [Y/N]: " -ForegroundColor $script:WarnFG -NoNewline
+                        $confirmKey = Read-StareKey
+                        if ($confirmKey.Key -eq [ConsoleKey]::Y) {
+                            Unregister-ScheduledTask -TaskName $delTaskName -Confirm:$false -ErrorAction SilentlyContinue
+                            Write-Host "Deleted." -ForegroundColor $script:DoneFG
+                            Start-Sleep -Seconds 1
+                            $script:RefreshRequired = $true
+                            $waitingForDelete = $false
+                        } else {
+                            Write-Host "Cancelled." -ForegroundColor $script:MutedFG
+                            Start-Sleep -Milliseconds 600
+                            $waitingForDelete = $false
+                            $script:RefreshRequired = $false
+                        }
+                    }
+                    else {
+                        Write-Host " Invalid Selection!" -ForegroundColor $script:WarnFG -NoNewline
+                        Start-Sleep -Milliseconds 800
+                    }
+                    # Scrub the 3rd line (where the delete prompt was)
+                    Move-StareCursor $script:MenuPos.X ($script:MenuPos.Y + 2)
+                    Write-Host (" " * $script:Width) -NoNewline
+                }
+
+                # Final Cleanup: Clear the dashed line and "Task Number" line before returning
+                Move-StareCursor $pos.X $pos.Y
+                Write-Host (" " * $script:Width) -NoNewline
+                Move-StareCursor $pos.X ($pos.Y + 1)
+                Write-Host (" " * $script:Width) -NoNewline
+                # Put the cursor back at the anchor for the next redraw
+                Move-StareCursor $script:MenuPos.X $script:MenuPos.Y
+                $script:RefreshRequired = $true
+            }
         }
-    } 
-    elseif ($script:TaskAction -eq "Create") {
-        Invoke-TaskCreationWizard
-        $script:TaskAction      = "List"
-        $script:RefreshRequired = $true
-        # Reset MenuPos so it's recalculated based on the new list length
-        $script:MenuPos = $null 
+        elseif ($script:TaskAction -eq "Create") {
+            Invoke-TaskCreationWizard
+            $script:TaskAction      = "List"
+            $script:RefreshRequired = $true
+            # Reset MenuPos so it's recalculated based on the new list length
+            $script:MenuPos = $null
+        }
     }
+
+    # Erase the menu (dashed separator, options and prompt lines) before the footer
+    if ($script:MenuPos) {
+        foreach ($row in 0..2) {
+            Move-StareCursor $script:MenuPos.X ($script:MenuPos.Y + $row)
+            Write-Host (" " * $script:Width) -NoNewline
+        }
+        Move-StareCursor $script:MenuPos.X $script:MenuPos.Y
+    }
+
+    # Footer
+    $_sfx   = "█"
+    $_ftr1  = " ╔═╗ ╔╦╗ ╔═╗ ╦═╗ ╔═╗ "
+    $_ftr2  = " ╚═╗  ║  ╠═╣ ╠╦╝ ║╣  "
+    $_ftr3  = " ╚═╝  ╩  ╩ ╩ ╩╚═ ╚═╝ "
+    $_ftrW  = [Math]::Max($_ftr1.Length, [Math]::Max($_ftr2.Length, $_ftr3.Length))
+    $_ftr1  = $_ftr1.PadRight($_ftrW); $_ftr2 = $_ftr2.PadRight($_ftrW); $_ftr3 = $_ftr3.PadRight($_ftrW)
+    $_ffillW = $script:Width - $_ftrW - $_sfx.Length
+    $_footer = "  TASK ADMINISTRATION SEQUENCE COMPLETE"
+    $_fver   = "| $($script:Version)"
+    $_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $_fver.Length))
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr1 -ForegroundColor $SubtitleFG -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+    Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $SubtitleFG -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr3 -ForegroundColor $SubtitleFG -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+
+    # Effective outcome. The final line always agrees with the exit code.
+    $ok = $script:StareChanges
+    $bad = $script:StareFailures
+    if ($bad -gt 0 -and $ok -gt 0) {
+        Exit-StareRun 3 "partial: $ok change(s) applied, $bad failed"
+    }
+    if ($bad -gt 0) {
+        Exit-StareRun 1 "$bad change(s) failed, nothing was applied"
+    }
+    Exit-StareRun 0 "session ended, $ok change(s) applied"
 }
 #endregion
 
-#region [4] - EXIT
-# ============================================================================
-
-# Move cursor up 2 lines to the dashed separator, then erase everything below.
-# This is more reliable than $Host.UI.RawUI.CursorPosition in Windows Terminal.
-[Console]::Write([char]27 + "[2F")  # Cursor Previous Line x2 → start of dashed separator
-[Console]::Write([char]27 + "[J")   # Erase from cursor to end of screen
-
-# Footer
-$_sfx   = "█"
-$_ftr1  = " ╔═╗ ╔╦╗ ╔═╗ ╦═╗ ╔═╗ "
-$_ftr2  = " ╚═╗  ║  ╠═╣ ╠╦╝ ║╣  "
-$_ftr3  = " ╚═╝  ╩  ╩ ╩ ╩╚═ ╚═╝ "
-$_ftrW  = [Math]::Max($_ftr1.Length, [Math]::Max($_ftr2.Length, $_ftr3.Length))
-$_ftr1  = $_ftr1.PadRight($_ftrW); $_ftr2 = $_ftr2.PadRight($_ftrW); $_ftr3 = $_ftr3.PadRight($_ftrW)
-$_ffillW = $script:Width - $_ftrW - $_sfx.Length
-$_footer = "  TASK ADMINISTRATION SEQUENCE COMPLETE"
-$_fver   = "| $($script:Version)"
-$_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $_fver.Length))
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr1 -ForegroundColor $SubtitleFG -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $SubtitleFG -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr3 -ForegroundColor $SubtitleFG -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-
-exit $EXIT_SUCCESS
-#endregion
+if (-not $global:KillerScriptsTestMode) { Invoke-StareMain }
