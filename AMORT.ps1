@@ -369,6 +369,31 @@ function Write-FreeLine {
     Write-Host ("{0} free of {1} ({2}% free)" -f (Format-Size $Free), $TotalGBStr, $Pct) -ForegroundColor (Get-FreeColor $Pct)
 }
 
+# System Restore keeps its points as persistent, client-accessible shadow copies from the Microsoft
+# software provider. Backup, hardware-provider, mounted and other-volume copies belong to something
+# else, so they are never counted for retention and never deleted.
+$script:AmortSystemShadowProvider = '{b5946137-7b9f-4925-af80-51abd60b20d5}'
+function Get-AmortShadowInventory {
+    param([string]$VolumeDeviceId)
+    $all = @(Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction SilentlyContinue |
+        Where-Object { $_.VolumeName -eq $VolumeDeviceId })
+    $eligible = @($all | Where-Object {
+        $_.ID -and $_.InstallDate -and
+        $_.ClientAccessible -eq $true -and $_.Persistent -eq $true -and
+        $_.ProviderID -eq $script:AmortSystemShadowProvider -and
+        -not $_.ExposedName
+    } | Sort-Object InstallDate -Descending)
+    [pscustomobject]@{ Eligible = $eligible; SkippedCount = ($all.Count - $eligible.Count) }
+}
+# Deletes one shadow copy of C: and confirms it is gone. Returns $true only when it really is.
+function Remove-AmortShadowCopy {
+    param([string]$Id, [string]$VolumeDeviceId)
+    $r = Invoke-AmortTool "vssadmin.exe" @("delete", "shadows", "/for=C:", "/shadow=$Id", "/quiet")
+    if ($r.ExitCode -ne 0) { return $false }
+    $left = @(Get-AmortShadowInventory -VolumeDeviceId $VolumeDeviceId).Eligible | Where-Object { $_.ID -eq $Id }
+    return (@($left).Count -eq 0)
+}
+
 # Removes C:\Windows.old. Strips the previous-installation protection first, then tries rd,
 # an ownership retry, a robocopy mirror and finally a delete-on-reboot.
 function Remove-AmortWindowsOld {
@@ -730,9 +755,9 @@ $RegionEst = [int64]0
 $CVol = Get-CimInstance Win32_Volume -Filter "DriveLetter='C:'" -ErrorAction SilentlyContinue
 $Shadows = @()
 if ($CVol) {
-    $Shadows = @(Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue |
-        Where-Object { $_.VolumeName -eq $CVol.DeviceID } |
-        Sort-Object InstallDate -Descending)
+    $Inventory = Get-AmortShadowInventory -VolumeDeviceId $CVol.DeviceID
+    $Shadows = @($Inventory.Eligible)
+    if ($Inventory.SkippedCount -gt 0) { $script:Notes += "$($Inventory.SkippedCount) shadow copies of C: were not System Restore points and were left alone." }
 }
 $OldShadows = @($Shadows | Select-Object -Skip $KeepRestorePoints)
 if ($OldShadows.Count -gt 0) {
@@ -743,7 +768,9 @@ if ($OldShadows.Count -gt 0) {
         if ($Storage) { $RegionEst = [int64]([double]$Storage.UsedSpace * $OldShadows.Count / $Shadows.Count) }
     } else {
         foreach ($S in $OldShadows) {
-            Invoke-AmortTool "vssadmin.exe" @("delete", "shadows", "/shadow=$($S.ID)", "/quiet") | Out-Null
+            if (-not (Remove-AmortShadowCopy -Id $S.ID -VolumeDeviceId $CVol.DeviceID)) {
+                $script:AmortFailures += "restore point $($S.ID) could not be deleted"
+            }
         }
     }
 }

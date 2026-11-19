@@ -213,4 +213,92 @@ Describe 'AMORT' {
             Should -Invoke Stop-Process -Times 0 -Exactly -ParameterFilter { $Id -in 200, 300 }
         }
     }
+
+    Describe 'Finding 01: only explicitly eligible restore points are trimmed' {
+        BeforeEach {
+            $script:Deleted = New-Object System.Collections.ArrayList
+            $script:Sticky = @()
+            # The CIM view of shadow copies reflects what vssadmin has deleted so far.
+            Mock Get-CimInstance { @($script:Shadows | Where-Object { $script:Deleted -notcontains $_.ID }) } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+            Mock Invoke-AmortTool {
+                [void]$script:ToolCalls.Add("$FilePath $($ArgumentList -join ' ')")
+                $sh = $ArgumentList | Where-Object { $_ -like '/shadow=*' }
+                if ($sh) {
+                    $id = $sh.Substring(8)
+                    if ($script:ToolExit.ContainsKey('vssadmin.exe')) { return [pscustomobject]@{ ExitCode = $script:ToolExit['vssadmin.exe']; Output = '' } }
+                    if ($script:Sticky -notcontains $id) { [void]$script:Deleted.Add($id) }
+                }
+                [pscustomobject]@{ ExitCode = 0; Output = '' }
+            }
+        }
+
+        It 'never deletes copies that are not System Restore points, however old' {
+            $script:Shadows = @(
+                (New-FakeShadow -Id '{r1}' -DaysOld 1),
+                (New-FakeShadow -Id '{r2}' -DaysOld 5),
+                (New-FakeShadow -Id '{r3}' -DaysOld 9),
+                (New-FakeShadow -Id '{backup}' -DaysOld 100 -ClientAccessible $false),
+                (New-FakeShadow -Id '{hw}' -DaysOld 101 -Provider '{11111111-2222-3333-4444-555555555555}'),
+                (New-FakeShadow -Id '{mounted}' -DaysOld 102 -ExposedName 'Z:\'),
+                (New-FakeShadow -Id '{transient}' -DaysOld 103 -Persistent $false),
+                (New-FakeShadow -Id '{otherdisk}' -DaysOld 104 -Volume '\\?\Volume{d00d}\')
+            )
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 0
+            @($script:Deleted) | Should -Be @('{r3}')
+            ($script:ToolCalls -join "`n") | Should -Not -Match 'backup|hw\}|mounted|transient|otherdisk'
+            $r.Output | Should -Match 'PASS'
+        }
+
+        It 'passes the documented volume argument and keeps the newest eligible copies' {
+            $script:Shadows = @(
+                (New-FakeShadow -Id '{r1}' -DaysOld 1),
+                (New-FakeShadow -Id '{r2}' -DaysOld 5),
+                (New-FakeShadow -Id '{r3}' -DaysOld 9),
+                (New-FakeShadow -Id '{r4}' -DaysOld 12)
+            )
+            [void](Invoke-AmortCapture)
+            @($script:Deleted | Sort-Object) | Should -Be @('{r3}', '{r4}')
+            $line = @($script:ToolCalls | Where-Object { $_ -like '*vssadmin*{r3}*' })[0]
+            $line | Should -Match '/for=C:'
+            $line | Should -Match 'delete shadows'
+        }
+
+        It 'reports a partial result when vssadmin fails and when a copy survives its delete' {
+            $script:Shadows = @((New-FakeShadow -Id '{r1}' -DaysOld 1), (New-FakeShadow -Id '{r2}' -DaysOld 5), (New-FakeShadow -Id '{r3}' -DaysOld 9))
+            $script:ToolExit['vssadmin.exe'] = 2
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 3
+            $r.Output | Should -Match 'restore point \{r3\} could not be deleted'
+
+            $script:ToolExit.Remove('vssadmin.exe')
+            $script:Sticky = @('{r3}')
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 3
+            $r.Output | Should -Match 'restore point \{r3\} could not be deleted'
+        }
+
+        It 'deletes nothing when no copy is eligible' {
+            $script:Shadows = @((New-FakeShadow -Id '{a}' -DaysOld 50 -ClientAccessible $false), (New-FakeShadow -Id '{b}' -DaysOld 60 -ClientAccessible $false), (New-FakeShadow -Id '{c}' -DaysOld 70 -ClientAccessible $false))
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 0
+            $script:Deleted.Count | Should -Be 0
+            ($script:ToolCalls -join "`n") | Should -Not -Match 'vssadmin'
+        }
+
+        It 'a dry run estimates only the eligible copies and deletes nothing' {
+            Mock Get-CimInstance { [pscustomobject]@{ UsedSpace = [int64](10GB); Volume = [pscustomobject]@{ DeviceID = '\\?\Volume{c0ffee}\' } } } -ParameterFilter { $ClassName -eq 'Win32_ShadowStorage' }
+            $script:Shadows = @(
+                (New-FakeShadow -Id '{r1}' -DaysOld 1), (New-FakeShadow -Id '{r2}' -DaysOld 5),
+                (New-FakeShadow -Id '{r3}' -DaysOld 9), (New-FakeShadow -Id '{r4}' -DaysOld 12),
+                (New-FakeShadow -Id '{b1}' -DaysOld 100 -ClientAccessible $false), (New-FakeShadow -Id '{b2}' -DaysOld 101 -ClientAccessible $false),
+                (New-FakeShadow -Id '{b3}' -DaysOld 102 -ClientAccessible $false), (New-FakeShadow -Id '{b4}' -DaysOld 103 -ClientAccessible $false)
+            )
+            $r = Invoke-AmortCapture @{ DryRun = $true }
+            $r.Code | Should -Be 0
+            $script:Deleted.Count | Should -Be 0
+            # 4 eligible, keep 2, so half of the shared storage. A count over all 8 would say 2.5 GB.
+            $script:EstYieldBytes | Should -Be ([int64](5GB))
+        }
+    }
 }
