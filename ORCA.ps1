@@ -1,12 +1,12 @@
 ﻿<#
 .SYNOPSIS
-    Outlook Repair & Configuration Assistant (ORCA) v2.1
-    Developed by SteveTheKiller | Updated: 2026-03-13
+    Outlook Repair & Configuration Assistant (ORCA) v2.2
+    Developed by SteveTheKiller | Updated: 2026-11-18
 .DESCRIPTION
     Resets broken Outlook installations for one or all user profiles.
     Supports New Outlook (Microsoft Store), Classic Outlook (Office/M365),
     or both simultaneously. Clears cached data, registry hives, and
-    authentication tokens. Optionally removes OST files and purges 3rd-party
+    authentication tokens. Optionally renames OST files to .ost.bak-<timestamp> and purges 3rd-party
     extensions for Classic Outlook. New Outlook is reinstalled clean from
     the Microsoft Store after reset.
 .NOTES
@@ -14,31 +14,116 @@
     NTUSER.DAT is loaded for per-user registry cleanup on non-current accounts
     (requires the target user to be logged out).
     .\ORCA.ps1
-        Prompts for user, Outlook type, and OST/ext. deletion preference.
+        Prompts for user, Outlook type, and OST/ext. reset preference.
     .\ORCA.ps1 -Silent
-        Non-interactive - All Users, Both Outlook types, no OST/ext. deletion.
+        Non-interactive - All Users, Both Outlook types, no OST/ext. changes.
+    .\ORCA.ps1 -FullSignOut
+        Also clears the Windows account broker caches (TokenBroker, AAD broker plugin, Edge
+        WebView). The default clears only Office identity, OneAuth and Outlook credentials.
+        Credential Manager is cleared only for the user running ORCA.
 #>
 param(
-    [switch]$Silent
+    [switch]$Silent,
+    [switch]$FullSignOut
 )
 $EXIT_SUCCESS = 0   # Completed successfully
-$EXIT_ERROR   = 1   # General / unexpected error
-$EXIT_CANCEL  = 2   # User cancelled
+$EXIT_ERROR   = 1   # Failure
+$EXIT_CANCEL  = 2   # Not elevated, precondition failed, or the operator cancelled
+$EXIT_PARTIAL = 3   # Partial success: something was skipped or failed
 
-$script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
-$script:DeletedOSTs = @()
-$script:PurgedExtensions = New-Object System.Collections.Generic.List[string]
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
+}
 
-# Suppress standard progress bars (fixes "Deployment operation progress" popups from Appx cmdlets)
-$ProgressPreference = 'SilentlyContinue'
-# Ensure TLS 1.2 is enabled for PowerShell Gallery downloads (critical for PS 5.1)
-[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+function Exit-OrcaRun {
+    # One exit point. The final line goes to the success stream so an RMM captures it, and it
+    # always agrees with the exit code.
+    param([int]$Code, [string]$Text)
+    Write-Output "ORCA RESULT: exit code $Code - $Text"
+    Exit-KillerScript $Code
+}
+
+# ---- System boundaries (tests mock these) ------------------------------------
+function Test-OrcaElevated {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+}
+
+function Get-OrcaUsersRoot { 'C:\Users' }
+
+function Get-OrcaCurrentSid {
+    [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
+function Resolve-OrcaAccountName {
+    # Full DOMAIN\name for a SID, or $null when it cannot be resolved.
+    param([string]$Sid)
+    try {
+        (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+    } catch { $null }
+}
+
+function Get-OrcaProfile {
+    # Every real user profile with its SID, account name and profile folder, read from the profile
+    # list. The folder name is never assumed to match the account name.
+    param([string]$ListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList')
+    foreach ($key in @(Get-ChildItem -LiteralPath $ListPath -ErrorAction SilentlyContinue)) {
+        $sid = $key.PSChildName
+        if ($sid -notmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -and $sid -notmatch '^S-1-12-1-') { continue }
+        $raw = (Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+        if (-not $raw) { continue }
+        $path = [Environment]::ExpandEnvironmentVariables([string]$raw)
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
+        $account = Resolve-OrcaAccountName -Sid $sid
+        $name = if ($account) { $account -replace '^.*\x5C' } else { Split-Path -Leaf $path }
+        [pscustomobject]@{ Name = $name; Account = $account; Sid = $sid; Path = $path }
+    }
+}
+
+function Read-OrcaKey {
+    # Throws when there is no console, which sends the caller to its fallback.
+    [Console]::ReadKey($true)
+}
+
+function Read-OrcaLine {
+    # One typed line, or $null when there is no console to ask. Never lets a console error escape.
+    try {
+        $line = Read-Host
+        if ($null -eq $line) { return $null }
+        return ([string]$line).Trim()
+    } catch {
+        if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+        return $null
+    }
+}
+
+function Get-OrcaTempRoot { $env:TEMP }
+
+function Invoke-OrcaWinget {
+    # Runs winget through cmd.exe and returns its exit code, or $null when it could not be started.
+    param([string]$Arguments, [switch]$AnswerYes)
+    $prefix = if ($AnswerYes) { 'echo Y | ' } else { '' }
+    try {
+        $cmdLine = "/c ${prefix}winget $Arguments"
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -WindowStyle Hidden -Wait -PassThru
+        if ($proc) { return $proc.ExitCode }
+    } catch { }
+    return $null
+}
+
+function Test-OrcaWingetPresent {
+    [bool](Get-Command "winget" -ErrorAction SilentlyContinue)
+}
+
+function Clear-OrcaScreen {
+    try { Clear-Host } catch { }
+}
 
 #region [1] - BANNER & DISPLAY HELPERS
 # ============================================================================
-Clear-Host
 $script:Width  = 85
-$_ver    = "| v2.1"
+$_ver    = "| v2.2"
 $LineCol   = "DarkCyan"
 $MainCol   = "Cyan"
 $WarnCol   = "DarkYellow"
@@ -156,15 +241,12 @@ function Get-ActiveUser {
 # ---- Cleanup helper functions ------------------------------------------------
 
 function Invoke-PurgeExtensions {
-    param([string]$UserName)
+    param($Target)
     if (-not $script:PurgeExtensions) { return }
 
-    try {
-        $userSID = (New-Object System.Security.Principal.NTAccount($UserName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    } catch {
-        return
-    }
-    $hiveName   = "ORCA_Ext_$UserName"
+    $UserName = $Target.Name
+    $userSID  = $Target.Sid
+    $hiveName   = "ORCA_Ext_$userSID"
     $hiveLoaded = $false
     $root       = $null
 
@@ -172,8 +254,8 @@ function Invoke-PurgeExtensions {
     if (Test-Path "Registry::HKU\$userSID") {
         $root = "Registry::HKU\$userSID"
     } else {
-        $ntUser = "C:\Users\$UserName\NTUSER.DAT"
-        if (-not (Test-Path $ntUser)) { return } # Silently skip if no hive
+        $ntUser = "$($Target.Path)\NTUSER.DAT"
+        if (-not (Test-Path -LiteralPath $ntUser)) { return } # Silently skip if no hive
         reg load "HKU\$hiveName" $ntUser *>$null
         if ($LASTEXITCODE -eq 0) {
             $root = "Registry::HKU\$hiveName"; $hiveLoaded = $true
@@ -208,23 +290,57 @@ function Invoke-PurgeExtensions {
     }
 }
 
-function Invoke-TerminateOutlook {
-    param([string]$Mode)
-    if ($Mode -ne "Classic") {
-        Get-Process -Name "olk", "WebViewHost", "msedgewebview2" -ErrorAction SilentlyContinue | Stop-Process -Force
+function Get-OrcaSessionId {
+    [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+}
+
+function Get-OrcaProcessCommandLine {
+    param([int]$ProcessId)
+    $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if ($cim) { [string]$cim.CommandLine } else { "" }
+}
+
+function Get-OrcaOutlookProcess {
+    # Only processes that belong to the target user AND to Outlook. WebView2 hosts are shared by
+    # Teams, Widgets and other apps, so they count only when their command line names Outlook.
+    param($Target, [string]$Mode)
+    $names = @()
+    if ($Mode -ne "Classic") { $names += "olk", "WebViewHost", "msedgewebview2" }
+    if ($Mode -ne "New")     { $names += "OUTLOOK" }
+    if ($script:IsAdmin) {
+        $found = @(Get-Process -Name $names -IncludeUserName -ErrorAction SilentlyContinue)
+    } else {
+        # Without elevation the owner name is not readable. A standard user can only stop their
+        # own processes, so keep this session.
+        $session = Get-OrcaSessionId
+        $found = @(Get-Process -Name $names -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
     }
-    if ($Mode -ne "New") {
-        Get-Process -Name "OUTLOOK" -ErrorAction SilentlyContinue | Stop-Process -Force
+    foreach ($proc in $found) {
+        if ($script:IsAdmin) {
+            if (-not $proc.UserName) { continue }
+            if ($Target.Account) {
+                if ($proc.UserName -ne $Target.Account) { continue }
+            } elseif ((([string]$proc.UserName).Split([char]92)[-1]) -ne $Target.Name) { continue }
+        }
+        if ($proc.Name -in @("olk", "OUTLOOK")) { $proc; continue }
+        if ((Get-OrcaProcessCommandLine -ProcessId $proc.Id) -match 'OutlookForWindows|\\Olk\\|\bolk\.exe') { $proc }
+    }
+}
+
+function Invoke-TerminateOutlook {
+    param([string]$Mode, $Target)
+    foreach ($proc in @(Get-OrcaOutlookProcess -Target $Target -Mode $Mode)) {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Invoke-ClearNewOutlookData {
-    param([string]$UserName)
-    $local = "C:\Users\$UserName\AppData\Local"
+    param($Target)
+    $local = "$($Target.Path)\AppData\Local"
 
     if ($script:IsAdmin) {
         try {
-            $userSID = (New-Object System.Security.Principal.NTAccount($UserName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            $userSID = $Target.Sid
             $pkg = Get-AppxPackage -Name "Microsoft.OutlookForWindows" -User $userSID -ErrorAction SilentlyContinue
             if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -User $userSID -ErrorAction SilentlyContinue }
         } catch {}
@@ -239,8 +355,9 @@ function Invoke-ClearNewOutlookData {
 }
 
 function Invoke-ClearClassicOutlookData {
-    param([string]$UserName)
-    $local = "C:\Users\$UserName\AppData\Local"
+    param($Target)
+    $UserName = $Target.Name
+    $local = "$($Target.Path)\AppData\Local"
     @(
         "$local\Microsoft\Outlook\RoamCache",
         "$local\Microsoft\Outlook\Offline Address Books",
@@ -248,22 +365,33 @@ function Invoke-ClearClassicOutlookData {
     ) | Where-Object { Test-Path $_ } | ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
 
     if ($script:DeleteOST) {
-        $ostFiles = Get-ChildItem "$local\Microsoft\Outlook" -Filter "*.ost" -ErrorAction SilentlyContinue
+        # The OST is renamed in place, never deleted, so the cached mail survives a bad reset.
+        # Each rename is verified before it is reported.
+        $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $ostFiles = @(Get-ChildItem -LiteralPath "$local\Microsoft\Outlook" -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer -and $_.Extension -eq ".ost" })
         foreach ($ostFile in $ostFiles) {
-            $script:DeletedOSTs += $ostFile.FullName
-            Remove-Item -Path $ostFile.FullName -Force -ErrorAction SilentlyContinue
+            $leaf   = "$($ostFile.Name).bak-$stamp"
+            $backup = Join-Path $ostFile.DirectoryName $leaf
+            try {
+                if (Test-Path -LiteralPath $backup) { throw "the backup name already exists" }
+                Rename-Item -LiteralPath $ostFile.FullName -NewName $leaf -ErrorAction Stop
+                if ((Test-Path -LiteralPath $ostFile.FullName) -or -not (Test-Path -LiteralPath $backup)) {
+                    throw "the rename could not be verified"
+                }
+                [void]$script:BackedUpOSTs.Add($backup)
+            } catch {
+                [void]$script:Problems.Add("OST not backed up for $UserName and left in place: $($ostFile.Name) ($($_.Exception.Message))")
+            }
         }
     }
 }
 
 function Invoke-RegistryCleanup {
-    param([string]$UserName, [string]$Mode)
-    try {
-        $userSID = (New-Object System.Security.Principal.NTAccount($UserName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    } catch {
-        return
-    }
-    $hiveName   = "ORCA_$UserName"
+    param($Target, [string]$Mode)
+    $UserName = $Target.Name
+    $userSID  = $Target.Sid
+    $hiveName   = "ORCA_$userSID"
     $hiveLoaded = $false
     $root       = $null
 
@@ -272,9 +400,10 @@ function Invoke-RegistryCleanup {
         $root = "Registry::HKU\$userSID"
     } else {
         # User is not logged in, so we try to load their hive manually
-        $ntUser = "C:\Users\$UserName\NTUSER.DAT"
-        if (-not (Test-Path $ntUser)) {
+        $ntUser = "$($Target.Path)\NTUSER.DAT"
+        if (-not (Test-Path -LiteralPath $ntUser)) {
             Write-Host " (NTUSER.DAT not found - skipping registry)" -ForegroundColor $WarnCol -NoNewline
+            [void]$script:Problems.Add("registry not cleaned for $UserName (NTUSER.DAT not found)")
             return
         }
         reg load "HKU\$hiveName" $ntUser *>$null
@@ -283,6 +412,7 @@ function Invoke-RegistryCleanup {
             $hiveLoaded = $true
         } else {
             Write-Host " (hive locked - skipping registry)" -ForegroundColor $WarnCol -NoNewline
+            [void]$script:Problems.Add("registry not cleaned for $UserName (hive locked)")
             return
         }
     }
@@ -302,511 +432,581 @@ function Invoke-RegistryCleanup {
     }
 }
 
-function Invoke-AuthFlush {
-    param([string]$UserName)
-    $local = "C:\Users\$UserName\AppData\Local"
-    @(
-        "$local\Microsoft\IdentityCache",
-        "$local\Microsoft\Edge\User Data\Default\EBWebView",
-        "$local\Microsoft\OneAuth",
-        "$local\Microsoft\TokenBroker\Cache"
-    ) | Where-Object { Test-Path $_ } | ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
-
+function Clear-OrcaCredential {
+    # Credential Manager belongs to the identity that runs this process. It is never touched
+    # for any other profile.
     cmdkey /list | ForEach-Object {
         if ($_ -like "*Target:*Outlook*" -or $_ -like "*Target:*Office*") {
             $target = ($_ -split "Target: ")[1].Trim()
-            cmdkey /delete:$target
+            cmdkey /delete:$target | Out-Null
         }
     }
-    Get-ChildItem -Path "$local\Packages\Microsoft.AAD.BrokerPlugin_*" -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-AuthFlush {
+    # Sign-out scope. The default clears only what Office and Outlook own: the Office identity
+    # cache, OneAuth and the Outlook and Office credentials. The Windows account broker
+    # (TokenBroker and the AAD broker plugin) is shared with Teams, Edge and the Windows work
+    # account, so it is cleared only with -FullSignOut.
+    param($Target, [bool]$FullSignOut)
+    $local = "$($Target.Path)\AppData\Local"
+    $paths = @(
+        "$local\Microsoft\IdentityCache",
+        "$local\Microsoft\OneAuth"
+    )
+    if ($FullSignOut) {
+        $paths += "$local\Microsoft\Edge\User Data\Default\EBWebView"
+        $paths += "$local\Microsoft\TokenBroker\Cache"
+    }
+    $paths | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Remove-Item -LiteralPath $_ -Recurse -Force -ErrorAction SilentlyContinue }
+
+    if ($Target.Sid -eq (Get-OrcaCurrentSid)) {
+        Clear-OrcaCredential
+    } else {
+        Write-Host " (Credential Manager is per identity - not cleared)" -ForegroundColor $WarnCol -NoNewline
+        [void]$script:Problems.Add("Credential Manager entries not cleared for $($Target.Name), run ORCA as that user")
+    }
+    if ($FullSignOut) {
+        foreach ($brokerDir in @(Get-ChildItem -Path "$local\Packages\Microsoft.AAD.BrokerPlugin_*" -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $brokerDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     Start-Sleep -Seconds 15
 }
 #endregion
 
-#region [2] - CONFIGURATION & SETUP
-# ============================================================================
-Write-Header
-if (-not $script:IsAdmin) {
-    Write-Host "  Standard User Mode (Current Profile Only)" -ForegroundColor $WarnCol
-}
+function Invoke-OrcaMain {
+    param([switch]$Silent, [switch]$FullSignOut)
+    $script:IsAdmin = Test-OrcaElevated
+    $script:BackedUpOSTs = New-Object System.Collections.Generic.List[string]
+    $script:PurgedExtensions = New-Object System.Collections.Generic.List[string]
+    $script:Problems = New-Object System.Collections.Generic.List[string]
+    $ProgressPreference = 'SilentlyContinue'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Clear-OrcaScreen
+    try {
+        Write-Header
+        if (-not $script:IsAdmin) {
+            Write-Host "  Standard User Mode (Current Profile Only)" -ForegroundColor $WarnCol
+        }
 
-# === USER SELECTION ===
-$ExcludedProfiles = @("Public", "Default", "All Users", "LocalService", "NetworkService", "SYSTEM")
-$UserProfiles = Get-ChildItem "C:\Users" | Where-Object { $_.PSIsContainer -and $_.Name -notin $ExcludedProfiles }
+        # === USER SELECTION ===
+        $UserProfiles = @(Get-OrcaProfile)
+        if ($UserProfiles.Count -eq 0) {
+            Exit-OrcaRun $EXIT_CANCEL "no user profiles were found in the profile list, nothing was changed."
+        }
 
-if ($script:IsAdmin) {
-    # Detect the active interactive user (works even when script is elevated)
-    $_activeUser   = Get-ActiveUser
+        if ($script:IsAdmin) {
+            # Detect the active interactive user (works even when script is elevated)
+            $_activeUser   = Get-ActiveUser
 
-    # Reorder profiles: Active user first (Index 0), then others
-    if ($null -ne $_activeUser -and $UserProfiles.Name -contains $_activeUser) {
-        $activeObj = $UserProfiles | Where-Object { $_.Name -eq $_activeUser }
-        $otherObjs = $UserProfiles | Where-Object { $_.Name -ne $_activeUser }
-        $UserProfiles = @($activeObj) + @($otherObjs)
-        $_defaultLabel = "0"
-        $_defaultValue = "0"
-    } else {
-        $_defaultLabel = "A"
-        $_defaultValue = "A"
-    }
-
-    if (-not $Silent) {
-        Write-Host ""
-        Write-Host "Select user profile:" -ForegroundColor $LineCol
-        for ($i = 0; $i -lt $UserProfiles.Count; $i++) {
-            $uName = $UserProfiles[$i].Name
-            Write-Host "  [$i] " -ForegroundColor $DimCol -NoNewline
-            Write-Host "$uName" -ForegroundColor $AccentCol -NoNewline
-            if ($uName -eq $_activeUser) {
-                Write-Host " (Current User)" -ForegroundColor $WarnCol
+            # Reorder profiles: Active user first (Index 0), then others
+            if ($null -ne $_activeUser -and $UserProfiles.Name -contains $_activeUser) {
+                $activeObj = $UserProfiles | Where-Object { $_.Name -eq $_activeUser }
+                $otherObjs = $UserProfiles | Where-Object { $_.Name -ne $_activeUser }
+                $UserProfiles = @($activeObj) + @($otherObjs)
+                $_defaultLabel = "0"
+                $_defaultValue = "0"
             } else {
+                $_defaultLabel = "A"
+                $_defaultValue = "A"
+            }
+
+            if (-not $Silent) {
                 Write-Host ""
+                Write-Host "Select user profile:" -ForegroundColor $LineCol
+                for ($i = 0; $i -lt $UserProfiles.Count; $i++) {
+                    $uName = $UserProfiles[$i].Name
+                    Write-Host "  [$i] " -ForegroundColor $DimCol -NoNewline
+                    Write-Host "$uName" -ForegroundColor $AccentCol -NoNewline
+                    if ($uName -eq $_activeUser) {
+                        Write-Host " (Current User)" -ForegroundColor $WarnCol
+                    } else {
+                        Write-Host ""
+                    }
+                }
+                Write-Host "  [A] " -ForegroundColor $DimCol -NoNewline; Write-Host "All Users" -ForegroundColor $AccentCol
+                Write-Host ""
+                Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
+                Write-Host "[0-$($UserProfiles.Count - 1)/A]  Enter = $_defaultLabel  Esc = quit: " -ForegroundColor $DimCol -NoNewline
+                try {
+                    $key = Read-OrcaKey
+                    Write-Host $key.KeyChar
+                    if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "cancelled by the operator, nothing was changed." }
+                    $userChoice = if ($key.Key -eq [ConsoleKey]::Enter) { $_defaultValue } else { $key.KeyChar.ToString() }
+                } catch {
+                    if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+                    $raw = Read-OrcaLine
+                    if ($null -eq $raw) { Exit-OrcaRun $EXIT_CANCEL "no console to ask which profile to reset, nothing was changed. Use -Silent for an unattended run." }
+                    $userChoice = if ([string]::IsNullOrWhiteSpace($raw)) { $_defaultValue } else { $raw }
+                }
+                $script:AllUsers = ($userChoice -eq 'A' -or $userChoice -eq 'a')
+                $pickIndex = 0
+                if ($script:AllUsers) {
+                    $TargetUsers = @($UserProfiles)
+                } elseif ([int]::TryParse([string]$userChoice, [ref]$pickIndex) -and $pickIndex -ge 0 -and $pickIndex -lt $UserProfiles.Count) {
+                    $TargetUsers = @($UserProfiles[$pickIndex])
+                } else {
+                    Write-Host "Invalid selection. Exiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "invalid profile selection, nothing was changed."
+                }
+            } else {
+                $script:AllUsers = $true
+                $TargetUsers = @($UserProfiles)
+            }
+        } else {
+            # Non-admin: force single-user mode for the current user and skip user selection prompt
+            $script:AllUsers = $false
+            $_activeUser = Get-ActiveUser
+            if ($null -eq $_activeUser) {
+                Write-Error "Could not determine the current user. Please run as Administrator to target other profiles."
+                Exit-OrcaRun $EXIT_CANCEL "could not determine the current user, nothing was changed."
+            }
+            # A standard user can only act on their own profile, so bind it by SID.
+            $mySid = Get-OrcaCurrentSid
+            $TargetUsers = @($UserProfiles | Where-Object { $_.Sid -eq $mySid })
+            if ($TargetUsers.Count -eq 0) {
+                Exit-OrcaRun $EXIT_CANCEL "no profile was found for the current user, nothing was changed."
             }
         }
-        Write-Host "  [A] " -ForegroundColor $DimCol -NoNewline; Write-Host "All Users" -ForegroundColor $AccentCol
-        Write-Host ""
-        Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
-        Write-Host "[0-$($UserProfiles.Count - 1)/A]  Enter = $_defaultLabel  Esc = quit: " -ForegroundColor $DimCol -NoNewline
-        try {
-            $key = [Console]::ReadKey($true)
-            Write-Host $key.KeyChar
-            if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL }
-            $userChoice = if ($key.Key -eq [ConsoleKey]::Enter) { $_defaultValue } else { $key.KeyChar.ToString() }
-        } catch {
-            $raw = (Read-Host).Trim()
-            $userChoice = if ([string]::IsNullOrWhiteSpace($raw)) { $_defaultValue } else { $raw }
-        }
-        $script:AllUsers = ($userChoice -eq 'A' -or $userChoice -eq 'a')
-        if ($script:AllUsers) {
-            $TargetUsers = $UserProfiles.Name
-        } elseif ($null -ne $UserProfiles[$userChoice]) {
-            $TargetUsers = @($UserProfiles[$userChoice].Name)
-        } else {
-            Write-Host "Invalid selection. Exiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL
-        }
-    } else {
-        $script:AllUsers = $true
-        $TargetUsers = $UserProfiles.Name
-    }
-} else {
-    # Non-admin: force single-user mode for the current user and skip user selection prompt
-    $script:AllUsers = $false
-    $_activeUser = Get-ActiveUser
-    if ($null -eq $_activeUser) {
-        Write-Error "Could not determine the current user. Please run as Administrator to target other profiles."
-        Exit $EXIT_ERROR
-    }
-    $TargetUsers = @($_activeUser)
-}
 
-# === OUTLOOK MODE SELECTION ===
-if (-not $Silent) {
-    Write-Host ""
-    Write-Host "Select Outlook version to reset:" -ForegroundColor $LineCol
-    Write-Host "  [1] " -ForegroundColor $DimCol -NoNewline; Write-Host "New Outlook" -ForegroundColor $AccentCol
-    Write-Host "  [2] " -ForegroundColor $DimCol -NoNewline; Write-Host "Classic Outlook" -ForegroundColor $AccentCol
-    Write-Host "  [3] " -ForegroundColor $DimCol -NoNewline; Write-Host "Both" -ForegroundColor $AccentCol
-    Write-Host ""
-    while ($true) {
-        Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
-        Write-Host "[1-3]  Enter = 3  Esc = quit: " -ForegroundColor $DimCol -NoNewline
-        try {
-            $key = [Console]::ReadKey($true)
-            if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL }
-            if ($key.Key -eq [ConsoleKey]::Enter) { Write-Host "3"; $modeChoice = "3" }
-            else { Write-Host $key.KeyChar; $modeChoice = $key.KeyChar.ToString() }
-        } catch {
-            $raw = (Read-Host).Trim()
-            if ([string]::IsNullOrWhiteSpace($raw)) { $modeChoice = "3" }
-            elseif ($raw -eq 'q' -or $raw -eq 'Q') { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL }
-            else { $modeChoice = $raw }
-        }
-        $script:OutlookMode = switch ($modeChoice) {
-            "1" { "New" }
-            "2" { "Classic" }
-            "3" { "Both" }
-            default { $null }
-        }
-        if ($script:OutlookMode) { break }
-        Write-Host "Invalid selection, try again." -ForegroundColor $WarnCol
-    }
-} else {
-    $script:OutlookMode = "Both"
-}
-
-# === OST DELETION (Classic / Both only) ===
-$script:DeleteOST = $false
-if (-not $Silent -and $script:OutlookMode -ne "New") {
-    Write-Host ""
-    Write-Host "Delete OST files?" -ForegroundColor $LineCol
-    Write-Host "  (removes local email cache - mailbox will re-sync on next login)" -ForegroundColor $WarnCol
-    Write-Host ""
-    Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
-    Write-Host "[Y/N]  Enter = N  Esc = quit: " -ForegroundColor $DimCol -NoNewline
-    try {
-        $key = [Console]::ReadKey($true)
-        Write-Host $key.KeyChar
-        if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL }
-        $ostChoice = if ($key.Key -eq [ConsoleKey]::Enter) { "N" } else { $key.KeyChar.ToString() }
-        $script:DeleteOST = ($ostChoice -eq 'Y' -or $ostChoice -eq 'y')
-    } catch {
-        $raw = (Read-Host).Trim()
-        if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "N" }
-        $script:DeleteOST = ($raw -eq 'Y' -or $raw -eq 'y')
-    }
-}
-
-# === EXTENSION PURGE (Classic / Both only) ===
-$script:PurgeExtensions = $false
-if (-not $Silent -and $script:OutlookMode -ne "New") {
-    Write-Host ""
-    Write-Host "Purge all Outlook extensions?" -ForegroundColor $LineCol
-    Write-Host "  (removes all 3rd-party add-ins like Salesforce, etc.)" -ForegroundColor $WarnCol
-    Write-Host ""
-    Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
-    Write-Host "[Y/N]  Enter = N  Esc = quit: " -ForegroundColor $DimCol -NoNewline
-    try {
-        $key = [Console]::ReadKey($true)
-        Write-Host $key.KeyChar
-        if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL }
-        $extChoice = if ($key.Key -eq [ConsoleKey]::Enter) { "N" } else { $key.KeyChar.ToString() }
-        $script:PurgeExtensions = ($extChoice -eq 'Y' -or $extChoice -eq 'y')
-    } catch {
-        $raw = (Read-Host).Trim()
-        if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "N" }
-        $script:PurgeExtensions = ($raw -eq 'Y' -or $raw -eq 'y')
-    }
-}
-
-# Redraw with confirmed selections
-Clear-Host
-Write-Header
-Write-Host "Device Name     : " -ForegroundColor $LineCol -NoNewline; Write-Host $env:COMPUTERNAME -ForegroundColor $AccentCol
-Write-Host "Target Profile  : " -ForegroundColor $LineCol -NoNewline
-if ($script:AllUsers) {
-    Write-Host "All Users " -ForegroundColor $AccentCol -NoNewline
-    Write-Host "($($TargetUsers.Count) profiles)" -ForegroundColor $WarnCol
-} else {
-    Write-Host $TargetUsers[0] -ForegroundColor $AccentCol
-}
-Write-Host "Mode            : " -ForegroundColor $LineCol -NoNewline
-if ($script:OutlookMode -eq "Both") {
-    Write-Host "Both " -ForegroundColor $AccentCol -NoNewline; Write-Host "(New and Classic Outlook)" -ForegroundColor $WarnCol
-} else {
-    Write-Host "$($script:OutlookMode) Outlook" -ForegroundColor $AccentCol
-}
-if ($script:OutlookMode -ne "New") {
-    Write-Host "Delete OSTs     : " -ForegroundColor $LineCol -NoNewline
-    if ($script:DeleteOST) { Write-Host "Yes" -ForegroundColor Red } else { Write-Host "No" -ForegroundColor $DimCol }
-    Write-Host "Purge Extensions: " -ForegroundColor $LineCol -NoNewline
-    if ($script:PurgeExtensions) { Write-Host "Yes" -ForegroundColor Red } else { Write-Host "No" -ForegroundColor $DimCol }
-}
-Write-HLine -Style dashed
-#endregion
-
-#region [3] - MAIN LOGIC
-# ============================================================================
-trap { Write-Error $_.Exception.Message; Exit $EXIT_ERROR }
-$script:skipReinstall = $false
-
-# Step counts per mode (WinGet is a pre-step outside the user loop)
-# New:     4 steps - [1] Kill/remove  [2] Registry  [3] Auth  [4] Reinstall
-# Classic: 3 steps - [1] Kill/clear   [2] Registry  [3] Auth
-# Both:    5 steps - [1] Kill/Classic clear  [2] New remove  [3] Registry  [4] Auth  [5] Reinstall
-$cleanupSteps = switch ($script:OutlookMode) { "New" { 3 } "Classic" { 3 } "Both" { 4 } }
-$reinstallSteps = if ($script:OutlookMode -ne "Classic") { 1 } else { 0 }
-$T = $cleanupSteps + $reinstallSteps
-$isSingleUser = ($TargetUsers.Count -eq 1)
-$stepOffset   = 0
-
-# If single user and using New/Both, WinGet becomes Step 1
-if ($isSingleUser -and $script:OutlookMode -ne "Classic") {
-    $T++
-    $stepOffset = 1
-}
-
-$loopTotalSteps = $T
-
-# --- WinGet bootstrap (New / Both only, runs once before user loop) ---
-if ($script:OutlookMode -ne "Classic") {
-    $wgLabel = if ($isSingleUser) { "1/$T" } else { "0/$loopTotalSteps" }
-    Write-Step $wgLabel "Validating WinGet environment..."
-    $WinGetTemp = Join-Path $env:TEMP "WinGet"
-    if (Test-Path $WinGetTemp) { Remove-Item $WinGetTemp -Recurse -Force -ErrorAction SilentlyContinue }
-    if (-not (Get-Command "winget" -ErrorAction SilentlyContinue)) {
-        if (-not (Get-Module -ListAvailable Microsoft.WinGet.Client)) {
-            Install-PackageProvider -Name NuGet -Force | Out-Null
-            Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser -AllowClobber | Out-Null
-        }
-        Import-Module Microsoft.WinGet.Client
-        Start-Process powershell.exe -ArgumentList "-NoProfile -Command `"Import-Module Microsoft.WinGet.Client; Repair-WinGetPackageManager -Latest`"" -WindowStyle Hidden -Wait
-    } else {
-        Start-Process -FilePath "cmd.exe" -ArgumentList "/c winget source reset --force && winget source update --silent" -WindowStyle Hidden -Wait
-    }
-    Complete-Step $wgLabel "Validating WinGet environment..."
-    if ($script:AllUsers) {
-        Write-HLine -Style dashed
-    }
-}
-
-# --- Per-user loop ---
-foreach ($UserName in $TargetUsers) {
-    if ($script:AllUsers) {
-        Write-Host "  User: " -ForegroundColor $LineCol -NoNewline
-        Write-Host $UserName -ForegroundColor $AccentCol
-    }
-
-    switch ($script:OutlookMode) {
-
-        "New" {
-            Write-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and removing package..."
-            Invoke-TerminateOutlook -Mode "New"
-            Invoke-ClearNewOutlookData -UserName $UserName
-            Complete-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and removing package..."
-
-            Write-Step "$($stepOffset + 2)/$loopTotalSteps" "Cleaning registry hives..."
-            Invoke-RegistryCleanup -UserName $UserName -Mode "New"
-            # Extension purge not applicable to New Outlook
-            Complete-Step "$($stepOffset + 2)/$loopTotalSteps" "Cleaning registry hives..."
-
-            Write-Step "$($stepOffset + 3)/$loopTotalSteps" "Flushing authentication tokens..."
-            Invoke-AuthFlush -UserName $UserName
-            Complete-Step "$($stepOffset + 3)/$loopTotalSteps" "Flushing authentication tokens..."
-
-            # Reinstall is handled after the user loop
-        }
-
-        "Classic" {
-            Write-Step "1/$loopTotalSteps" "Killing processes and clearing cache..."
-            Invoke-TerminateOutlook -Mode "Classic"
-            Invoke-ClearClassicOutlookData -UserName $UserName
-            Complete-Step "1/$loopTotalSteps" "Killing processes and clearing cache..."
-
-            Write-Step "2/$loopTotalSteps" "Cleaning registry hives..."
-            Invoke-RegistryCleanup -UserName $UserName -Mode "Classic"
-            Invoke-PurgeExtensions -UserName $UserName
-            Complete-Step "2/$loopTotalSteps" "Cleaning registry hives..."
-
-            Write-Step "3/$loopTotalSteps" "Flushing authentication tokens..."
-            Invoke-AuthFlush -UserName $UserName
-            Complete-Step "3/$loopTotalSteps" "Flushing authentication tokens..."
-        }
-
-        "Both" {
-            Write-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and clearing cache..."
-            Invoke-TerminateOutlook -Mode "Both"
-            Invoke-ClearClassicOutlookData -UserName $UserName
-            Complete-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and clearing cache..."
-
-            Write-Step "$($stepOffset + 2)/$loopTotalSteps" "Removing New Outlook package and data..."
-            Invoke-ClearNewOutlookData -UserName $UserName
-            Complete-Step "$($stepOffset + 2)/$loopTotalSteps" "Removing New Outlook package and data..."
-
-            Write-Step "$($stepOffset + 3)/$loopTotalSteps" "Cleaning registry hives..."
-            Invoke-RegistryCleanup -UserName $UserName -Mode "Both"
-            Invoke-PurgeExtensions -UserName $UserName
-            Complete-Step "$($stepOffset + 3)/$loopTotalSteps" "Cleaning registry hives..."
-
-            Write-Step "$($stepOffset + 4)/$loopTotalSteps" "Flushing authentication tokens..."
-            Invoke-AuthFlush -UserName $UserName
-            Complete-Step "$($stepOffset + 4)/$loopTotalSteps" "Flushing authentication tokens..."
-
-            # Reinstall is handled after the user loop
-        }
-    }
-    if ($script:AllUsers) {
-        Write-HLine -Style dashed
-    }
-}
-
-# --- System-Wide Reinstall (if applicable) ---
-if ($script:OutlookMode -ne "Classic") {
-    if ($script:AllUsers) {
-        Write-Host "  System: " -ForegroundColor $LineCol -NoNewline
-        Write-Host "Global Provisioning" -ForegroundColor $AccentCol
-    }
-
-    $reinstallStepNum = $stepOffset + $cleanupSteps + 1
-    $stepMsg = "Reinstalling New Outlook..."
-    if ($script:AllUsers) { $stepMsg = "Provisioning New Outlook for all users..." }
-    Write-Step "$reinstallStepNum/$T" $stepMsg
-
-    $installed = $false
-
-    # If running as SYSTEM and targeting a single, non-SYSTEM user, skip winget install
-    if (-not $script:AllUsers -and ($env:USERNAME -eq "SYSTEM") -and ($TargetUsers[0] -ne "SYSTEM")) {
-        $script:skipReinstall = $true
-        $status = "[SKIPPED]"
-        $pad = " " * [math]::Max(1, $script:Width - "[$reinstallStepNum/$T] $stepMsg".Length - $status.Length)
-        Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-        Write-Host "[$reinstallStepNum/$T]" -ForegroundColor $DimCol -NoNewline
-        Write-Host " $stepMsg$pad" -ForegroundColor $DimCol -NoNewline
-        Write-Host $status -ForegroundColor $WarnCol
-        Write-Host "Cannot install New Outlook for '$($TargetUsers[0])' from SYSTEM context." -ForegroundColor $WarnCol
-        Write-Host "Please run as the target user or select 'All Users' for provisioning." -ForegroundColor $WarnCol
-    }
-    
-    if (-not $script:skipReinstall) {
-        if ($script:AllUsers) {
-            $dlDir = Join-Path $env:TEMP "ORCA_DL"
-            New-Item -Path $dlDir -ItemType Directory -Force | Out-Null
-            $wingetDLArgs = "download --id 9NRX63209R7B --source msstore --accept-package-agreements --silent --download-directory `"$dlDir`""
-            Start-Process -FilePath "cmd.exe" -ArgumentList "/c winget $wingetDLArgs" -WindowStyle Hidden -Wait
-            
-            $packagePath = Get-ChildItem -Path $dlDir -Filter "*.msix" -Recurse | Select-Object -First 1
-            if ($packagePath) {
-                Add-AppxProvisionedPackage -Online -PackagePath $packagePath.FullName -SkipLicense | Out-Null
+        # === OUTLOOK MODE SELECTION ===
+        if (-not $Silent) {
+            Write-Host ""
+            Write-Host "Select Outlook version to reset:" -ForegroundColor $LineCol
+            Write-Host "  [1] " -ForegroundColor $DimCol -NoNewline; Write-Host "New Outlook" -ForegroundColor $AccentCol
+            Write-Host "  [2] " -ForegroundColor $DimCol -NoNewline; Write-Host "Classic Outlook" -ForegroundColor $AccentCol
+            Write-Host "  [3] " -ForegroundColor $DimCol -NoNewline; Write-Host "Both" -ForegroundColor $AccentCol
+            Write-Host ""
+            while ($true) {
+                Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
+                Write-Host "[1-3]  Enter = 3  Esc = quit: " -ForegroundColor $DimCol -NoNewline
+                try {
+                    $key = Read-OrcaKey
+                    if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "cancelled by the operator, nothing was changed." }
+                    if ($key.Key -eq [ConsoleKey]::Enter) { Write-Host "3"; $modeChoice = "3" }
+                    else { Write-Host $key.KeyChar; $modeChoice = $key.KeyChar.ToString() }
+                } catch {
+                    if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+                    $raw = Read-OrcaLine
+                    if ($null -eq $raw) { Exit-OrcaRun $EXIT_CANCEL "no console to ask which Outlook to reset, nothing was changed. Use -Silent for an unattended run." }
+                    if ([string]::IsNullOrWhiteSpace($raw)) { $modeChoice = "3" }
+                    elseif ($raw -eq 'q' -or $raw -eq 'Q') { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "cancelled by the operator, nothing was changed." }
+                    else { $modeChoice = $raw }
+                }
+                $script:OutlookMode = switch ($modeChoice) {
+                    "1" { "New" }
+                    "2" { "Classic" }
+                    "3" { "Both" }
+                    default { $null }
+                }
+                if ($script:OutlookMode) { break }
+                Write-Host "Invalid selection, try again." -ForegroundColor $WarnCol
             }
-            Remove-Item $dlDir -Recurse -Force -ErrorAction SilentlyContinue
         } else {
-            # Single-user install logic
-            $wingetArgs = 'install -e --id 9NRX63209R7B --source msstore --accept-package-agreements --accept-source-agreements --silent --force --disable-interactivity'
-            Start-Process -FilePath "cmd.exe" -ArgumentList "/c echo Y | winget $wingetArgs" -WindowStyle Hidden -Wait
+            $script:OutlookMode = "Both"
         }
 
-        # Verification
-        $Timer = 0; $Timeout = 60
-        while (-not $installed -and $Timer -lt $Timeout) {
+        # === OST DELETION (Classic / Both only) ===
+        $script:DeleteOST = $false
+        if (-not $Silent -and $script:OutlookMode -ne "New") {
+            Write-Host ""
+            Write-Host "Reset OST files?" -ForegroundColor $LineCol
+            Write-Host "  (renames each OST to .ost.bak-<timestamp> - mailbox will re-sync on next login)" -ForegroundColor $WarnCol
+            Write-Host ""
+            Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
+            Write-Host "[Y/N]  Enter = N  Esc = quit: " -ForegroundColor $DimCol -NoNewline
+            try {
+                $key = Read-OrcaKey
+                Write-Host $key.KeyChar
+                if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "cancelled by the operator, nothing was changed." }
+                $ostChoice = if ($key.Key -eq [ConsoleKey]::Enter) { "N" } else { $key.KeyChar.ToString() }
+                $script:DeleteOST = ($ostChoice -eq 'Y' -or $ostChoice -eq 'y')
+            } catch {
+                if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+                $raw = Read-OrcaLine
+                if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "N" }
+                $script:DeleteOST = ($raw -eq 'Y' -or $raw -eq 'y')
+            }
+        }
+
+        # === EXTENSION PURGE (Classic / Both only) ===
+        $script:PurgeExtensions = $false
+        if (-not $Silent -and $script:OutlookMode -ne "New") {
+            Write-Host ""
+            Write-Host "Purge all Outlook extensions?" -ForegroundColor $LineCol
+            Write-Host "  (removes all 3rd-party add-ins like Salesforce, etc.)" -ForegroundColor $WarnCol
+            Write-Host ""
+            Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
+            Write-Host "[Y/N]  Enter = N  Esc = quit: " -ForegroundColor $DimCol -NoNewline
+            try {
+                $key = Read-OrcaKey
+                Write-Host $key.KeyChar
+                if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "cancelled by the operator, nothing was changed." }
+                $extChoice = if ($key.Key -eq [ConsoleKey]::Enter) { "N" } else { $key.KeyChar.ToString() }
+                $script:PurgeExtensions = ($extChoice -eq 'Y' -or $extChoice -eq 'y')
+            } catch {
+                if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+                $raw = Read-OrcaLine
+                if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "N" }
+                $script:PurgeExtensions = ($raw -eq 'Y' -or $raw -eq 'y')
+            }
+        }
+
+        # Redraw with confirmed selections
+        Clear-OrcaScreen
+        Write-Header
+        Write-Host "Device Name     : " -ForegroundColor $LineCol -NoNewline; Write-Host $env:COMPUTERNAME -ForegroundColor $AccentCol
+        Write-Host "Target Profile  : " -ForegroundColor $LineCol -NoNewline
+        if ($script:AllUsers) {
+            Write-Host "All Users " -ForegroundColor $AccentCol -NoNewline
+            Write-Host "($($TargetUsers.Count) profiles)" -ForegroundColor $WarnCol
+        } else {
+            Write-Host $TargetUsers[0].Name -ForegroundColor $AccentCol
+        }
+        Write-Host "Mode            : " -ForegroundColor $LineCol -NoNewline
+        if ($script:OutlookMode -eq "Both") {
+            Write-Host "Both " -ForegroundColor $AccentCol -NoNewline; Write-Host "(New and Classic Outlook)" -ForegroundColor $WarnCol
+        } else {
+            Write-Host "$($script:OutlookMode) Outlook" -ForegroundColor $AccentCol
+        }
+        if ($script:OutlookMode -ne "New") {
+            Write-Host "Back up OSTs    : " -ForegroundColor $LineCol -NoNewline
+            if ($script:DeleteOST) { Write-Host "Yes" -ForegroundColor Red } else { Write-Host "No" -ForegroundColor $DimCol }
+            Write-Host "Purge Extensions: " -ForegroundColor $LineCol -NoNewline
+            if ($script:PurgeExtensions) { Write-Host "Yes" -ForegroundColor Red } else { Write-Host "No" -ForegroundColor $DimCol }
+        }
+        Write-HLine -Style dashed
+        #endregion
+
+        #region [3] - MAIN LOGIC
+        # ============================================================================
+        $script:skipReinstall = $false
+        $script:ReinstallError = $null
+
+        # Step counts per mode (WinGet is a pre-step outside the user loop)
+        # New:     4 steps - [1] Kill/remove  [2] Registry  [3] Auth  [4] Reinstall
+        # Classic: 3 steps - [1] Kill/clear   [2] Registry  [3] Auth
+        # Both:    5 steps - [1] Kill/Classic clear  [2] New remove  [3] Registry  [4] Auth  [5] Reinstall
+        $cleanupSteps = switch ($script:OutlookMode) { "New" { 3 } "Classic" { 3 } "Both" { 4 } }
+        $reinstallSteps = if ($script:OutlookMode -ne "Classic") { 1 } else { 0 }
+        $T = $cleanupSteps + $reinstallSteps
+        $isSingleUser = ($TargetUsers.Count -eq 1)
+        $stepOffset   = 0
+
+        # If single user and using New/Both, WinGet becomes Step 1
+        if ($isSingleUser -and $script:OutlookMode -ne "Classic") {
+            $T++
+            $stepOffset = 1
+        }
+
+        $loopTotalSteps = $T
+
+        # --- WinGet bootstrap (New / Both only, runs once before user loop) ---
+        if ($script:OutlookMode -ne "Classic") {
+            $wgLabel = if ($isSingleUser) { "1/$T" } else { "0/$loopTotalSteps" }
+            Write-Step $wgLabel "Validating WinGet environment..."
+            $WinGetTemp = Join-Path (Get-OrcaTempRoot) "WinGet"
+            if (Test-Path $WinGetTemp) { Remove-Item $WinGetTemp -Recurse -Force -ErrorAction SilentlyContinue }
+            if (-not (Test-OrcaWingetPresent)) {
+                if (-not (Get-Module -ListAvailable Microsoft.WinGet.Client)) {
+                    Install-PackageProvider -Name NuGet -Force | Out-Null
+                    Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser -AllowClobber | Out-Null
+                }
+                Import-Module Microsoft.WinGet.Client
+                Start-Process powershell.exe -ArgumentList "-NoProfile -Command `"Import-Module Microsoft.WinGet.Client; Repair-WinGetPackageManager -Latest`"" -WindowStyle Hidden -Wait
+            } else {
+                Start-Process -FilePath "cmd.exe" -ArgumentList "/c winget source reset --force && winget source update --silent" -WindowStyle Hidden -Wait
+            }
+            Complete-Step $wgLabel "Validating WinGet environment..."
             if ($script:AllUsers) {
-                $installed = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.OutlookForWindows" }
-            } else {
-                $installed = Get-AppxPackage -Name "Microsoft.OutlookForWindows" -ErrorAction SilentlyContinue
+                Write-HLine -Style dashed
             }
-            if (-not $installed) { Start-Sleep -Seconds 2; $Timer += 2 }
         }
-    }
 
-
-    if ($installed) {
-        Complete-Step "$reinstallStepNum/$T" $stepMsg
-    } elseif (-not $script:skipReinstall) { # Only report FAILED if it wasn't explicitly skipped
-        $status = "[FAILED]"
-        $pad = " " * [math]::Max(1, $script:Width - "[$reinstallStepNum/$T] $stepMsg".Length - $status.Length)
-        Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-        Write-Host "[$reinstallStepNum/$T]" -ForegroundColor $DimCol -NoNewline
-        Write-Host " $stepMsg$pad" -ForegroundColor $DimCol -NoNewline
-        Write-Host $status -ForegroundColor "Red"
-        exit $EXIT_ERROR
-        Write-Host "      > Winget/Provisioning failed. Try manual install from Store." -ForegroundColor $WarnCol
-    }
-}
-#endregion
-
-#region [4] - RESULTS
-# ============================================================================
-Write-HLine -Style dashed
-if (-not $script:skipReinstall) {
-    $_status = "System ready for fresh login."
-    $_padL = " " * [math]::Floor(($script:Width - $_status.Length) / 2)
-    Write-Host "$_padL$_status" -ForegroundColor $OkCol
-}
-
-if ($script:DeletedOSTs.Count -gt 0) {
-    Write-Host "Deleted OSTs :" -ForegroundColor $LineCol
-    foreach ($ostPath in $script:DeletedOSTs) {
-        Write-Host "  - $ostPath" -ForegroundColor $DimCol
-    }
-}
-
-if ($script:PurgedExtensions.Count -gt 0) {
-    Write-Host "Purged Extensions :" -ForegroundColor $LineCol
-    foreach ($ext in $script:PurgedExtensions) {
-        Write-Host "  - $ext" -ForegroundColor $DimCol
-    }
-}
-
-if (-not $script:AllUsers) {
-    if (-not $script:skipReinstall) {
-        if ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
-            # This case may not be hit if IsSystem check is unreliable, but keep for robustness
-            Write-Host ""
-            Write-Host "NOTE: Script running as 'SYSTEM', target is '$($TargetUsers[0])'." -ForegroundColor $WarnCol
-        } elseif ($TargetUsers[0] -ne $env:USERNAME) {
-            Write-Host ""
-            Write-Host "NOTE: Script running as '$env:USERNAME', target is '$($TargetUsers[0])'." -ForegroundColor $WarnCol
-            Write-Host "Please launch Outlook manually as the target user." -ForegroundColor $DimCol
-        } else {
-            $launchChoice = $null
-            Write-Host ""
-            if ($script:OutlookMode -eq "New") {
-                Write-Host "Launch New Outlook?" -ForegroundColor $InfoCol
-                Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
-                Write-Host "[Y/N]  Enter = Yes  Esc = quit: " -ForegroundColor $DimCol -NoNewline
-                try {
-                    $key = [Console]::ReadKey($true)
-                    Write-Host $key.KeyChar
-                    if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL }
-                    $yn = if ($key.Key -eq [ConsoleKey]::Enter) { "Y" } else { $key.KeyChar.ToString() }
-                    if ($yn -eq "Y" -or $yn -eq "y") { $launchChoice = "2" }
-                } catch {
-                    $raw = (Read-Host).Trim(); if ($raw -eq "" -or $raw -eq "Y" -or $raw -eq "y") { $launchChoice = "2" }
-                }
-            } elseif ($script:OutlookMode -eq "Classic") {
-                Write-Host "Launch Classic Outlook?" -ForegroundColor $InfoCol
-                Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
-                Write-Host "[Y/N]  Enter = Yes  Esc = quit: " -ForegroundColor $DimCol -NoNewline
-                try {
-                    $key = [Console]::ReadKey($true)
-                    Write-Host $key.KeyChar
-                    if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL }
-                    $yn = if ($key.Key -eq [ConsoleKey]::Enter) { "Y" } else { $key.KeyChar.ToString() }
-                    if ($yn -eq "Y" -or $yn -eq "y") { $launchChoice = "1" }
-                } catch {
-                    $raw = (Read-Host).Trim(); if ($raw -eq "" -or $raw -eq "Y" -or $raw -eq "y") { $launchChoice = "1" }
-                }
-            } else {
-                Write-Host "Launch Outlook?" -ForegroundColor $LineCol
-                Write-Host "  [1] " -ForegroundColor $DimCol -NoNewline; Write-Host "Classic Outlook" -ForegroundColor $AccentCol
-                Write-Host "  [2] " -ForegroundColor $DimCol -NoNewline; Write-Host "New Outlook" -ForegroundColor $AccentCol
-                Write-Host ""
-                Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
-                Write-Host "[1-2]  Enter = No  Esc = quit: " -ForegroundColor $DimCol -NoNewline
-                try {
-                    $key = [Console]::ReadKey($true)
-                    Write-Host $key.KeyChar
-                    if ($key.Key -eq [ConsoleKey]::Escape) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit $EXIT_CANCEL }
-                    $launchChoice = if ($key.Key -eq [ConsoleKey]::Enter) { "N" } else { $key.KeyChar.ToString() }
-                } catch {
-                    $raw = (Read-Host).Trim()
-                    if ([string]::IsNullOrWhiteSpace($raw)) { $launchChoice = "N" } else { $raw }
-                }
+        # --- Per-user loop ---
+        foreach ($Target in $TargetUsers) {
+            $UserName = $Target.Name
+            if ($script:AllUsers) {
+                Write-Host "  User: " -ForegroundColor $LineCol -NoNewline
+                Write-Host $UserName -ForegroundColor $AccentCol
             }
 
-            if ($launchChoice -eq "1") {
-                $classicPath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE" -ErrorAction SilentlyContinue).'(default)'
-                if ($classicPath -and (Test-Path $classicPath)) {
-                    Start-Process $classicPath -ErrorAction SilentlyContinue
-                } else { Write-Warning "Classic Outlook (OUTLOOK.EXE) not found." }
-            } elseif ($launchChoice -eq "2") {
-                if (Get-AppxPackage -Name "Microsoft.OutlookForWindows" -ErrorAction SilentlyContinue) {
-                    try {
-                        Start-Process "shell:appsfolder\Microsoft.OutlookForWindows_8wekyb3d8bbwe!olk" -ErrorAction Stop
-                    } catch {
-                        $alias = "$env:LOCALAPPDATA\Microsoft\WindowsApps\olk.exe"
-                        if (Test-Path $alias) {
-                            Start-Process $alias -ErrorAction SilentlyContinue
-                        } else {
-                            Write-Warning "New Outlook is installed but could not be launched. Please open it manually."
+            switch ($script:OutlookMode) {
+
+                "New" {
+                    Write-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and removing package..."
+                    Invoke-TerminateOutlook -Mode "New" -Target $Target
+                    Invoke-ClearNewOutlookData -Target $Target
+                    Complete-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and removing package..."
+
+                    Write-Step "$($stepOffset + 2)/$loopTotalSteps" "Cleaning registry hives..."
+                    Invoke-RegistryCleanup -Target $Target -Mode "New"
+                    # Extension purge not applicable to New Outlook
+                    Complete-Step "$($stepOffset + 2)/$loopTotalSteps" "Cleaning registry hives..."
+
+                    Write-Step "$($stepOffset + 3)/$loopTotalSteps" "Flushing authentication tokens..."
+                    Invoke-AuthFlush -Target $Target -FullSignOut $FullSignOut.IsPresent
+                    Complete-Step "$($stepOffset + 3)/$loopTotalSteps" "Flushing authentication tokens..."
+
+                    # Reinstall is handled after the user loop
+                }
+
+                "Classic" {
+                    Write-Step "1/$loopTotalSteps" "Killing processes and clearing cache..."
+                    Invoke-TerminateOutlook -Mode "Classic" -Target $Target
+                    Invoke-ClearClassicOutlookData -Target $Target
+                    Complete-Step "1/$loopTotalSteps" "Killing processes and clearing cache..."
+
+                    Write-Step "2/$loopTotalSteps" "Cleaning registry hives..."
+                    Invoke-RegistryCleanup -Target $Target -Mode "Classic"
+                    Invoke-PurgeExtensions -Target $Target
+                    Complete-Step "2/$loopTotalSteps" "Cleaning registry hives..."
+
+                    Write-Step "3/$loopTotalSteps" "Flushing authentication tokens..."
+                    Invoke-AuthFlush -Target $Target -FullSignOut $FullSignOut.IsPresent
+                    Complete-Step "3/$loopTotalSteps" "Flushing authentication tokens..."
+                }
+
+                "Both" {
+                    Write-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and clearing cache..."
+                    Invoke-TerminateOutlook -Mode "Both" -Target $Target
+                    Invoke-ClearClassicOutlookData -Target $Target
+                    Complete-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and clearing cache..."
+
+                    Write-Step "$($stepOffset + 2)/$loopTotalSteps" "Removing New Outlook package and data..."
+                    Invoke-ClearNewOutlookData -Target $Target
+                    Complete-Step "$($stepOffset + 2)/$loopTotalSteps" "Removing New Outlook package and data..."
+
+                    Write-Step "$($stepOffset + 3)/$loopTotalSteps" "Cleaning registry hives..."
+                    Invoke-RegistryCleanup -Target $Target -Mode "Both"
+                    Invoke-PurgeExtensions -Target $Target
+                    Complete-Step "$($stepOffset + 3)/$loopTotalSteps" "Cleaning registry hives..."
+
+                    Write-Step "$($stepOffset + 4)/$loopTotalSteps" "Flushing authentication tokens..."
+                    Invoke-AuthFlush -Target $Target -FullSignOut $FullSignOut.IsPresent
+                    Complete-Step "$($stepOffset + 4)/$loopTotalSteps" "Flushing authentication tokens..."
+
+                    # Reinstall is handled after the user loop
+                }
+            }
+            if ($script:AllUsers) {
+                Write-HLine -Style dashed
+            }
+        }
+
+        # --- System-Wide Reinstall (if applicable) ---
+        if ($script:OutlookMode -ne "Classic") {
+            if ($script:AllUsers) {
+                Write-Host "  System: " -ForegroundColor $LineCol -NoNewline
+                Write-Host "Global Provisioning" -ForegroundColor $AccentCol
+            }
+
+            $reinstallStepNum = $stepOffset + $cleanupSteps + 1
+            $stepMsg = "Reinstalling New Outlook..."
+            if ($script:AllUsers) { $stepMsg = "Provisioning New Outlook for all users..." }
+            Write-Step "$reinstallStepNum/$T" $stepMsg
+
+            $installed = $false
+
+            # winget installs for the account that runs it. When one other user is targeted (SYSTEM, or an
+            # admin repairing someone else), installing would give the wrong account the app and the
+            # verification below would read the wrong account's packages, so skip and say so.
+            if (-not $script:AllUsers -and ($TargetUsers[0].Sid -ne (Get-OrcaCurrentSid))) {
+                $script:skipReinstall = $true
+                $status = "[SKIPPED]"
+                $pad = " " * [math]::Max(1, $script:Width - "[$reinstallStepNum/$T] $stepMsg".Length - $status.Length)
+                Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
+                Write-Host "[$reinstallStepNum/$T]" -ForegroundColor $DimCol -NoNewline
+                Write-Host " $stepMsg$pad" -ForegroundColor $DimCol -NoNewline
+                Write-Host $status -ForegroundColor $WarnCol
+                Write-Host "Cannot install New Outlook for '$($TargetUsers[0].Name)' from another account." -ForegroundColor $WarnCol
+                Write-Host "Please run as the target user or select 'All Users' for provisioning." -ForegroundColor $WarnCol
+                [void]$script:Problems.Add("New Outlook was not reinstalled for $($TargetUsers[0].Name), run ORCA as that user or choose All Users")
+            }
+            
+            if (-not $script:skipReinstall) {
+                if ($script:AllUsers) {
+                    $dlDir = Join-Path (Get-OrcaTempRoot) "ORCA_DL"
+                    New-Item -Path $dlDir -ItemType Directory -Force | Out-Null
+                    $wingetDLArgs = "download --id 9NRX63209R7B --source msstore --accept-package-agreements --silent --download-directory `"$dlDir`""
+                    $dlCode = Invoke-OrcaWinget -Arguments $wingetDLArgs
+
+                    # Download first and require a package. The existing provisioned package is removed only
+                    # once a replacement is in hand, so a failed download cannot pass the check below.
+                    $packagePath = Get-ChildItem -Path $dlDir -Filter "*.msix" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if (-not $packagePath) {
+                        $script:ReinstallError = "winget download produced no .msix package (exit code $dlCode)"
+                    } else {
+                        try {
+                            foreach ($old in @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.OutlookForWindows" })) {
+                                Remove-AppxProvisionedPackage -Online -PackageName $old.PackageName -ErrorAction Stop | Out-Null
+                            }
+                            Add-AppxProvisionedPackage -Online -PackagePath $packagePath.FullName -SkipLicense -ErrorAction Stop | Out-Null
+                        } catch {
+                            $script:ReinstallError = "provisioning failed: $($_.Exception.Message)"
                         }
                     }
+                    Remove-Item -LiteralPath $dlDir -Recurse -Force -ErrorAction SilentlyContinue
                 } else {
-                    Write-Warning "New Outlook installation was not detected."
+                    # Single-user install logic
+                    $wingetArgs = 'install -e --id 9NRX63209R7B --source msstore --accept-package-agreements --accept-source-agreements --silent --force --disable-interactivity'
+                    [void](Invoke-OrcaWinget -Arguments $wingetArgs -AnswerYes)
+                }
+
+                # Verification
+                $Timer = 0; $Timeout = 60
+                while (-not $installed -and -not $script:ReinstallError -and $Timer -lt $Timeout) {
+                    if ($script:AllUsers) {
+                        $installed = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.OutlookForWindows" }
+                    } else {
+                        $installed = Get-AppxPackage -Name "Microsoft.OutlookForWindows" -ErrorAction SilentlyContinue
+                    }
+                    if (-not $installed) { Start-Sleep -Seconds 2; $Timer += 2 }
+                }
+            }
+
+
+            if ($installed) {
+                Complete-Step "$reinstallStepNum/$T" $stepMsg
+            } elseif (-not $script:skipReinstall) { # Only report FAILED if it wasn't explicitly skipped
+                $status = "[FAILED]"
+                $pad = " " * [math]::Max(1, $script:Width - "[$reinstallStepNum/$T] $stepMsg".Length - $status.Length)
+                Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
+                Write-Host "[$reinstallStepNum/$T]" -ForegroundColor $DimCol -NoNewline
+                Write-Host " $stepMsg$pad" -ForegroundColor $DimCol -NoNewline
+                Write-Host $status -ForegroundColor "Red"
+                Write-Host "      > Winget/Provisioning failed. Try manual install from Store." -ForegroundColor $WarnCol
+                $why = if ($script:ReinstallError) { ": $($script:ReinstallError)" } else { "" }
+                Exit-OrcaRun $EXIT_ERROR "New Outlook was not reinstalled, winget or provisioning failed$why. Install it from the Store."
+            }
+        }
+        #endregion
+
+        #region [4] - RESULTS
+        # ============================================================================
+        Write-HLine -Style dashed
+        if (-not $script:skipReinstall -and $script:Problems.Count -eq 0) {
+            $_status = "System ready for fresh login."
+            $_padL = " " * [math]::Floor(($script:Width - $_status.Length) / 2)
+            Write-Host "$_padL$_status" -ForegroundColor $OkCol
+        }
+
+        if ($script:BackedUpOSTs.Count -gt 0) {
+            Write-Host "OST backups (original renamed, Outlook builds a new OST) :" -ForegroundColor $LineCol
+            foreach ($ostPath in $script:BackedUpOSTs) {
+                Write-Host "  - $ostPath" -ForegroundColor $DimCol
+            }
+        }
+
+        if ($script:PurgedExtensions.Count -gt 0) {
+            Write-Host "Purged Extensions :" -ForegroundColor $LineCol
+            foreach ($ext in $script:PurgedExtensions) {
+                Write-Host "  - $ext" -ForegroundColor $DimCol
+            }
+        }
+
+        if (-not $script:AllUsers) {
+            if (-not $script:skipReinstall) {
+                if ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
+                    # This case may not be hit if IsSystem check is unreliable, but keep for robustness
+                    Write-Host ""
+                    Write-Host "NOTE: Script running as 'SYSTEM', target is '$($TargetUsers[0].Name)'." -ForegroundColor $WarnCol
+                } elseif ($TargetUsers[0].Sid -ne (Get-OrcaCurrentSid)) {
+                    Write-Host ""
+                    Write-Host "NOTE: Script running as '$env:USERNAME', target is '$($TargetUsers[0].Name)'." -ForegroundColor $WarnCol
+                    Write-Host "Please launch Outlook manually as the target user." -ForegroundColor $DimCol
+                } else {
+                    $launchChoice = $null
+                    Write-Host ""
+                    if ($script:OutlookMode -eq "New") {
+                        Write-Host "Launch New Outlook?" -ForegroundColor $InfoCol
+                        Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
+                        Write-Host "[Y/N]  Enter = Yes  Esc = quit: " -ForegroundColor $DimCol -NoNewline
+                        try {
+                            $key = Read-OrcaKey
+                            Write-Host $key.KeyChar
+                            $yn = if ($key.Key -eq [ConsoleKey]::Escape) { "N" } elseif ($key.Key -eq [ConsoleKey]::Enter) { "Y" } else { $key.KeyChar.ToString() }
+                            if ($yn -eq "Y" -or $yn -eq "y") { $launchChoice = "2" }
+                        } catch {
+                            if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+                            $raw = Read-OrcaLine; if ($null -ne $raw -and ($raw -eq "" -or $raw -eq "Y" -or $raw -eq "y")) { $launchChoice = "2" }
+                        }
+                    } elseif ($script:OutlookMode -eq "Classic") {
+                        Write-Host "Launch Classic Outlook?" -ForegroundColor $InfoCol
+                        Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
+                        Write-Host "[Y/N]  Enter = Yes  Esc = quit: " -ForegroundColor $DimCol -NoNewline
+                        try {
+                            $key = Read-OrcaKey
+                            Write-Host $key.KeyChar
+                            $yn = if ($key.Key -eq [ConsoleKey]::Escape) { "N" } elseif ($key.Key -eq [ConsoleKey]::Enter) { "Y" } else { $key.KeyChar.ToString() }
+                            if ($yn -eq "Y" -or $yn -eq "y") { $launchChoice = "1" }
+                        } catch {
+                            if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+                            $raw = Read-OrcaLine; if ($null -ne $raw -and ($raw -eq "" -or $raw -eq "Y" -or $raw -eq "y")) { $launchChoice = "1" }
+                        }
+                    } else {
+                        Write-Host "Launch Outlook?" -ForegroundColor $LineCol
+                        Write-Host "  [1] " -ForegroundColor $DimCol -NoNewline; Write-Host "Classic Outlook" -ForegroundColor $AccentCol
+                        Write-Host "  [2] " -ForegroundColor $DimCol -NoNewline; Write-Host "New Outlook" -ForegroundColor $AccentCol
+                        Write-Host ""
+                        Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
+                        Write-Host "[1-2]  Enter = No  Esc = quit: " -ForegroundColor $DimCol -NoNewline
+                        try {
+                            $key = Read-OrcaKey
+                            Write-Host $key.KeyChar
+                            $launchChoice = if ($key.Key -eq [ConsoleKey]::Escape -or $key.Key -eq [ConsoleKey]::Enter) { "N" } else { $key.KeyChar.ToString() }
+                        } catch {
+                            if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+                            $raw = Read-OrcaLine
+                            if ([string]::IsNullOrWhiteSpace($raw)) { $launchChoice = "N" } else { $launchChoice = $raw }
+                        }
+                    }
+
+                    if ($launchChoice -eq "1") {
+                        $classicPath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE" -ErrorAction SilentlyContinue).'(default)'
+                        if ($classicPath -and (Test-Path $classicPath)) {
+                            Start-Process $classicPath -ErrorAction SilentlyContinue
+                        } else { Write-Warning "Classic Outlook (OUTLOOK.EXE) not found." }
+                    } elseif ($launchChoice -eq "2") {
+                        if (Get-AppxPackage -Name "Microsoft.OutlookForWindows" -ErrorAction SilentlyContinue) {
+                            try {
+                                Start-Process "shell:appsfolder\Microsoft.OutlookForWindows_8wekyb3d8bbwe!olk" -ErrorAction Stop
+                            } catch {
+                                $alias = "$env:LOCALAPPDATA\Microsoft\WindowsApps\olk.exe"
+                                if (Test-Path $alias) {
+                                    Start-Process $alias -ErrorAction SilentlyContinue
+                                } else {
+                                    Write-Warning "New Outlook is installed but could not be launched. Please open it manually."
+                                }
+                            }
+                        } else {
+                            Write-Warning "New Outlook installation was not detected."
+                        }
+                    }
                 }
             }
         }
+
+        # Footer
+        $_sfx    = "█"
+        $_ftrW   = $_artW + 1
+        $_ffillW = $script:Width - $_ftrW - $_sfx.Length
+        $_footer = if ($script:Problems.Count -gt 0) { "  REPAIR SEQUENCE FINISHED WITH PROBLEMS" } else { "  REPAIR AND CONFIGURATION SEQUENCE COMPLETE" }
+        $_fpad   = " " * ($_ffillW - $_footer.Length - $_ver.Length)
+        Write-Host ("━" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+        Write-Host "$_footer$_fpad$_ver" -ForegroundColor $MainCol -NoNewline; Write-Host " $_art2" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+        Write-Host ("━" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+
+        if ($script:Problems.Count -gt 0) {
+            Exit-OrcaRun $EXIT_PARTIAL ("Outlook reset finished with problems: " + ($script:Problems -join '; ') + ".")
+        }
+        Exit-OrcaRun $EXIT_SUCCESS "Outlook reset completed for $($TargetUsers.Count) profile(s)."
+    }
+    catch {
+        if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+        Write-Error $_.Exception.Message
+        Exit-OrcaRun $EXIT_ERROR "ORCA stopped on an unexpected error: $($_.Exception.Message)"
     }
 }
 
-# Footer
-$_sfx    = "█"
-$_ftrW   = $_artW + 1
-$_ffillW = $script:Width - $_ftrW - $_sfx.Length
-$_footer = "  REPAIR AND CONFIGURATION SEQUENCE COMPLETE"
-$_fpad   = " " * ($_ffillW - $_footer.Length - $_ver.Length)
-Write-Host ("━" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-Write-Host "$_footer$_fpad$_ver" -ForegroundColor $MainCol -NoNewline; Write-Host " $_art2" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-Write-Host ("━" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-
-exit $EXIT_SUCCESS
-#endregion
+if (-not $global:KillerScriptsTestMode) { Invoke-OrcaMain -Silent:$Silent -FullSignOut:$FullSignOut }
