@@ -180,4 +180,37 @@ Describe 'AMORT' {
             $r.Output | Should -Match '\[FAIL\] AMORT stopped on an error: boom \(exit 1\)'
         }
     }
+
+    Describe 'Finding 45: only work this run started is ever stopped' {
+        It 'leaves independent TiWorker and DISM processes alone after the owned repair exits' {
+            # Servicing that starts after the preflight check belongs to Windows, not to this run.
+            $script:GetProcCalls = 0
+            Mock Get-Process {
+                $script:GetProcCalls++
+                if ($script:GetProcCalls -le 1) { return @() }
+                @(
+                    [pscustomobject]@{ Name = 'TiWorker'; Id = 7001 },
+                    [pscustomobject]@{ Name = 'DISM'; Id = 7002 }
+                ) | Where-Object { $Name -contains $_.Name }
+            }
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 0
+            Should -Invoke Stop-Process -Times 0 -Exactly
+        }
+
+        It 'Stop-AmortOwnedTree stops the owned process and its descendants, and nothing else' {
+            $script:WinProcs = @(
+                [pscustomobject]@{ ProcessId = 100; ParentProcessId = 1;   Name = 'cmd.exe' },
+                [pscustomobject]@{ ProcessId = 101; ParentProcessId = 100; Name = 'dism.exe' },
+                [pscustomobject]@{ ProcessId = 102; ParentProcessId = 101; Name = 'DismHost.exe' },
+                [pscustomobject]@{ ProcessId = 200; ParentProcessId = 1;   Name = 'dism.exe' },
+                [pscustomobject]@{ ProcessId = 300; ParentProcessId = 1;   Name = 'TiWorker.exe' }
+            )
+            Stop-AmortOwnedTree -ProcessId 100
+            Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 100 }
+            Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 101 }
+            Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 102 }
+            Should -Invoke Stop-Process -Times 0 -Exactly -ParameterFilter { $Id -in 200, 300 }
+        }
+    }
 }

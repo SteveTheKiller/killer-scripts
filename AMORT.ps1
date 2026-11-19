@@ -335,18 +335,31 @@ function Clear-AndReprintStep {
 }
 # Helper: flush buffered console keypresses using raw .NET Console API (bypasses PSReadLine)
 function Clear-InputBuffer { try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {} }
-# Kills cmd.exe and any DISM/TiWorker children it left behind
-function Stop-DismTree {
-    Get-Process -Name "DISM","TiWorker" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-}
-# After DISM exits, give TiWorker 5s to exit naturally, then kill it to release the console stdin handle
-function Stop-TiWorker {
-    $tw = Get-Process -Name "TiWorker" -ErrorAction SilentlyContinue
-    if ($tw) {
-        $tw | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
-        Get-Process -Name "TiWorker" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 300
+# Ids of every process started, directly or not, by the given parent. Only processes this run
+# launched are ever stopped. TiWorker and other servicing belong to Windows and are never named.
+function Get-AmortDescendantId {
+    param([int]$ParentId)
+    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)
+    $found = New-Object System.Collections.ArrayList
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue($ParentId)
+    while ($queue.Count -gt 0) {
+        $cur = $queue.Dequeue()
+        foreach ($p in $all) {
+            if ([int]$p.ParentProcessId -eq $cur -and [int]$p.ProcessId -ne $ParentId -and -not $found.Contains([int]$p.ProcessId)) {
+                [void]$found.Add([int]$p.ProcessId)
+                $queue.Enqueue([int]$p.ProcessId)
+            }
+        }
     }
+    @($found)
+}
+# Stops the process this run started and the tree under it, children first, by id.
+function Stop-AmortOwnedTree {
+    param([int]$ProcessId)
+    $ids = @(Get-AmortDescendantId -ParentId $ProcessId)
+    [array]::Reverse($ids)
+    foreach ($id in ($ids + $ProcessId)) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
 }
 function Get-FreeColor { param([double]$Pct) if ($Pct -lt 10) { "Red" } elseif ($Pct -lt 20) { "DarkYellow" } else { "Green" } }
 function Write-FreeLine {
@@ -817,8 +830,7 @@ if (-not $SkipRepair) {
                         if ([Console]::KeyAvailable) {
                             $Key = [Console]::ReadKey($true)
                             if ($Key.Key -eq [ConsoleKey]::Escape) {
-                                try { $Proc1.Kill() } catch {}
-                                Stop-DismTree
+                                Stop-AmortOwnedTree -ProcessId $Proc1.Id
                                 $Skipped1 = $true
                                 break
                             }
@@ -843,7 +855,6 @@ if (-not $SkipRepair) {
 
                 if (-not $Skipped1) {
                     $Proc1.WaitForExit()
-                    Stop-TiWorker
                 }
                 $ExitCode1 = $Proc1.ExitCode
                 try { $Proc1.Dispose() } catch {}
@@ -898,8 +909,7 @@ if (-not $SkipRepair) {
                         if ([Console]::KeyAvailable) {
                             $Key = [Console]::ReadKey($true)
                             if ($Key.Key -eq [ConsoleKey]::Escape) {
-                                try { $Proc2.Kill() } catch {}
-                                Stop-DismTree
+                                Stop-AmortOwnedTree -ProcessId $Proc2.Id
                                 $Skipped2 = $true
                                 break
                             }
@@ -924,7 +934,6 @@ if (-not $SkipRepair) {
 
                 if (-not $Skipped2) {
                     $Proc2.WaitForExit()
-                    Stop-TiWorker
                 }
                 $ExitCode2 = $Proc2.ExitCode
                 try { $Proc2.Dispose() } catch {}
@@ -975,8 +984,7 @@ if (-not $SkipRepair) {
                         if ([Console]::KeyAvailable) {
                             $Key = [Console]::ReadKey($true)
                             if ($Key.Key -eq [ConsoleKey]::Escape) {
-                                try { $Proc3.Kill() } catch {}
-                                Get-Process -Name "sfc" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                                Stop-AmortOwnedTree -ProcessId $Proc3.Id
                                 $Skipped3 = $true
                                 break
                             }
