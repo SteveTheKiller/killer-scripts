@@ -237,9 +237,14 @@ function Invoke-DepotElevationRelaunch {
     Exit-KillerScript 0
 }
 
-function Invoke-DepotPreflight {
-    # --- STARTUP CLEANUP: kill leftovers from any previous cancelled/crashed run ---
-    Write-Host "[*] Checking for leftover processes from previous run..." -ForegroundColor DarkGray
+function Invoke-DepotReg {
+    # Thin wrapper over reg.exe so the registry-hive calls can be mocked. Returns the exit code and output.
+    param([string[]]$Arguments)
+    $out = & reg @Arguments 2>&1
+    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out | ForEach-Object { "$_" }) }
+}
+
+function Stop-DepotLeftoverProcess {
     # Kill any stale installer/maintenance processes
     $StaleProcs = @(
         "winget", "WinGet",
@@ -268,19 +273,19 @@ function Invoke-DepotPreflight {
     } else {
         Write-Host "    > No stale processes found." -ForegroundColor DarkGray
     }
-    # Stop Windows Update service if left running
-    $wuSvc = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
-    if ($wuSvc -and $wuSvc.Status -eq 'Running') {
-        Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-        Write-Host "    [!] Stopped leftover wuauserv." -ForegroundColor Yellow
-    }
+}
+
+function Remove-DepotOrphanHive {
     # Unload any APT registry hives left mounted from a previous run
-    $mountedHives = (reg query HKU 2>$null) -split "`n" | Where-Object { $_ -match "APT_" }
+    $mountedHives = (Invoke-DepotReg @('query', 'HKU')).Output | Where-Object { $_ -match "APT_" }
     foreach ($hive in $mountedHives) {
         $hiveName = ($hive -split "\\")[-1].Trim()
-        reg unload "HKU\$hiveName" 2>$null | Out-Null
+        $null = Invoke-DepotReg @('unload', "HKU\$hiveName")
         Write-Host "    [!] Unloaded orphaned hive: $hiveName" -ForegroundColor Yellow
     }
+}
+
+function Remove-DepotStaleFile {
     # Wipe all temp files this script may have created
     $staleFiles = @(
         "C:\Windows\Temp\ODT.exe",
@@ -299,6 +304,20 @@ function Invoke-DepotPreflight {
     foreach ($f in $staleFiles) {
         Remove-Item $f -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Invoke-DepotPreflight {
+    # --- STARTUP CLEANUP: kill leftovers from any previous cancelled/crashed run ---
+    Write-Host "[*] Checking for leftover processes from previous run..." -ForegroundColor DarkGray
+    Stop-DepotLeftoverProcess
+    # Stop Windows Update service if left running
+    $wuSvc = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+    if ($wuSvc -and $wuSvc.Status -eq 'Running') {
+        Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+        Write-Host "    [!] Stopped leftover wuauserv." -ForegroundColor Yellow
+    }
+    Remove-DepotOrphanHive
+    Remove-DepotStaleFile
 }
 
 function Read-DepotChoice {
