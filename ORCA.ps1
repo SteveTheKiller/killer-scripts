@@ -17,9 +17,14 @@
         Prompts for user, Outlook type, and OST/ext. reset preference.
     .\ORCA.ps1 -Silent
         Non-interactive - All Users, Both Outlook types, no OST/ext. changes.
+    .\ORCA.ps1 -FullSignOut
+        Also clears the Windows account broker caches (TokenBroker, AAD broker plugin, Edge
+        WebView). The default clears only Office identity, OneAuth and Outlook credentials.
+        Credential Manager is cleared only for the user running ORCA.
 #>
 param(
-    [switch]$Silent
+    [switch]$Silent,
+    [switch]$FullSignOut
 )
 $EXIT_SUCCESS = 0   # Completed successfully
 $EXIT_ERROR   = 1   # Failure
@@ -46,6 +51,35 @@ function Test-OrcaElevated {
 }
 
 function Get-OrcaUsersRoot { 'C:\Users' }
+
+function Get-OrcaCurrentSid {
+    [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
+function Resolve-OrcaAccountName {
+    # Full DOMAIN\name for a SID, or $null when it cannot be resolved.
+    param([string]$Sid)
+    try {
+        (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+    } catch { $null }
+}
+
+function Get-OrcaProfile {
+    # Every real user profile with its SID, account name and profile folder, read from the profile
+    # list. The folder name is never assumed to match the account name.
+    param([string]$ListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList')
+    foreach ($key in @(Get-ChildItem -LiteralPath $ListPath -ErrorAction SilentlyContinue)) {
+        $sid = $key.PSChildName
+        if ($sid -notmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -and $sid -notmatch '^S-1-12-1-') { continue }
+        $raw = (Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+        if (-not $raw) { continue }
+        $path = [Environment]::ExpandEnvironmentVariables([string]$raw)
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
+        $account = Resolve-OrcaAccountName -Sid $sid
+        $name = if ($account) { $account -replace '^.*\x5C' } else { Split-Path -Leaf $path }
+        [pscustomobject]@{ Name = $name; Account = $account; Sid = $sid; Path = $path }
+    }
+}
 
 function Read-OrcaKey {
     # Throws when there is no console, which sends the caller to its Read-Host fallback.
@@ -183,15 +217,12 @@ function Get-ActiveUser {
 # ---- Cleanup helper functions ------------------------------------------------
 
 function Invoke-PurgeExtensions {
-    param([string]$UserName)
+    param($Target)
     if (-not $script:PurgeExtensions) { return }
 
-    try {
-        $userSID = (New-Object System.Security.Principal.NTAccount($UserName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    } catch {
-        return
-    }
-    $hiveName   = "ORCA_Ext_$UserName"
+    $UserName = $Target.Name
+    $userSID  = $Target.Sid
+    $hiveName   = "ORCA_Ext_$userSID"
     $hiveLoaded = $false
     $root       = $null
 
@@ -199,8 +230,8 @@ function Invoke-PurgeExtensions {
     if (Test-Path "Registry::HKU\$userSID") {
         $root = "Registry::HKU\$userSID"
     } else {
-        $ntUser = "$(Get-OrcaUsersRoot)\$UserName\NTUSER.DAT"
-        if (-not (Test-Path $ntUser)) { return } # Silently skip if no hive
+        $ntUser = "$($Target.Path)\NTUSER.DAT"
+        if (-not (Test-Path -LiteralPath $ntUser)) { return } # Silently skip if no hive
         reg load "HKU\$hiveName" $ntUser *>$null
         if ($LASTEXITCODE -eq 0) {
             $root = "Registry::HKU\$hiveName"; $hiveLoaded = $true
@@ -248,7 +279,7 @@ function Get-OrcaProcessCommandLine {
 function Get-OrcaOutlookProcess {
     # Only processes that belong to the target user AND to Outlook. WebView2 hosts are shared by
     # Teams, Widgets and other apps, so they count only when their command line names Outlook.
-    param([string]$UserName, [string]$Mode)
+    param($Target, [string]$Mode)
     $names = @()
     if ($Mode -ne "Classic") { $names += "olk", "WebViewHost", "msedgewebview2" }
     if ($Mode -ne "New")     { $names += "OUTLOOK" }
@@ -262,7 +293,10 @@ function Get-OrcaOutlookProcess {
     }
     foreach ($proc in $found) {
         if ($script:IsAdmin) {
-            if (-not $proc.UserName -or (($proc.UserName -replace '^.*\\') -ne $UserName)) { continue }
+            if (-not $proc.UserName) { continue }
+            if ($Target.Account) {
+                if ($proc.UserName -ne $Target.Account) { continue }
+            } elseif ((([string]$proc.UserName).Split([char]92)[-1]) -ne $Target.Name) { continue }
         }
         if ($proc.Name -in @("olk", "OUTLOOK")) { $proc; continue }
         if ((Get-OrcaProcessCommandLine -ProcessId $proc.Id) -match 'OutlookForWindows|\\Olk\\|\bolk\.exe') { $proc }
@@ -270,19 +304,19 @@ function Get-OrcaOutlookProcess {
 }
 
 function Invoke-TerminateOutlook {
-    param([string]$Mode, [string]$UserName)
-    foreach ($proc in @(Get-OrcaOutlookProcess -UserName $UserName -Mode $Mode)) {
+    param([string]$Mode, $Target)
+    foreach ($proc in @(Get-OrcaOutlookProcess -Target $Target -Mode $Mode)) {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Invoke-ClearNewOutlookData {
-    param([string]$UserName)
-    $local = "$(Get-OrcaUsersRoot)\$UserName\AppData\Local"
+    param($Target)
+    $local = "$($Target.Path)\AppData\Local"
 
     if ($script:IsAdmin) {
         try {
-            $userSID = (New-Object System.Security.Principal.NTAccount($UserName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            $userSID = $Target.Sid
             $pkg = Get-AppxPackage -Name "Microsoft.OutlookForWindows" -User $userSID -ErrorAction SilentlyContinue
             if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName -User $userSID -ErrorAction SilentlyContinue }
         } catch {}
@@ -297,8 +331,9 @@ function Invoke-ClearNewOutlookData {
 }
 
 function Invoke-ClearClassicOutlookData {
-    param([string]$UserName)
-    $local = "$(Get-OrcaUsersRoot)\$UserName\AppData\Local"
+    param($Target)
+    $UserName = $Target.Name
+    $local = "$($Target.Path)\AppData\Local"
     @(
         "$local\Microsoft\Outlook\RoamCache",
         "$local\Microsoft\Outlook\Offline Address Books",
@@ -329,13 +364,10 @@ function Invoke-ClearClassicOutlookData {
 }
 
 function Invoke-RegistryCleanup {
-    param([string]$UserName, [string]$Mode)
-    try {
-        $userSID = (New-Object System.Security.Principal.NTAccount($UserName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    } catch {
-        return
-    }
-    $hiveName   = "ORCA_$UserName"
+    param($Target, [string]$Mode)
+    $UserName = $Target.Name
+    $userSID  = $Target.Sid
+    $hiveName   = "ORCA_$userSID"
     $hiveLoaded = $false
     $root       = $null
 
@@ -344,8 +376,8 @@ function Invoke-RegistryCleanup {
         $root = "Registry::HKU\$userSID"
     } else {
         # User is not logged in, so we try to load their hive manually
-        $ntUser = "$(Get-OrcaUsersRoot)\$UserName\NTUSER.DAT"
-        if (-not (Test-Path $ntUser)) {
+        $ntUser = "$($Target.Path)\NTUSER.DAT"
+        if (-not (Test-Path -LiteralPath $ntUser)) {
             Write-Host " (NTUSER.DAT not found - skipping registry)" -ForegroundColor $WarnCol -NoNewline
             [void]$script:Problems.Add("registry not cleaned for $UserName (NTUSER.DAT not found)")
             return
@@ -376,30 +408,51 @@ function Invoke-RegistryCleanup {
     }
 }
 
-function Invoke-AuthFlush {
-    param([string]$UserName)
-    $local = "$(Get-OrcaUsersRoot)\$UserName\AppData\Local"
-    @(
-        "$local\Microsoft\IdentityCache",
-        "$local\Microsoft\Edge\User Data\Default\EBWebView",
-        "$local\Microsoft\OneAuth",
-        "$local\Microsoft\TokenBroker\Cache"
-    ) | Where-Object { Test-Path $_ } | ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
-
+function Clear-OrcaCredential {
+    # Credential Manager belongs to the identity that runs this process. It is never touched
+    # for any other profile.
     cmdkey /list | ForEach-Object {
         if ($_ -like "*Target:*Outlook*" -or $_ -like "*Target:*Office*") {
             $target = ($_ -split "Target: ")[1].Trim()
-            cmdkey /delete:$target
+            cmdkey /delete:$target | Out-Null
         }
     }
-    Get-ChildItem -Path "$local\Packages\Microsoft.AAD.BrokerPlugin_*" -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-AuthFlush {
+    # Sign-out scope. The default clears only what Office and Outlook own: the Office identity
+    # cache, OneAuth and the Outlook and Office credentials. The Windows account broker
+    # (TokenBroker and the AAD broker plugin) is shared with Teams, Edge and the Windows work
+    # account, so it is cleared only with -FullSignOut.
+    param($Target, [bool]$FullSignOut)
+    $local = "$($Target.Path)\AppData\Local"
+    $paths = @(
+        "$local\Microsoft\IdentityCache",
+        "$local\Microsoft\OneAuth"
+    )
+    if ($FullSignOut) {
+        $paths += "$local\Microsoft\Edge\User Data\Default\EBWebView"
+        $paths += "$local\Microsoft\TokenBroker\Cache"
+    }
+    $paths | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Remove-Item -LiteralPath $_ -Recurse -Force -ErrorAction SilentlyContinue }
+
+    if ($Target.Sid -eq (Get-OrcaCurrentSid)) {
+        Clear-OrcaCredential
+    } else {
+        Write-Host " (Credential Manager is per identity - not cleared)" -ForegroundColor $WarnCol -NoNewline
+        [void]$script:Problems.Add("Credential Manager entries not cleared for $($Target.Name), run ORCA as that user")
+    }
+    if ($FullSignOut) {
+        foreach ($brokerDir in @(Get-ChildItem -Path "$local\Packages\Microsoft.AAD.BrokerPlugin_*" -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $brokerDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     Start-Sleep -Seconds 15
 }
 #endregion
 
 function Invoke-OrcaMain {
-    param([switch]$Silent)
+    param([switch]$Silent, [switch]$FullSignOut)
     $script:IsAdmin = Test-OrcaElevated
     $script:BackedUpOSTs = New-Object System.Collections.Generic.List[string]
     $script:PurgedExtensions = New-Object System.Collections.Generic.List[string]
@@ -414,8 +467,10 @@ function Invoke-OrcaMain {
         }
 
         # === USER SELECTION ===
-        $ExcludedProfiles = @("Public", "Default", "All Users", "LocalService", "NetworkService", "SYSTEM")
-        $UserProfiles = Get-ChildItem (Get-OrcaUsersRoot) | Where-Object { $_.PSIsContainer -and $_.Name -notin $ExcludedProfiles }
+        $UserProfiles = @(Get-OrcaProfile)
+        if ($UserProfiles.Count -eq 0) {
+            Exit-OrcaRun $EXIT_CANCEL "no user profiles were found in the profile list, nothing was changed."
+        }
 
         if ($script:IsAdmin) {
             # Detect the active interactive user (works even when script is elevated)
@@ -461,16 +516,17 @@ function Invoke-OrcaMain {
                     $userChoice = if ([string]::IsNullOrWhiteSpace($raw)) { $_defaultValue } else { $raw }
                 }
                 $script:AllUsers = ($userChoice -eq 'A' -or $userChoice -eq 'a')
+                $pickIndex = 0
                 if ($script:AllUsers) {
-                    $TargetUsers = $UserProfiles.Name
-                } elseif ($null -ne $UserProfiles[$userChoice]) {
-                    $TargetUsers = @($UserProfiles[$userChoice].Name)
+                    $TargetUsers = @($UserProfiles)
+                } elseif ([int]::TryParse([string]$userChoice, [ref]$pickIndex) -and $pickIndex -ge 0 -and $pickIndex -lt $UserProfiles.Count) {
+                    $TargetUsers = @($UserProfiles[$pickIndex])
                 } else {
                     Write-Host "Invalid selection. Exiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "invalid profile selection, nothing was changed."
                 }
             } else {
                 $script:AllUsers = $true
-                $TargetUsers = $UserProfiles.Name
+                $TargetUsers = @($UserProfiles)
             }
         } else {
             # Non-admin: force single-user mode for the current user and skip user selection prompt
@@ -480,7 +536,12 @@ function Invoke-OrcaMain {
                 Write-Error "Could not determine the current user. Please run as Administrator to target other profiles."
                 Exit-OrcaRun $EXIT_CANCEL "could not determine the current user, nothing was changed."
             }
-            $TargetUsers = @($_activeUser)
+            # A standard user can only act on their own profile, so bind it by SID.
+            $mySid = Get-OrcaCurrentSid
+            $TargetUsers = @($UserProfiles | Where-Object { $_.Sid -eq $mySid })
+            if ($TargetUsers.Count -eq 0) {
+                Exit-OrcaRun $EXIT_CANCEL "no profile was found for the current user, nothing was changed."
+            }
         }
 
         # === OUTLOOK MODE SELECTION ===
@@ -574,7 +635,7 @@ function Invoke-OrcaMain {
             Write-Host "All Users " -ForegroundColor $AccentCol -NoNewline
             Write-Host "($($TargetUsers.Count) profiles)" -ForegroundColor $WarnCol
         } else {
-            Write-Host $TargetUsers[0] -ForegroundColor $AccentCol
+            Write-Host $TargetUsers[0].Name -ForegroundColor $AccentCol
         }
         Write-Host "Mode            : " -ForegroundColor $LineCol -NoNewline
         if ($script:OutlookMode -eq "Both") {
@@ -636,7 +697,8 @@ function Invoke-OrcaMain {
         }
 
         # --- Per-user loop ---
-        foreach ($UserName in $TargetUsers) {
+        foreach ($Target in $TargetUsers) {
+            $UserName = $Target.Name
             if ($script:AllUsers) {
                 Write-Host "  User: " -ForegroundColor $LineCol -NoNewline
                 Write-Host $UserName -ForegroundColor $AccentCol
@@ -646,17 +708,17 @@ function Invoke-OrcaMain {
 
                 "New" {
                     Write-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and removing package..."
-                    Invoke-TerminateOutlook -Mode "New" -UserName $UserName
-                    Invoke-ClearNewOutlookData -UserName $UserName
+                    Invoke-TerminateOutlook -Mode "New" -Target $Target
+                    Invoke-ClearNewOutlookData -Target $Target
                     Complete-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and removing package..."
 
                     Write-Step "$($stepOffset + 2)/$loopTotalSteps" "Cleaning registry hives..."
-                    Invoke-RegistryCleanup -UserName $UserName -Mode "New"
+                    Invoke-RegistryCleanup -Target $Target -Mode "New"
                     # Extension purge not applicable to New Outlook
                     Complete-Step "$($stepOffset + 2)/$loopTotalSteps" "Cleaning registry hives..."
 
                     Write-Step "$($stepOffset + 3)/$loopTotalSteps" "Flushing authentication tokens..."
-                    Invoke-AuthFlush -UserName $UserName
+                    Invoke-AuthFlush -Target $Target -FullSignOut $FullSignOut.IsPresent
                     Complete-Step "$($stepOffset + 3)/$loopTotalSteps" "Flushing authentication tokens..."
 
                     # Reinstall is handled after the user loop
@@ -664,37 +726,37 @@ function Invoke-OrcaMain {
 
                 "Classic" {
                     Write-Step "1/$loopTotalSteps" "Killing processes and clearing cache..."
-                    Invoke-TerminateOutlook -Mode "Classic" -UserName $UserName
-                    Invoke-ClearClassicOutlookData -UserName $UserName
+                    Invoke-TerminateOutlook -Mode "Classic" -Target $Target
+                    Invoke-ClearClassicOutlookData -Target $Target
                     Complete-Step "1/$loopTotalSteps" "Killing processes and clearing cache..."
 
                     Write-Step "2/$loopTotalSteps" "Cleaning registry hives..."
-                    Invoke-RegistryCleanup -UserName $UserName -Mode "Classic"
-                    Invoke-PurgeExtensions -UserName $UserName
+                    Invoke-RegistryCleanup -Target $Target -Mode "Classic"
+                    Invoke-PurgeExtensions -Target $Target
                     Complete-Step "2/$loopTotalSteps" "Cleaning registry hives..."
 
                     Write-Step "3/$loopTotalSteps" "Flushing authentication tokens..."
-                    Invoke-AuthFlush -UserName $UserName
+                    Invoke-AuthFlush -Target $Target -FullSignOut $FullSignOut.IsPresent
                     Complete-Step "3/$loopTotalSteps" "Flushing authentication tokens..."
                 }
 
                 "Both" {
                     Write-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and clearing cache..."
-                    Invoke-TerminateOutlook -Mode "Both" -UserName $UserName
-                    Invoke-ClearClassicOutlookData -UserName $UserName
+                    Invoke-TerminateOutlook -Mode "Both" -Target $Target
+                    Invoke-ClearClassicOutlookData -Target $Target
                     Complete-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and clearing cache..."
 
                     Write-Step "$($stepOffset + 2)/$loopTotalSteps" "Removing New Outlook package and data..."
-                    Invoke-ClearNewOutlookData -UserName $UserName
+                    Invoke-ClearNewOutlookData -Target $Target
                     Complete-Step "$($stepOffset + 2)/$loopTotalSteps" "Removing New Outlook package and data..."
 
                     Write-Step "$($stepOffset + 3)/$loopTotalSteps" "Cleaning registry hives..."
-                    Invoke-RegistryCleanup -UserName $UserName -Mode "Both"
-                    Invoke-PurgeExtensions -UserName $UserName
+                    Invoke-RegistryCleanup -Target $Target -Mode "Both"
+                    Invoke-PurgeExtensions -Target $Target
                     Complete-Step "$($stepOffset + 3)/$loopTotalSteps" "Cleaning registry hives..."
 
                     Write-Step "$($stepOffset + 4)/$loopTotalSteps" "Flushing authentication tokens..."
-                    Invoke-AuthFlush -UserName $UserName
+                    Invoke-AuthFlush -Target $Target -FullSignOut $FullSignOut.IsPresent
                     Complete-Step "$($stepOffset + 4)/$loopTotalSteps" "Flushing authentication tokens..."
 
                     # Reinstall is handled after the user loop
@@ -720,7 +782,7 @@ function Invoke-OrcaMain {
             $installed = $false
 
             # If running as SYSTEM and targeting a single, non-SYSTEM user, skip winget install
-            if (-not $script:AllUsers -and ($env:USERNAME -eq "SYSTEM") -and ($TargetUsers[0] -ne "SYSTEM")) {
+            if (-not $script:AllUsers -and ($env:USERNAME -eq "SYSTEM") -and ($TargetUsers[0].Name -ne "SYSTEM")) {
                 $script:skipReinstall = $true
                 $status = "[SKIPPED]"
                 $pad = " " * [math]::Max(1, $script:Width - "[$reinstallStepNum/$T] $stepMsg".Length - $status.Length)
@@ -728,9 +790,9 @@ function Invoke-OrcaMain {
                 Write-Host "[$reinstallStepNum/$T]" -ForegroundColor $DimCol -NoNewline
                 Write-Host " $stepMsg$pad" -ForegroundColor $DimCol -NoNewline
                 Write-Host $status -ForegroundColor $WarnCol
-                Write-Host "Cannot install New Outlook for '$($TargetUsers[0])' from SYSTEM context." -ForegroundColor $WarnCol
+                Write-Host "Cannot install New Outlook for '$($TargetUsers[0].Name)' from SYSTEM context." -ForegroundColor $WarnCol
                 Write-Host "Please run as the target user or select 'All Users' for provisioning." -ForegroundColor $WarnCol
-                [void]$script:Problems.Add("New Outlook was not reinstalled for $($TargetUsers[0])")
+                [void]$script:Problems.Add("New Outlook was not reinstalled for $($TargetUsers[0].Name)")
             }
             
             if (-not $script:skipReinstall) {
@@ -807,10 +869,10 @@ function Invoke-OrcaMain {
                 if ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
                     # This case may not be hit if IsSystem check is unreliable, but keep for robustness
                     Write-Host ""
-                    Write-Host "NOTE: Script running as 'SYSTEM', target is '$($TargetUsers[0])'." -ForegroundColor $WarnCol
-                } elseif ($TargetUsers[0] -ne $env:USERNAME) {
+                    Write-Host "NOTE: Script running as 'SYSTEM', target is '$($TargetUsers[0].Name)'." -ForegroundColor $WarnCol
+                } elseif ($TargetUsers[0].Name -ne $env:USERNAME) {
                     Write-Host ""
-                    Write-Host "NOTE: Script running as '$env:USERNAME', target is '$($TargetUsers[0])'." -ForegroundColor $WarnCol
+                    Write-Host "NOTE: Script running as '$env:USERNAME', target is '$($TargetUsers[0].Name)'." -ForegroundColor $WarnCol
                     Write-Host "Please launch Outlook manually as the target user." -ForegroundColor $DimCol
                 } else {
                     $launchChoice = $null
@@ -906,4 +968,4 @@ function Invoke-OrcaMain {
     }
 }
 
-if (-not $global:KillerScriptsTestMode) { Invoke-OrcaMain -Silent:$Silent }
+if (-not $global:KillerScriptsTestMode) { Invoke-OrcaMain -Silent:$Silent -FullSignOut:$FullSignOut }

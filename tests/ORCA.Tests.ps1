@@ -12,6 +12,8 @@ BeforeAll {
     }
     Enable-KillerTestMode
     . (Get-KillerScriptPath ORCA)
+    # The real profile reader, kept before any test mocks Get-OrcaProfile.
+    $script:RealGetOrcaProfile = ${function:Get-OrcaProfile}
 
     function New-OrcaKey {
         param([string]$Key = 'Enter', [string]$Char = "`r")
@@ -20,11 +22,11 @@ BeforeAll {
 
     # Runs Invoke-OrcaMain, capturing every stream as text and the KILLERSCRIPT_EXIT code it throws.
     function Invoke-OrcaRun {
-        param([switch]$Silent)
+        param([switch]$Silent, [switch]$FullSignOut)
         $script:Code = $null
         $script:Lines = New-Object System.Collections.ArrayList
         try {
-            Invoke-OrcaMain -Silent:$Silent *>&1 | ForEach-Object { [void]$script:Lines.Add("$_") }
+            Invoke-OrcaMain -Silent:$Silent -FullSignOut:$FullSignOut *>&1 | ForEach-Object { [void]$script:Lines.Add("$_") }
         } catch {
             if ($_.Exception.Message -match 'KILLERSCRIPT_EXIT:(\d+)') { $script:Code = [int]$Matches[1] } else { throw }
         }
@@ -45,6 +47,7 @@ Describe 'ORCA' {
             $out = Join-Path $script:UsersRoot "$u\AppData\Local\Microsoft\Outlook"
             New-Item -ItemType Directory -Path $out -Force | Out-Null
             Set-Content -LiteralPath (Join-Path $out "$u@contoso.com.ost") -Value "synthetic OST for $u"
+            Set-Content -LiteralPath (Join-Path $script:UsersRoot "$u\NTUSER.DAT") -Value 'synthetic hive'
         }
 
         $script:Elevated   = $true
@@ -57,6 +60,13 @@ Describe 'ORCA' {
 
         Mock Test-OrcaElevated { $script:Elevated }
         Mock Get-OrcaUsersRoot { $script:UsersRoot }
+        Mock Get-OrcaProfile {
+            @(
+                [pscustomobject]@{ Name = 'alice'; Account = 'CONTOSO\alice'; Sid = 'S-1-5-21-1000-2000-3000-1001'; Path = (Join-Path $script:UsersRoot 'alice') },
+                [pscustomobject]@{ Name = 'bob'; Account = 'CONTOSO\bob'; Sid = 'S-1-5-21-1000-2000-3000-1002'; Path = (Join-Path $script:UsersRoot 'bob') }
+            )
+        }
+        Mock Get-OrcaCurrentSid { 'S-1-5-21-1000-2000-3000-1001' }
         Mock Get-OrcaTempRoot { $script:TempRoot }
         Mock Test-OrcaWingetPresent { $true }
         Mock Get-ActiveUser { $script:Active }
@@ -88,7 +98,10 @@ Describe 'ORCA' {
             { Exit-KillerScript 3010 } | Should -Throw '*KILLERSCRIPT_EXIT:3010*'
         }
 
-        It 'a silent All Users run that works exits 0 and says so' {
+        It 'a silent run over only the current user that works exits 0 and says so' {
+            Mock Get-OrcaProfile {
+                @([pscustomobject]@{ Name = 'alice'; Account = 'CONTOSO\alice'; Sid = 'S-1-5-21-1000-2000-3000-1001'; Path = (Join-Path $script:UsersRoot 'alice') })
+            }
             Invoke-OrcaRun -Silent
             $script:Code | Should -Be 0
             $script:Text | Should -Match 'ORCA RESULT: exit code 0 '
@@ -235,6 +248,124 @@ Describe 'ORCA' {
             foreach ($a in @(@('D0', '0'), @('D2', '2'), @('N', 'n'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
             Invoke-OrcaRun
             ($script:Stopped | Sort-Object) -join ',' | Should -Be '100'
+        }
+    }
+
+    Context 'Profile identity, credentials and sign-out scope (19)' {
+        BeforeEach {
+            $script:AliceSid  = 'S-1-5-21-1000-2000-3000-1001'
+            $script:BobSid    = 'S-1-5-21-1000-2000-3000-1002'
+            # alice lives in a folder that does not match her account name.
+            [IO.Directory]::Delete((Join-Path $script:UsersRoot 'alice'), $true)
+            $script:AliceHome = Join-Path $script:UsersRoot 'alice.CONTOSO'
+            $script:BobHome   = Join-Path $script:UsersRoot 'bob'
+            $aliceOut = Join-Path $script:AliceHome 'AppData\Local\Microsoft\Outlook'
+            New-Item -ItemType Directory -Path $aliceOut -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $aliceOut 'alice@contoso.com.ost') -Value 'synthetic OST for alice'
+            foreach ($h in $script:AliceHome, $script:BobHome) {
+                Set-Content -LiteralPath (Join-Path $h 'NTUSER.DAT') -Value 'synthetic hive'
+                foreach ($rel in 'Microsoft\IdentityCache', 'Microsoft\OneAuth', 'Microsoft\TokenBroker\Cache', 'Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy') {
+                    New-Item -ItemType Directory -Path (Join-Path $h "AppData\Local\$rel") -Force | Out-Null
+                }
+            }
+            $script:AppxRemoved = @()
+            $script:RegCalls    = @()
+            $script:CredDeletes = @()
+            Mock Get-OrcaProfile {
+                @(
+                    [pscustomobject]@{ Name = 'alice'; Sid = $script:AliceSid; Path = $script:AliceHome },
+                    [pscustomobject]@{ Name = 'bob';   Sid = $script:BobSid;   Path = $script:BobHome }
+                )
+            }
+            Mock Get-OrcaCurrentSid { $script:AliceSid }
+            Mock Remove-AppxPackage { $script:AppxRemoved += $User }
+            Mock reg { $script:RegCalls += ($args -join ' '); $global:LASTEXITCODE = 0 }
+            Mock cmdkey {
+                $global:LASTEXITCODE = 0
+                if ($args[0] -eq '/list') { '    Target: LegacyGeneric:target=MicrosoftOffice16_Data:SSPI:alice@contoso.com'; '    Target: LegacyGeneric:target=Unrelated' }
+                elseif ("$($args[0])" -like '/delete:*') { $script:CredDeletes += "$($args[0])" }
+            }
+        }
+
+        It 'removes the New Outlook package by profile SID, not by a name guess' {
+            foreach ($a in @(@('A', 'A'), @('D3', '3'), @('N', 'n'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Invoke-OrcaRun
+            ($script:AppxRemoved | Sort-Object) -join ',' | Should -Be "$script:AliceSid,$script:BobSid"
+        }
+
+        It 'loads NTUSER.DAT from the resolved profile folder, not from the account name' {
+            foreach ($a in @(@('A', 'A'), @('D2', '2'), @('N', 'n'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Invoke-OrcaRun
+            @($script:RegCalls | Where-Object { $_ -like 'load *' -and $_ -like '*alice.CONTOSO\NTUSER.DAT' }).Count | Should -BeGreaterThan 0
+            @($script:RegCalls | Where-Object { $_ -like 'unload *' }).Count | Should -BeGreaterThan 0
+        }
+
+        It 'renames the OST under the resolved profile folder when one profile is selected' {
+            foreach ($a in @(@('D0', '0'), @('D2', '2'), @('Y', 'y'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Invoke-OrcaRun
+            @(Get-ChildItem -LiteralPath (Join-Path $script:AliceHome 'AppData\Local\Microsoft\Outlook') -Filter '*.ost.bak-*').Count | Should -Be 1
+        }
+
+        It 'clears Credential Manager entries only for the identity that runs the script' {
+            foreach ($a in @(@('A', 'A'), @('D2', '2'), @('N', 'n'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Invoke-OrcaRun
+            $script:CredDeletes.Count | Should -Be 1
+            $script:CredDeletes[0] | Should -Match 'MicrosoftOffice16_Data'
+        }
+
+        It 'exits 3 and names the profile whose Credential Manager entries could not be cleared' {
+            foreach ($a in @(@('A', 'A'), @('D2', '2'), @('N', 'n'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Invoke-OrcaRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match 'ORCA RESULT: exit code 3 .*Credential Manager.*bob'
+        }
+
+        It 'keeps the shared Windows account broker caches by default and clears the Office ones' {
+            Invoke-OrcaRun -Silent
+            foreach ($h in $script:AliceHome, $script:BobHome) {
+                Test-Path -LiteralPath (Join-Path $h 'AppData\Local\Microsoft\IdentityCache') | Should -BeFalse
+                Test-Path -LiteralPath (Join-Path $h 'AppData\Local\Microsoft\OneAuth') | Should -BeFalse
+                Test-Path -LiteralPath (Join-Path $h 'AppData\Local\Microsoft\TokenBroker\Cache') | Should -BeTrue
+                Test-Path -LiteralPath (Join-Path $h 'AppData\Local\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy') | Should -BeTrue
+            }
+        }
+
+        It '-FullSignOut also clears the Windows account broker caches' {
+            Invoke-OrcaRun -Silent -FullSignOut
+            foreach ($h in $script:AliceHome, $script:BobHome) {
+                Test-Path -LiteralPath (Join-Path $h 'AppData\Local\Microsoft\TokenBroker\Cache') | Should -BeFalse
+                Test-Path -LiteralPath (Join-Path $h 'AppData\Local\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy') | Should -BeFalse
+            }
+        }
+    }
+
+    Context 'Get-OrcaProfile' {
+        BeforeEach {
+            New-Item -Path 'TestRegistry:\ProfileList' -Force | Out-Null
+            $script:LiveHome = Join-Path $TestDrive 'Users\alice.CONTOSO'
+            New-Item -ItemType Directory -Path $script:LiveHome -Force | Out-Null
+            function Add-OrcaProfileKey { param([string]$Sid, [string]$Path)
+                New-Item -Path "TestRegistry:\ProfileList\$Sid" -Force | Out-Null
+                New-ItemProperty -Path "TestRegistry:\ProfileList\$Sid" -Name ProfileImagePath -Value $Path -PropertyType ExpandString | Out-Null
+            }
+            Add-OrcaProfileKey 'S-1-5-21-1000-2000-3000-1001' $script:LiveHome
+            Add-OrcaProfileKey 'S-1-5-18' 'C:\Windows\system32\config\systemprofile'
+            Add-OrcaProfileKey 'S-1-5-21-1000-2000-3000-1003' (Join-Path $TestDrive 'Users\gone')
+            Mock Resolve-OrcaAccountName { if ($Sid -like '*-1001') { 'alice' } else { $null } }
+        }
+
+        It 'binds each real user SID to its profile folder and account name' {
+            $p = @(& $script:RealGetOrcaProfile -ListPath 'TestRegistry:\ProfileList')
+            $p.Count | Should -Be 1
+            $p[0].Name | Should -Be 'alice'
+            $p[0].Sid  | Should -Be 'S-1-5-21-1000-2000-3000-1001'
+            $p[0].Path | Should -Be $script:LiveHome
+        }
+
+        It 'skips service profiles and profiles whose folder is gone' {
+            $p = @(& $script:RealGetOrcaProfile -ListPath 'TestRegistry:\ProfileList')
+            $p.Sid | Should -Not -Contain 'S-1-5-18'
+            $p.Sid | Should -Not -Contain 'S-1-5-21-1000-2000-3000-1003'
         }
     }
 }
