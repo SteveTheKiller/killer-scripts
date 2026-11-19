@@ -235,13 +235,44 @@ function Invoke-PurgeExtensions {
     }
 }
 
-function Invoke-TerminateOutlook {
-    param([string]$Mode)
-    if ($Mode -ne "Classic") {
-        Get-Process -Name "olk", "WebViewHost", "msedgewebview2" -ErrorAction SilentlyContinue | Stop-Process -Force
+function Get-OrcaSessionId {
+    [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+}
+
+function Get-OrcaProcessCommandLine {
+    param([int]$ProcessId)
+    $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if ($cim) { [string]$cim.CommandLine } else { "" }
+}
+
+function Get-OrcaOutlookProcess {
+    # Only processes that belong to the target user AND to Outlook. WebView2 hosts are shared by
+    # Teams, Widgets and other apps, so they count only when their command line names Outlook.
+    param([string]$UserName, [string]$Mode)
+    $names = @()
+    if ($Mode -ne "Classic") { $names += "olk", "WebViewHost", "msedgewebview2" }
+    if ($Mode -ne "New")     { $names += "OUTLOOK" }
+    if ($script:IsAdmin) {
+        $found = @(Get-Process -Name $names -IncludeUserName -ErrorAction SilentlyContinue)
+    } else {
+        # Without elevation the owner name is not readable. A standard user can only stop their
+        # own processes, so keep this session.
+        $session = Get-OrcaSessionId
+        $found = @(Get-Process -Name $names -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
     }
-    if ($Mode -ne "New") {
-        Get-Process -Name "OUTLOOK" -ErrorAction SilentlyContinue | Stop-Process -Force
+    foreach ($proc in $found) {
+        if ($script:IsAdmin) {
+            if (-not $proc.UserName -or (($proc.UserName -replace '^.*\\') -ne $UserName)) { continue }
+        }
+        if ($proc.Name -in @("olk", "OUTLOOK")) { $proc; continue }
+        if ((Get-OrcaProcessCommandLine -ProcessId $proc.Id) -match 'OutlookForWindows|\\Olk\\|\bolk\.exe') { $proc }
+    }
+}
+
+function Invoke-TerminateOutlook {
+    param([string]$Mode, [string]$UserName)
+    foreach ($proc in @(Get-OrcaOutlookProcess -UserName $UserName -Mode $Mode)) {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -615,7 +646,7 @@ function Invoke-OrcaMain {
 
                 "New" {
                     Write-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and removing package..."
-                    Invoke-TerminateOutlook -Mode "New"
+                    Invoke-TerminateOutlook -Mode "New" -UserName $UserName
                     Invoke-ClearNewOutlookData -UserName $UserName
                     Complete-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and removing package..."
 
@@ -633,7 +664,7 @@ function Invoke-OrcaMain {
 
                 "Classic" {
                     Write-Step "1/$loopTotalSteps" "Killing processes and clearing cache..."
-                    Invoke-TerminateOutlook -Mode "Classic"
+                    Invoke-TerminateOutlook -Mode "Classic" -UserName $UserName
                     Invoke-ClearClassicOutlookData -UserName $UserName
                     Complete-Step "1/$loopTotalSteps" "Killing processes and clearing cache..."
 
@@ -649,7 +680,7 @@ function Invoke-OrcaMain {
 
                 "Both" {
                     Write-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and clearing cache..."
-                    Invoke-TerminateOutlook -Mode "Both"
+                    Invoke-TerminateOutlook -Mode "Both" -UserName $UserName
                     Invoke-ClearClassicOutlookData -UserName $UserName
                     Complete-Step "$($stepOffset + 1)/$loopTotalSteps" "Killing processes and clearing cache..."
 

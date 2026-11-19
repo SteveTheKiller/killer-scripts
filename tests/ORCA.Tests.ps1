@@ -187,4 +187,54 @@ Describe 'ORCA' {
             $script:Text | Should -Match 'ORCA RESULT: exit code 3 .*OST'
         }
     }
+
+    Context 'Process termination (18b)' {
+        BeforeEach {
+            function New-OrcaProc { param([string]$Name, [int]$Id, [string]$User, [string]$Cmd = '')
+                [pscustomobject]@{ Name = $Name; Id = $Id; UserName = $User; SessionId = 1; CommandLine = $Cmd }
+            }
+            $olkCmd   = '"C:\Program Files\WindowsApps\Microsoft.OutlookForWindows_1.0\olk.exe" --webview'
+            $teamsCmd = '"C:\Program Files\WindowsApps\MSTeams_1.0\msedgewebview2.exe" --user-data-dir=C:\Users\alice\AppData\Local\Packages\MSTeams'
+            $script:Procs = @(
+                (New-OrcaProc 'OUTLOOK' 100 'CONTOSO\alice'),
+                (New-OrcaProc 'OUTLOOK' 101 'CONTOSO\bob'),
+                (New-OrcaProc 'olk' 200 'CONTOSO\alice'),
+                (New-OrcaProc 'olk' 201 'CONTOSO\bob'),
+                (New-OrcaProc 'msedgewebview2' 300 'CONTOSO\alice' $olkCmd),
+                (New-OrcaProc 'msedgewebview2' 301 'CONTOSO\alice' $teamsCmd),
+                (New-OrcaProc 'msedgewebview2' 302 'CONTOSO\bob' $olkCmd),
+                (New-OrcaProc 'WebViewHost' 310 'CONTOSO\alice' $olkCmd)
+            )
+            Mock Get-Process {
+                $script:Procs | Where-Object { $Name -contains $_.Name }
+            }
+            Mock Get-CimInstance {
+                $id = [int](([string]$Filter) -replace '\D', '')
+                $script:Procs | Where-Object { $_.Id -eq $id } | ForEach-Object { [pscustomobject]@{ ProcessId = $_.Id; CommandLine = $_.CommandLine } }
+            }
+            Mock Stop-Process { foreach ($x in (@($InputObject | ForEach-Object { $_.Id }) + @($Id))) { if ($null -ne $x) { $script:Stopped += $x } } }
+            # Profile 0 (alice), Both, no OST reset, no extension purge.
+            foreach ($a in @(@('D0', '0'), @('D3', '3'), @('N', 'n'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+        }
+
+        It 'stops only the selected user Outlook and Outlook WebView processes' {
+            Invoke-OrcaRun
+            ($script:Stopped | Sort-Object) -join ',' | Should -Be '100,200,300,310'
+        }
+
+        It 'never stops another user Outlook or an unrelated WebView2 app' {
+            Invoke-OrcaRun
+            $script:Stopped | Should -Not -Contain 101
+            $script:Stopped | Should -Not -Contain 201
+            $script:Stopped | Should -Not -Contain 301
+            $script:Stopped | Should -Not -Contain 302
+        }
+
+        It 'Classic mode leaves New Outlook processes running' {
+            $script:Keys.Clear()
+            foreach ($a in @(@('D0', '0'), @('D2', '2'), @('N', 'n'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Invoke-OrcaRun
+            ($script:Stopped | Sort-Object) -join ',' | Should -Be '100'
+        }
+    }
 }
