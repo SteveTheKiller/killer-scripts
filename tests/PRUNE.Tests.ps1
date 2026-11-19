@@ -187,3 +187,86 @@ Describe 'Finding 47: disabled and failed account lookups' {
         Get-AccountStatus -SID 'S-1-5-21-900-800-700-1100' -AccountName 'CONTOSO\jdoe' | Should -Be 'Domain'
     }
 }
+
+Describe 'Finding 22: service and task owners are matched by exact identity' {
+    BeforeAll {
+        $script:BobSid     = 'S-1-5-21-111-222-333-1010'
+        $script:BobbySid   = 'S-1-5-21-111-222-333-1011'
+        $script:Bob2Sid    = 'S-1-5-21-111-222-333-1012'
+        $script:CorpBobSid = 'S-1-5-21-900-800-700-1500'
+        $script:Target = [pscustomobject]@{ SID = $script:BobSid; AccountName = "$env:COMPUTERNAME\bob"; DisplayName = "$env:COMPUTERNAME\bob"; LocalPath = 'C:\Users\bob' }
+    }
+
+    BeforeEach {
+        # Names that merely contain "bob" map to different accounts. Only the SID decides.
+        Mock Resolve-PrunePrincipalSid {
+            param($Name)
+            switch ($Name) {
+                'bob'                { $script:BobSid }
+                ".\bob"              { $script:BobSid }
+                "$env:COMPUTERNAME\bob" { $script:BobSid }
+                'bobby'              { $script:BobbySid }
+                ".\bobby"            { $script:BobbySid }
+                'bob2'               { $script:Bob2Sid }
+                'CORP\bob'           { $script:CorpBobSid }
+                'LocalSystem'        { 'S-1-5-18' }
+                'S-1-5-21-111-222-333-1010' { $Name }
+                default              { $null }
+            }
+        }
+        Mock Get-CimInstance {
+            if ($ClassName -eq 'Win32_Service') {
+                @(
+                    [pscustomobject]@{ Name = 'SvcBob';    StartName = '.\bob';        State = 'Running'; DisplayName = 'Bob service' },
+                    [pscustomobject]@{ Name = 'SvcBobby';  StartName = '.\bobby';      State = 'Running'; DisplayName = 'Bobby service' },
+                    [pscustomobject]@{ Name = 'SvcCorp';   StartName = 'CORP\bob';     State = 'Running'; DisplayName = 'Corp Bob service' },
+                    [pscustomobject]@{ Name = 'SvcSystem'; StartName = 'LocalSystem';  State = 'Running'; DisplayName = 'System service' },
+                    [pscustomobject]@{ Name = 'SvcGone';   StartName = 'robobob';      State = 'Stopped'; DisplayName = 'Unresolvable owner' }
+                )
+            }
+        }
+        Mock Get-ScheduledTask {
+            @(
+                [pscustomobject]@{ TaskName = 'BobTask';   TaskPath = '\'; State = 'Ready'; Principal = [pscustomobject]@{ UserId = 'bob' } },
+                [pscustomobject]@{ TaskName = 'BobbyTask'; TaskPath = '\'; State = 'Ready'; Principal = [pscustomobject]@{ UserId = 'bobby' } },
+                [pscustomobject]@{ TaskName = 'Bob2Task';  TaskPath = '\'; State = 'Ready'; Principal = [pscustomobject]@{ UserId = 'bob2' } },
+                [pscustomobject]@{ TaskName = 'CorpTask';  TaskPath = '\'; State = 'Ready'; Principal = [pscustomobject]@{ UserId = 'CORP\bob' } },
+                [pscustomobject]@{ TaskName = 'SidTask';   TaskPath = '\'; State = 'Ready'; Principal = [pscustomobject]@{ UserId = 'S-1-5-21-111-222-333-1010' } }
+            )
+        }
+    }
+
+    It 'lists only the services that run as exactly this account' {
+        $o = Find-PruneOwnedItems -Target $script:Target
+        @($o.Services | ForEach-Object Name) | Should -Be @('SvcBob')
+    }
+
+    It 'lists only the tasks that run as exactly this account, including one that names the SID' {
+        $o = Find-PruneOwnedItems -Target $script:Target
+        @($o.Tasks | ForEach-Object TaskName | Sort-Object) | Should -Be @('BobTask', 'SidTask')
+    }
+
+    It 'unregisters only the exact-owner tasks when the technician agrees' {
+        $script:keys = New-Object System.Collections.Queue
+        $script:keys.Enqueue([pscustomobject]@{ Key = [ConsoleKey]::Y; KeyChar = 'y' })
+        $script:keys.Enqueue([pscustomobject]@{ Key = [ConsoleKey]::N; KeyChar = 'n' })
+        Mock Read-PruneKey { if ($script:keys.Count -gt 0) { $script:keys.Dequeue() } else { $null } }
+        Mock Unregister-ScheduledTask { }
+        $null = Invoke-PruneInvestigation -Target $script:Target
+        Should -Invoke Unregister-ScheduledTask -Times 2 -Exactly
+        Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'BobTask' }
+        Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'SidTask' }
+    }
+
+    It 'leaves a task alone when its owner cannot be resolved' {
+        Mock Get-ScheduledTask { @([pscustomobject]@{ TaskName = 'Mystery'; TaskPath = '\'; State = 'Ready'; Principal = [pscustomobject]@{ UserId = 'nosuchuser' } }) }
+        $o = Find-PruneOwnedItems -Target $script:Target
+        @($o.Tasks).Count | Should -Be 0
+    }
+}
+
+Describe 'Finding 22: principal resolution' {
+    It 'resolves a SID string to itself without a directory lookup' {
+        Resolve-PrunePrincipalSid -Name 'S-1-5-21-111-222-333-1010' | Should -Be 'S-1-5-21-111-222-333-1010'
+    }
+}

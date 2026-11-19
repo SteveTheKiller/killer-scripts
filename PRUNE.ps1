@@ -303,16 +303,37 @@ function Get-PruneProfiles {
     return ,$profiles
 }
 
+function Resolve-PrunePrincipalSid {
+    # Resolves a service or task owner (DOMAIN\name, .\name, a bare name, a UPN or a SID string) to a
+    # SID string. Returns $null when the owner cannot be resolved.
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $n = $Name.Trim()
+    try {
+        if ($n -match '^S-1-\d+(-\d+)+$') { return (New-Object System.Security.Principal.SecurityIdentifier($n)).Value }
+        if ($n.StartsWith('.\')) { $n = "$($env:COMPUTERNAME)\" + $n.Substring(2) }
+        return ((New-Object System.Security.Principal.NTAccount($n)).Translate([System.Security.Principal.SecurityIdentifier])).Value
+    } catch { return $null }
+}
+
 function Find-PruneOwnedItems {
-    # Services and scheduled tasks configured to run as the given profile's account.
+    # Services and scheduled tasks configured to run as exactly the given profile's account. An owner
+    # counts only when it resolves to the profile's SID, so a similar name (bob, bobby, CORP\bob) is
+    # never listed and can never be removed. An owner that does not resolve is left alone.
     param([Parameter(Mandatory)]$Target)
-    $uname = if ($Target.AccountName -like "*\*") { ($Target.AccountName -split "\\")[1] } else { $Target.AccountName }
-    if (-not $uname) { $uname = [System.IO.Path]::GetFileName($Target.LocalPath) }
+    $cache = @{}
+    $ownedBy = {
+        param([string]$Owner)
+        if ([string]::IsNullOrWhiteSpace($Owner)) { return $false }
+        if (-not $cache.ContainsKey($Owner)) { $cache[$Owner] = Resolve-PrunePrincipalSid -Name $Owner }
+        $resolved = $cache[$Owner]
+        return [bool]($resolved -and ($resolved -ieq $Target.SID))
+    }
 
     $services = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
-        Where-Object { $_.StartName -like "*$uname*" })
+        Where-Object { & $ownedBy $_.StartName })
     $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
-        Where-Object { $_.Principal.UserId -like "*$uname*" })
+        Where-Object { & $ownedBy $_.Principal.UserId })
     [pscustomobject]@{ Services = $services; Tasks = $tasks }
 }
 
