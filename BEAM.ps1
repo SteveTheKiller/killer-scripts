@@ -649,7 +649,7 @@ function Wait-GraphState {
     param([string]$Uri, [hashtable]$Headers, [string]$Property, [string[]]$SuccessValues, [string[]]$FailValues, [int]$TimeoutSec = 300)
     $deadline = (Get-BeamUtcNow).AddSeconds($TimeoutSec)
     while ((Get-BeamUtcNow) -lt $deadline) {
-        $r = Invoke-RestMethod $Uri -Headers $Headers
+        $r = Invoke-BeamGraph $Uri $Headers
         $v = $r.$Property
         if ($SuccessValues -contains $v) { return $r }
         if ($FailValues    -contains $v) { throw "Graph state failure: $v" }
@@ -1018,7 +1018,8 @@ exit 1
     $baseFileUri = "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions/$($cv.id)/files/$($fileEntry.id)"
 
     Write-StepUpdate "Waiting for Azure Storage URI..." INFO
-    $fileReady = Wait-GraphState $baseFileUri $h "uploadState" @("azureStorageUriRequestSuccess") @("azureStorageUriRequestFailed")
+    try { $fileReady = Wait-GraphState $baseFileUri $h "uploadState" @("azureStorageUriRequestSuccess") @("azureStorageUriRequestFailed") }
+    catch { Write-StepUpdate "Waiting for the Azure Storage URI failed: $_" FAIL; return $false }
     Write-StepUpdate "Azure Storage URI ready" OK
 
     Write-StepUpdate "Uploading encrypted content to Azure Storage..." INFO
@@ -1041,7 +1042,8 @@ exit 1
     } | ConvertTo-Json -Depth 5
     try { Invoke-BeamGraph "$baseFileUri/commit" $h POST $commitBody | Out-Null }
     catch { Write-StepUpdate "Committing the file failed: $_" FAIL; return $false }
-    Wait-GraphState $baseFileUri $h "uploadState" @("commitFileSuccess") @("commitFileFailed") | Out-Null
+    try { Wait-GraphState $baseFileUri $h "uploadState" @("commitFileSuccess") @("commitFileFailed") | Out-Null }
+    catch { Write-StepUpdate "Waiting for the file commit failed: $_" FAIL; return $false }
     Write-StepUpdate "File committed" OK
 
     $patchBody = @{ "@odata.type" = "#microsoft.graph.win32LobApp"; committedContentVersion = $cv.id } | ConvertTo-Json

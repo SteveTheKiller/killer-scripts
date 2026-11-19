@@ -438,4 +438,44 @@ Context 'Finding 50: a failed Graph call is a failure, not an OK' {
         $script:Text | Should -Match 'BEAM RESULT: exit code 1 -'
     }
 }
+
+Context 'Finding 64: a failed or timed-out Graph wait is reported, not fatal' {
+    BeforeEach { Add-FakeDevice 'PC01' }
+
+    It 'returns failure instead of throwing when Azure Storage URI allocation fails' {
+        $script:G.NextFileState = 'azureStorageUriRequestFailed'
+        $r = $null
+        { $script:r = Invoke-Deploy } | Should -Not -Throw
+        ($script:r | Select-Object -Last 1) | Should -BeFalse
+        ($script:Log -join "`n") | Should -Match 'FAIL\].*azureStorageUriRequestFailed'
+    }
+
+    It 'returns failure instead of throwing when the commit never completes before the deadline' {
+        $script:G.CommitState = 'commitFilePending'
+        { $script:r = Invoke-Deploy } | Should -Not -Throw
+        ($script:r | Select-Object -Last 1) | Should -BeFalse
+        ($script:Log -join "`n") | Should -Match 'FAIL\].*Timeout'
+    }
+
+    It 'returns failure instead of throwing when polling the file state gets an HTTP error' {
+        Add-FakeFailure -Method GET -Pattern '/files/file-\d+$' -Mode throw -Message 'The remote server returned an error: (503)'
+        { $script:r = Invoke-Deploy } | Should -Not -Throw
+        ($script:r | Select-Object -Last 1) | Should -BeFalse
+        ($script:Log -join "`n") | Should -Match 'FAIL\].*503'
+    }
+
+    It 'still ends with a per-target FAIL, a summary line and exit 1 from the entry point' {
+        foreach ($x in 'https://files.invalid/setup.exe', '', '', '/S', 'PC01', 'admin@contoso.invalid') { $script:Reads.Enqueue($x) }
+        Mock Invoke-WebRequest { [IO.File]::WriteAllBytes($OutFile, [byte[]](0x4D, 0x5A, 0x90, 0x00, 1, 2, 3, 4)) }
+        Mock Invoke-RestMethod {
+            if ("$Uri" -match 'openid-configuration') { return [pscustomobject]@{ issuer = 'https://sts.windows.net/11111111-2222-3333-4444-555555555555/' } }
+            Invoke-FakeGraph -Uri $Uri -Method $Method -Body $Body
+        }
+        $script:G.NextFileState = 'azureStorageUriRequestFailed'
+        Invoke-BeamRun
+        $script:Code | Should -Be 1
+        $script:Text | Should -Match 'BEAM RESULT: exit code 1 -'
+        ($script:Log -join "`n") | Should -Match '\[FAIL\] PC01'
+    }
+}
 }
