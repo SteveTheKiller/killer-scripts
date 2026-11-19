@@ -22,6 +22,8 @@ BeforeAll {
             Calls = New-Object System.Collections.ArrayList
             Fail = New-Object System.Collections.ArrayList
             FileState = @{}
+            NextFileState = 'azureStorageUriRequestSuccess'
+            CommitState = 'commitFileSuccess'
             Seq = 0
         }
     }
@@ -85,10 +87,10 @@ BeforeAll {
         if ($u -match '/contentVersions/([^/]+)/files$' -and $m -eq 'POST') {
             $script:G.Seq++
             $fid = "file-$($script:G.Seq)"
-            $script:G.FileState[$fid] = 'azureStorageUriRequestSuccess'
+            $script:G.FileState[$fid] = $script:G.NextFileState
             return [pscustomobject]@{ id = $fid }
         }
-        if ($u -match '/files/([^/]+)/commit$' -and $m -eq 'POST') { $script:G.FileState[$Matches[1]] = 'commitFileSuccess'; return }
+        if ($u -match '/files/([^/]+)/commit$' -and $m -eq 'POST') { $script:G.FileState[$Matches[1]] = $script:G.CommitState; return }
         if ($u -match '/files/([^/]+)$' -and $m -eq 'GET') {
             return [pscustomobject]@{ id = $Matches[1]; uploadState = $script:G.FileState[$Matches[1]]; azureStorageUri = 'https://fake.blob.invalid/c?sig=1' }
         }
@@ -229,6 +231,8 @@ BeforeEach {
     Mock Write-HLine { }
     Mock Clear-Host { }
     Mock Start-Sleep { }
+    $script:Clock = [DateTime]::UtcNow
+    Mock Get-BeamUtcNow { $script:Clock = $script:Clock.AddSeconds(5); $script:Clock }
     Mock Write-StepUpdate { [void]$script:Log.Add("[$Status] $Message") }
     Mock Write-Detail { [void]$script:Log.Add("<$Label> $Value ($Status)") }
     $script:WorkRoot = Join-Path $TestDrive ('w' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -393,6 +397,45 @@ Context 'Finding 03a: each app has its own detection marker' {
         $detect = Get-AppDetectScript $script:G.Apps[0]
         (Get-MarkerPathFromScript $detect) | Should -Be $first
         $detect | Should -Match 'RUN-2'
+    }
+}
+
+Context 'Finding 50: a failed Graph call is a failure, not an OK' {
+    BeforeEach { Add-FakeDevice 'PC01' }
+
+    It 'reports failure and never prints OK when committing the app version fails' {
+        Add-FakeFailure -Method PATCH -Pattern 'mobileApps/app-\d+$'
+        $r = Invoke-Deploy
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        ($script:Log -join "`n") | Should -Not -Match 'OK\] App version committed'
+        $script:G.Apps[0].PSObject.Properties.Name | Should -Not -Contain 'committedContentVersion'
+    }
+
+    It 'reports failure and never marks anything assigned when the assignment call fails' {
+        Add-FakeFailure -Method POST -Pattern '/assign$'
+        $r = Invoke-Deploy
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        ($script:Log -join "`n") | Should -Not -Match 'OK\] App assigned'
+    }
+
+    It 'reports failure when the file commit call fails' {
+        Add-FakeFailure -Method POST -Pattern '/commit$'
+        $r = Invoke-Deploy
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        ($script:Log -join "`n") | Should -Not -Match 'OK\] File committed'
+    }
+
+    It 'exits 1 from the entry point and does not claim any target is queued when assignment fails' {
+        foreach ($x in 'https://files.invalid/setup.exe', '', '', '/S', 'PC01', 'admin@contoso.invalid') { $script:Reads.Enqueue($x) }
+        Mock Invoke-WebRequest { [IO.File]::WriteAllBytes($OutFile, [byte[]](0x4D, 0x5A, 0x90, 0x00, 1, 2, 3, 4)) }
+        Mock Invoke-RestMethod {
+            if ("$Uri" -match 'openid-configuration') { return [pscustomobject]@{ issuer = 'https://sts.windows.net/11111111-2222-3333-4444-555555555555/' } }
+            Invoke-FakeGraph -Uri $Uri -Method $Method -Body $Body
+        }
+        Add-FakeFailure -Method POST -Pattern '/assign$'
+        Invoke-BeamRun
+        $script:Code | Should -Be 1
+        $script:Text | Should -Match 'BEAM RESULT: exit code 1 -'
     }
 }
 }

@@ -709,6 +709,20 @@ function Resolve-DirectDownload {
     } catch { return $pick }
 }
 
+function Invoke-BeamGraph {
+    # Every Graph call goes through here so a failure is always a terminating error. Without
+    # -ErrorAction Stop, Invoke-RestMethod can write a non-terminating error and carry on, and the
+    # caller would print OK for a call that failed. String bodies are sent as UTF-8 bytes: PS 5.1
+    # sends string bodies as Latin-1, which mangles non-ASCII names.
+    param([string]$Uri, [hashtable]$Headers, [string]$Method = 'GET', $Body)
+    $p = @{ Uri = $Uri; Headers = $Headers; Method = $Method; ErrorAction = 'Stop' }
+    if ($null -ne $Body) {
+        if ($Body -is [string]) { $p.Body = [System.Text.Encoding]::UTF8.GetBytes($Body) } else { $p.Body = $Body }
+        $p.ContentType = 'application/json; charset=utf-8'
+    }
+    Invoke-RestMethod @p
+}
+
 function Get-BeamAppKey {
     # A stable, file-name-safe identity for one deployed app: a readable slice of the name plus a
     # short hash of the exact display name, so two names that sanitize to the same text still differ.
@@ -988,9 +1002,6 @@ exit 1
     }
     }
 
-    $cv = Invoke-RestMethod "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions" -Method POST -Headers $h -Body "{}" -ContentType "application/json"
-    Write-StepUpdate "Content version: $($cv.id)" INFO
-
     $fileBody = @{
         "@odata.type" = "#microsoft.graph.mobileAppContentFile"
         name          = "$SetupFile.intunewin"
@@ -999,7 +1010,11 @@ exit 1
         manifest      = $null
         isDependency  = $false
     } | ConvertTo-Json
-    $fileEntry   = Invoke-RestMethod "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions/$($cv.id)/files" -Method POST -Headers $h -Body $fileBody -ContentType "application/json"
+    try {
+        $cv = Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions" $h POST "{}"
+        Write-StepUpdate "Content version: $($cv.id)" INFO
+        $fileEntry = Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions/$($cv.id)/files" $h POST $fileBody
+    } catch { Write-StepUpdate "Creating the content version failed: $_" FAIL; return $false }
     $baseFileUri = "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions/$($cv.id)/files/$($fileEntry.id)"
 
     Write-StepUpdate "Waiting for Azure Storage URI..." INFO
@@ -1024,12 +1039,14 @@ exit 1
             fileDigestAlgorithm  = $enc.FileDigestAlgorithm
         }
     } | ConvertTo-Json -Depth 5
-    Invoke-RestMethod "$baseFileUri/commit" -Method POST -Headers $h -Body $commitBody -ContentType "application/json" | Out-Null
+    try { Invoke-BeamGraph "$baseFileUri/commit" $h POST $commitBody | Out-Null }
+    catch { Write-StepUpdate "Committing the file failed: $_" FAIL; return $false }
     Wait-GraphState $baseFileUri $h "uploadState" @("commitFileSuccess") @("commitFileFailed") | Out-Null
     Write-StepUpdate "File committed" OK
 
     $patchBody = @{ "@odata.type" = "#microsoft.graph.win32LobApp"; committedContentVersion = $cv.id } | ConvertTo-Json
-    Invoke-RestMethod "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)" -Method PATCH -Headers $h -Body $patchBody -ContentType "application/json" | Out-Null
+    try { Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)" $h PATCH $patchBody | Out-Null }
+    catch { Write-StepUpdate "Committing the app version failed: $_" FAIL; return $false }
     Write-StepUpdate "App version committed" OK
 
     $groupName = "BEAM-$safeName"
@@ -1116,7 +1133,8 @@ exit 1
             }
         )
     } | ConvertTo-Json -Depth 10
-    Invoke-RestMethod "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/assign" -Method POST -Headers $h -Body $assignBody -ContentType "application/json" | Out-Null
+    try { Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/assign" $h POST $assignBody | Out-Null }
+    catch { Write-StepUpdate "Assigning the app failed: $_" FAIL; return $false }
     Write-StepUpdate "App assigned. Devices will install on next Intune check-in (15-60 min)." OK
     Write-Host ""
     Write-StepUpdate "App ID: $($app.id)" INFO
