@@ -154,3 +154,36 @@ Describe 'Exit codes and final status line' {
         Should -Invoke Remove-CimInstance -Times 0 -Exactly
     }
 }
+
+Describe 'Finding 47: disabled and failed account lookups' {
+    BeforeAll {
+        $script:LocalSid = 'S-1-5-21-111-222-333-1005'
+        $script:LocalName = "$env:COMPUTERNAME\olduser"
+    }
+
+    It 'reports Disabled for a disabled local account' {
+        Mock Get-LocalUser { [pscustomobject]@{ Name = 'olduser'; Enabled = $false } }
+        Get-AccountStatus -SID $script:LocalSid -AccountName $script:LocalName | Should -Be 'Disabled'
+    }
+
+    It 'reports Local for an enabled local account' {
+        Mock Get-LocalUser { [pscustomobject]@{ Name = 'olduser'; Enabled = $true } }
+        Get-AccountStatus -SID $script:LocalSid -AccountName $script:LocalName | Should -Be 'Local'
+    }
+
+    It 'reports a failed lookup as LookupFailed, never as Local' {
+        Mock Get-LocalUser { throw 'The service is not running' }
+        Get-AccountStatus -SID $script:LocalSid -AccountName $script:LocalName | Should -Be 'LookupFailed'
+    }
+
+    It 'looks the account up by SID so a similar name cannot answer for it' {
+        Mock Get-LocalUser { [pscustomobject]@{ Name = 'olduser'; Enabled = $false } } -ParameterFilter { $SID -and $SID.Value -eq 'S-1-5-21-111-222-333-1005' }
+        Mock Get-LocalUser { [pscustomobject]@{ Name = 'olduser2'; Enabled = $true } }
+        Get-AccountStatus -SID $script:LocalSid -AccountName $script:LocalName | Should -Be 'Disabled'
+    }
+
+    It 'reports a domain account as Domain without querying local users' {
+        Mock Get-LocalUser { throw 'must not be called' }
+        Get-AccountStatus -SID 'S-1-5-21-900-800-700-1100' -AccountName 'CONTOSO\jdoe' | Should -Be 'Domain'
+    }
+}

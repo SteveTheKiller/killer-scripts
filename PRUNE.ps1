@@ -160,10 +160,15 @@ function Get-AccountStatus {
     $userPart   = if ($AccountName -like "*\*") { ($AccountName -split "\\")[1] } else { $AccountName }
     $isLocal    = (-not $domainPart) -or ($domainPart -ieq $env:COMPUTERNAME)
     if ($isLocal) {
+        # Look the account up by SID, so a similar name can never answer for it. A failed lookup is
+        # reported as its own state and is never guessed to be an enabled local account.
         try {
-            $lu = Get-LocalUser -Name $userPart -ErrorAction Stop
-            return if ($lu.Enabled) { "Local" } else { "Disabled" }
-        } catch { return "Local" }
+            $sidObj = $null
+            try { $sidObj = New-Object System.Security.Principal.SecurityIdentifier($SID) } catch { $sidObj = $null }
+            $lu = if ($sidObj) { Get-LocalUser -SID $sidObj -ErrorAction Stop } else { Get-LocalUser -Name $userPart -ErrorAction Stop }
+            if ($lu.Enabled) { return "Local" }
+            return "Disabled"
+        } catch { return "LookupFailed" }
     }
     return "Domain"
 }
@@ -707,6 +712,7 @@ function Invoke-PruneSession {
         $flags = @()
         if ($p.Status -eq "Orphaned")      { $flags += "orphaned" }
         if ($p.Status -eq "Disabled")      { $flags += "disabled" }
+        if ($p.Status -eq "LookupFailed")  { $flags += "account lookup failed" }
         if (-not $p.FolderExists)          { $flags += "no folder on disk" }
         $flagStr = if ($flags.Count -gt 0) { "  [$($flags -join ', ')]" } else { "" }
 
