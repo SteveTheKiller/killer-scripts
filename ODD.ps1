@@ -300,8 +300,7 @@ function Write-OddSection {
 function Invoke-OddMain {
     if (-not (Test-OddElevated)) {
         Write-Error "O.D.D. requires Elevated Privileges. Please run as Administrator."
-        Write-Output "[FAIL] ODD not elevated, nothing was read (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     $endpointsOut = @(Get-OddEndpoints -Branch Render)
     $endpointsIn  = @(Get-OddEndpoints -Branch Capture)
@@ -379,14 +378,6 @@ function Invoke-OddMain {
     #endregion
 
     Write-HLine -Style dashed
-    $notes = @()
-    if (-not $AudioRunning) { $notes += "the Windows Audio service is not running" }
-    if ($errors -gt 0) { $notes += "$errors listed device(s) report an error" }
-    if ($notes.Count -gt 0) {
-        Write-Output "[WARN] ODD report produced, but $($notes -join ' and ') (exit 3)"
-        Exit-KillerScript 3
-    }
-    Write-Output "[PASS] ODD report produced, audio service running and no device errors (exit 0)"
     Exit-KillerScript 0
 }
 

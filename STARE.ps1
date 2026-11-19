@@ -20,10 +20,8 @@ function Exit-KillerScript {
 }
 
 function Exit-StareRun {
-    # One exit point. The final line goes to the success stream so an RMM captures it, and it
-    # always agrees with the exit code.
+    # One exit point.
     param([int]$Code, [string]$Text)
-    Write-Output "STARE RESULT: exit code $Code - $Text"
     Exit-KillerScript $Code
 }
 
@@ -625,7 +623,7 @@ function Invoke-StareMain {
 
     if (-not (Test-StareElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Exit-StareRun 2 "not elevated, nothing was changed"
+        Exit-StareRun 3 "not elevated, nothing was changed"
     }
 
     # Force UTF-8 output so box-drawing characters render correctly. Hosts with no console reject this.
@@ -633,7 +631,7 @@ function Invoke-StareMain {
     try { $global:OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
     if (-not (Test-StareConsole)) {
-        Exit-StareRun 2 "STARE is an interactive wizard and needs a console to answer its prompts, nothing was changed"
+        Exit-StareRun 1 "STARE is an interactive wizard and needs a console to answer its prompts, nothing was changed"
     }
 
     $script:TaskAction      = "List"
@@ -823,11 +821,11 @@ function Invoke-StareMain {
     Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $SubtitleFG -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr3 -ForegroundColor $SubtitleFG -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
 
-    # Effective outcome. The final line always agrees with the exit code.
+    # Effective outcome.
     $ok = $script:StareChanges
     $bad = $script:StareFailures
     if ($bad -gt 0 -and $ok -gt 0) {
-        Exit-StareRun 3 "partial: $ok change(s) applied, $bad failed"
+        Exit-StareRun 0 "partial: $ok change(s) applied, $bad failed"
     }
     if ($bad -gt 0) {
         Exit-StareRun 1 "$bad change(s) failed, nothing was applied"

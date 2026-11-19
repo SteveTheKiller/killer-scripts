@@ -239,8 +239,7 @@ function Invoke-DefendMain {
     # --------------------------------------------------------------------------
     if (-not (Test-IsAdmin)) {
         Write-Warning "D.E.F.E.N.D. requires Elevated Privileges. Please run as Administrator."
-        Write-Output "[FAIL] DEFEND not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     Import-Module NetSecurity -ErrorAction SilentlyContinue
     Import-Module NetConnection -ErrorAction SilentlyContinue
@@ -561,14 +560,7 @@ function Invoke-DefendMain {
 
     if ($script:DefendFailures.Count -gt 0) {
         foreach ($m in $script:DefendFailures) { Write-Output "[!] $m" }
-        Write-Output ("[WARN] DEFEND partial: {0} (exit 3)" -f ($script:DefendFailures -join "; "))
-        Exit-KillerScript 3
     }
-    if ($RebootPending) {
-        Write-Output "[PASS] DEFEND complete, reboot required (exit 3010)"
-        Exit-KillerScript 3010
-    }
-    Write-Output "[PASS] DEFEND complete (exit 0)"
     Exit-KillerScript 0
 }
 

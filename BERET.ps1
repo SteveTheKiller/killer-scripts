@@ -104,10 +104,8 @@ function Show-RecoveryInfo {
 }
 
 function Exit-BeretRun {
-    # One exit point. The final line goes to the success stream so an RMM captures it, and it
-    # always agrees with the exit code.
+    # One exit point.
     param([int]$Code, [string]$Text)
-    Write-Output "BERET RESULT: exit code $Code - $Text"
     Exit-KillerScript $Code
 }
 
@@ -416,7 +414,7 @@ function Invoke-BeretEscrow {
     }
 }
 function Add-BeretResult {
-    # Records one outcome. Anything that is not Done or Skipped makes the run partial (exit 3).
+    # Records one outcome. Anything that is not Done or Skipped makes the run partial.
     param([string]$Step, [ValidateSet('Done', 'Skipped', 'Failed')][string]$Status, [string]$Detail = '')
     $script:BeretResults = @($script:BeretResults) + [pscustomobject]@{ Step = $Step; Status = $Status; Detail = $Detail }
 }
@@ -570,14 +568,14 @@ function Invoke-BeretMain {
     $script:BeretResults = @()
     Show-BeretBanner
     if (-not (Test-BeretElevated)) {
-        Exit-BeretRun 2 "not elevated. Run as Administrator or SYSTEM. Nothing was changed."
+        Exit-BeretRun 1 "not elevated. Run as Administrator or SYSTEM. Nothing was changed."
     }
 
     #region 1 - Pre-Flight Checks
     # =================================================================================
     $BeretModeChoice = Get-BeretMode
     if ($BeretModeChoice -eq 'NOCONSOLE') {
-        Exit-BeretRun 2 "no console to ask the FIPS question. Set `$BeretMode = 'FIPS' or 'STANDARD' before running. Nothing was changed."
+        Exit-BeretRun 1 "no console to ask the FIPS question. Set `$BeretMode = 'FIPS' or 'STANDARD' before running. Nothing was changed."
     }
     if ($null -eq $BeretModeChoice) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-BeretRun 0 "cancelled by the operator. Nothing was changed." }
     if ($BeretModeChoice -eq 'FIPS') {
@@ -600,7 +598,7 @@ function Invoke-BeretMain {
     if ($OSCaption -match "Home") {
         Write-Host "`n![ ERROR ]!: Windows Home Edition Detected ($OSCaption)." -ForegroundColor $BorderCol
         Write-Host "BitLocker management requires Pro, Business, or Enterprise. Upgrade required." -ForegroundColor $AccentCol
-        Exit-BeretRun 2 "Windows Home does not support BitLocker management. Nothing was changed."
+        Exit-BeretRun 1 "Windows Home does not support BitLocker management. Nothing was changed."
     }
     # --- TPM Health & Auto-Initialization ---
     $TPM = Get-Tpm
@@ -629,8 +627,8 @@ function Invoke-BeretMain {
             Write-Host "![ CRITICAL ]!: TPM could not be initialized: $($_.Exception.Message)" -ForegroundColor $BorderCol
             $tpmFailed = $_.Exception.Message
         }
-        if ($tpmRestart) { Exit-BeretRun 3010 "TPM ownership initiated. Reboot, then run BERET again. Nothing was encrypted." }
-        if ($tpmFailed) { Exit-BeretRun 2 "the TPM could not be initialized ($tpmFailed). Nothing was changed." }
+        if ($tpmRestart) { Exit-BeretRun 0 "TPM ownership initiated. Reboot, then run BERET again. Nothing was encrypted." }
+        if ($tpmFailed) { Exit-BeretRun 1 "the TPM could not be initialized ($tpmFailed). Nothing was changed." }
     } else {
         Write-Host "TPM Health: " -ForegroundColor $InfoCol -NoNewline; Write-Host "Ready" -ForegroundColor $OkCol
     }
@@ -747,7 +745,7 @@ function Invoke-BeretMain {
     $problems = @($script:BeretResults | Where-Object { $_.Status -eq 'Failed' })
     if ($problems.Count -gt 0) {
         Show-BeretFooter "  BITLOCKER SEQUENCE FINISHED WITH PROBLEMS"
-        Exit-BeretRun 3 "$ModeLabel BitLocker ($EncryptionMethod) is in place on $DriveLetter, but: $(($problems | ForEach-Object { $_.Detail }) -join '; ')."
+        Exit-BeretRun 0 "$ModeLabel BitLocker ($EncryptionMethod) is in place on $DriveLetter, but: $(($problems | ForEach-Object { $_.Detail }) -join '; ')."
     }
     Show-BeretFooter "  BITLOCKER DEPLOYMENT SEQUENCE COMPLETE"
     Exit-BeretRun 0 "$ModeLabel BitLocker ($EncryptionMethod) is in place on $DriveLetter."

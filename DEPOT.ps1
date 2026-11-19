@@ -274,7 +274,7 @@ function Test-DepotElevated {
 function Invoke-DepotElevationRelaunch {
     if (-not $script:DepotScriptPath) {
         Write-Host "[!] Not running as Administrator and there is no script file to relaunch. Run from an elevated session." -ForegroundColor Red
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     Write-Host "[!] Not running as Administrator. Relaunching elevated..." -ForegroundColor Yellow
     $relaunched = $false
@@ -284,7 +284,7 @@ function Invoke-DepotElevationRelaunch {
     } catch {
         Write-Host "[!] Could not relaunch elevated: $($_.Exception.Message)" -ForegroundColor Red
     }
-    if (-not $relaunched) { Exit-KillerScript 2 }
+    if (-not $relaunched) { Exit-KillerScript 1 }
     Write-Host "[>] Elevated copy launched in a new window. This window can be closed." -ForegroundColor Yellow
     Exit-KillerScript 0
 }
@@ -1202,10 +1202,6 @@ function Complete-Depot {
     Write-Host "$_footer$_fpad$_ver" -ForegroundColor $script:MainCol -NoNewline; Write-Host " $($script:Art2)" -ForegroundColor $script:AccentCol -NoNewline; Write-Host $_sfx -ForegroundColor $script:LineCol
     Write-Host ("-" * $_ffillW) -ForegroundColor $script:LineCol -NoNewline; Write-Host " $($script:Art3)" -ForegroundColor $script:AccentCol -NoNewline; Write-Host $_sfx -ForegroundColor $script:LineCol
 
-    # One plain line for an RMM console or a log, always in agreement with the exit code.
-    $FinalLine = "DEPOT RESULT: exit code $Code - $RebootStatus"
-    if ($Failures.Count -gt 0) { $FinalLine += " (" + (($Failures | ForEach-Object { "$($_.Step): $($_.Detail)" }) -join '; ') + ")" }
-    Write-Output $FinalLine
     Write-DepotRunLog -Code $Code
 
     # Only a person at a console is asked anything. Unattended, there is no prompt and no reboot.
@@ -1219,7 +1215,9 @@ function Complete-Depot {
         Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5; Remove-Item -Path '$selfPath' -Force`"" -WindowStyle Hidden
     }
     if ($Choice -eq "RESTART") { Restart-Computer -Force }
-    Exit-KillerScript $Code
+    # Partial (3) and reboot-needed (3010) runs exit 0; only a run where nothing worked exits 1.
+    if ($Code -eq 1) { Exit-KillerScript 1 }
+    Exit-KillerScript 0
 }
 
 function Invoke-DepotMain {

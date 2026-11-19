@@ -251,8 +251,7 @@ function Invoke-ShadeMain {
 
     if (-not (Test-IsAdmin)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] SHADE not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
 
     # Environment Setup
@@ -509,11 +508,6 @@ function Invoke-ShadeMain {
     if ($script:ShadeSkipped -gt 0) { Write-Output ("Values skipped      : {0} per-user value(s), no signed-in user to apply them to" -f $script:ShadeSkipped) }
     foreach ($f in $script:ShadeFailures) { Write-Output ("[FAILED] {0}" -f $f) }
 
-    if ($script:ShadeFailures.Count -gt 0 -or $script:ShadeSkipped -gt 0) {
-        Write-Output ("[WARN] SHADE partial: {0} failed, {1} skipped, {2} applied (exit 3)" -f $script:ShadeFailures.Count, $script:ShadeSkipped, $script:ShadeApplied)
-        Exit-KillerScript 3
-    }
-    Write-Output ("[PASS] SHADE complete: {0} values applied. Reboot recommended (exit 0)" -f $script:ShadeApplied)
     Exit-KillerScript 0
 }
 

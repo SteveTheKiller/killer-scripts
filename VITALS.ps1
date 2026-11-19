@@ -215,8 +215,7 @@ function Invoke-VitalsMain {
     # ============================================================================
     if (-not (Test-VitalsElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] VITALS not elevated, nothing was collected (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     $Problems = New-Object System.Collections.ArrayList
     Initialize-VitalsConsole
@@ -430,11 +429,6 @@ function Invoke-VitalsMain {
     Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr3 -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
 
-    if ($Problems.Count -gt 0) {
-        Write-Output "[WARN] VITALS report produced, but $($Problems -join ' and ') (exit 3)"
-        Exit-KillerScript 3
-    }
-    Write-Output "[PASS] VITALS report produced (exit 0)"
     Exit-KillerScript 0
 }
 

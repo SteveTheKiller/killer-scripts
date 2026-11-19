@@ -15,7 +15,7 @@
     running to limit the cleanup to one profile. A single profile only loses
     its own processes, user-scope apps, files and registry; Office,
     machine-wide Teams, system folders and HKLM keys are All Users work.
-    An unrecognized $MaceScope or an invalid menu key stops with exit 2.
+    An unrecognized $MaceScope or an invalid menu key stops with exit 1.
 
     Microsoft app settings, caches and profile data are wiped for a clean
     slate. User documents are never deleted: Documents, Desktop and
@@ -294,7 +294,7 @@ function Invoke-MaceRun {
     # ========================================================================
     if (-not (Test-MaceElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        $script:MaceExit = 2
+        $script:MaceExit = 1
         $script:MaceNote = "not elevated; nothing was changed"
         return
     }
@@ -419,7 +419,7 @@ function Invoke-MaceRun {
             Write-Host "[!] No valid scope was chosen. Nothing was changed." -ForegroundColor Yellow
             $script:MaceNote = "no valid scope chosen; nothing was changed"
         }
-        $script:MaceExit = 2
+        $script:MaceExit = 1
         return
     }
 
@@ -753,7 +753,7 @@ function Invoke-MaceRun {
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host "█" -ForegroundColor $LineCol
 
     if ($Partial.Count -gt 0) {
-        $script:MaceExit = 3
+        $script:MaceExit = 0
         $script:MaceNote = ($Partial -join "; ")
     } else {
         $script:MaceExit = 0
@@ -771,14 +771,6 @@ function Invoke-MaceMain {
         $script:MaceExit = 1
         $script:MaceNote = "failed: $($_.Exception.Message)"
     }
-    $label = switch ($script:MaceExit) {
-        0       { "SUCCESS" }
-        2       { "NOT RUN" }
-        3       { "PARTIAL" }
-        default { "FAILED" }
-    }
-    # Goes to the output stream so an RMM console captures it
-    Write-Output ("MACE RESULT: {0} (exit {1}) - {2}" -f $label, $script:MaceExit, $script:MaceNote)
     Exit-KillerScript $script:MaceExit
 }
 

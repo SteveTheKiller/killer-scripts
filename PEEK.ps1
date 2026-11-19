@@ -30,7 +30,7 @@ param(
 # PEEK is read-only and never reboots, so it only ever returns 0, 1 or 2.
 $EXIT_SUCCESS = 0
 $EXIT_FAILURE = 1
-$EXIT_DENIED  = 2
+$EXIT_DENIED  = 3
 
 function Exit-KillerScript {
     param([int]$Code)
@@ -1206,7 +1206,6 @@ function Show-PEEKSnapshot {
 function Invoke-PEEKMain {
     if (-not (Test-PEEKElevated)) {
         Write-Warning "P.E.E.K. requires elevated privileges. Please run as Administrator or SYSTEM."
-        Write-Output "[FAIL] P.E.E.K. not run: elevation required (exit $EXIT_DENIED)."
         Exit-KillerScript $EXIT_DENIED
     }
 
@@ -1214,7 +1213,6 @@ function Invoke-PEEKMain {
     $OutputEncoding = [System.Text.Encoding]::UTF8
 
     $exitCode = $EXIT_SUCCESS
-    $finalLine = ""
     try {
         $script:BitLockerState = Get-PEEKBitLockerState
         $quit = $false
@@ -1238,19 +1236,14 @@ function Invoke-PEEKMain {
                 Start-Sleep -Milliseconds 100
             }
         }
-
-        if ($Once) { $finalLine = "[OK] P.E.E.K. snapshot complete. Read-only, nothing was changed (exit $EXIT_SUCCESS)." }
-        else       { $finalLine = "[OK] P.E.E.K. monitor stopped. Read-only, nothing was changed (exit $EXIT_SUCCESS)." }
     } catch {
         $exitCode = $EXIT_FAILURE
-        $finalLine = "[FAIL] P.E.E.K. stopped on an error: $($_.Exception.Message) (exit $EXIT_FAILURE)."
     }
 
     try {
         Write-Footer -Text "READ-ONLY LIVE SERVICING MONITOR"
     } catch {}
 
-    Write-Output $finalLine
     Exit-KillerScript $exitCode
 }
 #endregion

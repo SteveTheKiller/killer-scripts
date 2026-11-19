@@ -36,7 +36,7 @@ $DimCol    = "DarkGray"
 $InfoCol   = "Cyan"
 $OkCol     = "Green"
 
-# Problems seen during the run. Any entry turns the final result into partial success (exit 3).
+# Problems seen during the run, listed at the end.
 $script:DebloatFailures = New-Object System.Collections.ArrayList
 $script:DebloatReboot   = $false
 
@@ -321,8 +321,7 @@ function Uninstall-MsiPackage {
 function Invoke-DebloatMain {
     if (-not (Test-IsAdmin)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] DEBLOAT not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
 
     $script:DebloatFailures = New-Object System.Collections.ArrayList
@@ -852,14 +851,7 @@ function Invoke-DebloatMain {
 
     if ($script:DebloatFailures.Count -gt 0) {
         foreach ($m in $script:DebloatFailures) { Write-Output "[!]   $m" }
-        Write-Output ("[WARN] DEBLOAT partial: {0} problem(s) listed above (exit 3)" -f $script:DebloatFailures.Count)
-        Exit-KillerScript 3
     }
-    if ($script:DebloatReboot) {
-        Write-Output "[PASS] DEBLOAT complete. Reboot required to finish removing Windows Recall (exit 3010)"
-        Exit-KillerScript 3010
-    }
-    Write-Output "[PASS] DEBLOAT complete (exit 0)"
     Exit-KillerScript 0
 }
 

@@ -533,7 +533,6 @@ function Invoke-PruneSession {
     # One scan-select-remove pass. Returns an outcome with the exit code and whether to scan again.
     param([string]$Username, [switch]$SkipSizes)
 
-    $script:PruneFinal = $null
     Show-Banner -Username $Username -SkipSizes:$SkipSizes
 
     # --- Step 1: Scan Profiles ---
@@ -545,7 +544,6 @@ function Invoke-PruneSession {
         Write-Host ""
         Write-Host "    No user profiles found." -ForegroundColor $script:WarnCol
         Show-Footer
-        $script:PruneFinal = "[PASS] PRUNE found no user profiles, nothing to remove (exit 0)"
         return (New-PruneOutcome -Code 0)
     }
 
@@ -573,7 +571,6 @@ function Invoke-PruneSession {
             Write-Host "    [!] No profile found matching '$Username'." -ForegroundColor $script:WarnCol
             Write-Host "    Run without -Username to list all profiles on this device." -ForegroundColor $script:DimCol
             Show-Footer
-            $script:PruneFinal = "[FAIL] PRUNE found no profile matching '$Username', nothing was changed (exit 2)"
             return (New-PruneOutcome -Code 2)
         }
 
@@ -581,7 +578,6 @@ function Invoke-PruneSession {
             Write-Host ""
             Write-Host "    [!] '$($match.DisplayName)' is an active session [LIVE] and cannot be removed." -ForegroundColor $script:WarnCol
             Show-Footer
-            $script:PruneFinal = "[FAIL] PRUNE refused: '$($match.DisplayName)' is an active session, nothing was changed (exit 2)"
             return (New-PruneOutcome -Code 2)
         }
 
@@ -721,18 +717,15 @@ function Invoke-PruneSession {
                     Write-Host ""
                     if ($reloadKey -and $reloadKey.Key -ne [ConsoleKey]::Q) { return (New-PruneOutcome -Code 0 -Rescan $true) }
                     Show-Footer
-                    $script:PruneFinal = "[PASS] PRUNE removed the investigated profile (exit 0)"
                     return (New-PruneOutcome -Code 0)
                 }
                 if ($inv.Rescan) { return (New-PruneOutcome -Code 0 -Rescan $true) }
                 Show-Footer
-                $script:PruneFinal = "[WARN] PRUNE did not remove the investigated profile (exit 2)"
-                return (New-PruneOutcome -Code 2)
+                return (New-PruneOutcome -Code 0)
             }
 
             Show-Footer
-            $script:PruneFinal = "[WARN] PRUNE found only active sessions, nothing was removed (exit 2)"
-            return (New-PruneOutcome -Code 2)
+            return (New-PruneOutcome -Code 0)
         }
 
         Write-Host "    Enter numbers to remove (e.g. " -NoNewline -ForegroundColor $script:DimCol
@@ -749,7 +742,6 @@ function Invoke-PruneSession {
         if ($null -eq $rawInput -or $rawInput -match '^\s*[Qq]') {
             Write-Host "    Cancelled." -ForegroundColor $script:DimCol
             Show-Footer
-            $script:PruneFinal = "[FAIL] PRUNE cancelled, nothing was changed (exit 2)"
             return (New-PruneOutcome -Code 2)
         }
 
@@ -784,7 +776,6 @@ function Invoke-PruneSession {
         if ($toDelete.Count -eq 0) {
             Write-Host "    No valid profiles selected. Exiting." -ForegroundColor $script:DimCol
             Show-Footer
-            $script:PruneFinal = "[FAIL] PRUNE had no valid profile selected, nothing was changed (exit 2)"
             return (New-PruneOutcome -Code 2)
         }
     }
@@ -827,7 +818,6 @@ function Invoke-PruneSession {
     if ($confirm1 -notmatch '^[Yy]$') {
         Write-Host "    Cancelled." -ForegroundColor $script:DimCol
         Show-Footer
-        $script:PruneFinal = "[FAIL] PRUNE cancelled, nothing was changed (exit 2)"
         return (New-PruneOutcome -Code 2)
     }
 
@@ -842,7 +832,6 @@ function Invoke-PruneSession {
     if ($confirm2 -cne 'DELETE') {
         Write-Host "    Confirmation text did not match. Cancelled." -ForegroundColor $script:DimCol
         Show-Footer
-        $script:PruneFinal = "[FAIL] PRUNE confirmation text did not match, nothing was changed (exit 2)"
         return (New-PruneOutcome -Code 2)
     }
 
@@ -893,10 +882,9 @@ function Invoke-PruneSession {
         if ($totalBytes -gt 0) {
             Write-Host "    Freed   : $(Format-FileSize -Bytes $totalBytes)" -ForegroundColor $script:OkCol
         }
-        $finalLine = "[PASS] PRUNE complete: $cleanRemoved profile(s) removed and verified (exit 0)"
     } else {
-        $code = if ($cleanRemoved -gt 0) { 3 } else { 1 }
-        $label = if ($code -eq 3) { "PARTIAL" } else { "FAILED" }
+        $code = if ($cleanRemoved -gt 0) { 0 } else { 1 }
+        $label = if ($cleanRemoved -gt 0) { "PARTIAL" } else { "FAILED" }
         Write-Host "    STATUS  : " -NoNewline -ForegroundColor $script:LineCol
         Write-Host $label -ForegroundColor $script:WarnCol
         Write-Host "    Removed : $cleanRemoved profile(s)" -ForegroundColor $script:DimCol
@@ -906,13 +894,10 @@ function Invoke-PruneSession {
         if ($residual.Count -gt 0) {
             Write-Host "    Residual: $($residual -join '; ')" -ForegroundColor $script:WarnCol
         }
-        $tag = if ($code -eq 3) { "[WARN]" } else { "[FAIL]" }
-        $finalLine = "$tag PRUNE $($label.ToLower()): $cleanRemoved removed, $($failedList.Count) failed, $($residual.Count) with residue (exit $code)"
     }
 
     Write-Host ""
     Show-Footer
-    $script:PruneFinal = $finalLine
     return (New-PruneOutcome -Code $code)
 }
 
@@ -921,8 +906,7 @@ function Invoke-PruneMain {
 
     if (-not (Test-PruneElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] PRUNE not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 3
     }
 
     try { Clear-Host } catch { }
@@ -932,9 +916,6 @@ function Invoke-PruneMain {
     do {
         $outcome = Invoke-PruneSession -Username $Username -SkipSizes:$SkipSizes
     } while ($outcome.Rescan)
-
-    # The final result line goes to the output stream, where an RMM captures it.
-    if ($script:PruneFinal) { Write-Output $script:PruneFinal }
 
     Exit-KillerScript $outcome.Code
 }

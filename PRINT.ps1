@@ -662,8 +662,7 @@ function Invoke-PrintMain {
 
     if (-not (Test-PrintElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] PRINT not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 3
         return
     }
 
@@ -672,19 +671,16 @@ function Invoke-PrintMain {
         try {
             $list = @(Get-Printer -ErrorAction Stop | Sort-Object Name)
         } catch {
-            Write-Output "[FAIL] PRINT could not list printers: $($_.Exception.Message) (exit 1)"
             Exit-KillerScript 1
             return
         }
         $list | Format-Table Name, DriverName, PortName -AutoSize | Out-String -Width 200 | Write-Host
-        Write-Output "[PASS] PRINT listed $($list.Count) printer(s) (exit 0)"
         Exit-KillerScript 0
         return
     }
 
     if (-not (Test-PrintInteractive)) {
-        Write-Output "[FAIL] PRINT needs an interactive console. Re-run with -Silent to list printers. Nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
         return
     }
 
@@ -703,7 +699,6 @@ function Invoke-PrintMain {
         Write-Host "  Choice: " -NoNewline -ForegroundColor $LineCol
         $key = Read-PrintKey
         if ($null -eq $key) {
-            Write-Output "[FAIL] PRINT lost its console input and stopped (exit 1)"
             Exit-KillerScript 1
             return
         }
@@ -721,17 +716,10 @@ function Invoke-PrintMain {
 
     Write-PrintFooter
 
-    if ($script:PrintFailures -gt 0 -and $script:PrintSuccesses -gt 0) {
-        Write-Output "[WARN] PRINT partial: $($script:PrintSuccesses) change(s) succeeded, $($script:PrintFailures) failed (exit 3)"
-        Exit-KillerScript 3
-        return
-    }
-    if ($script:PrintFailures -gt 0) {
-        Write-Output "[FAIL] PRINT: $($script:PrintFailures) change(s) failed, none succeeded (exit 1)"
+    if ($script:PrintFailures -gt 0 -and $script:PrintSuccesses -eq 0) {
         Exit-KillerScript 1
         return
     }
-    Write-Output "[PASS] PRINT complete: $($script:PrintSuccesses) change(s) made (exit 0)"
     Exit-KillerScript 0
 }
 #endregion

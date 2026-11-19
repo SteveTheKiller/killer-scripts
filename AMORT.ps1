@@ -1226,8 +1226,7 @@ function Invoke-AmortMain {
     )
     if (-not (Test-AmortElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] AMORT not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     $script:AmortFailures = @()
     $script:AmortSkips    = @()
@@ -1243,30 +1242,10 @@ function Invoke-AmortMain {
         if ($fatal -like 'PRECONDITION:*') { $precondition = $true; $fatal = $fatal.Substring(13).Trim() }
     }
 
-    # The final result line goes to the output stream, where an RMM captures it.
     if ($fatal) {
-        if ($precondition) {
-            Write-Output "[FAIL] AMORT precondition failed: $fatal Nothing was changed (exit 2)"
-            Exit-KillerScript 2
-        }
-        Write-Output "[FAIL] AMORT stopped on an error: $fatal (exit 1)"
+        Write-Host $fatal -ForegroundColor Red
         Exit-KillerScript 1
     }
-    $problems = @($script:AmortFailures) + @($script:AmortSkips)
-    if ($problems.Count -gt 0) {
-        $tail = if ($script:AmortReboot) { "; a reboot is also needed" } else { "" }
-        Write-Output ("[WARN] AMORT partial: {0} (exit 3){1}" -f ($problems -join "; "), $tail)
-        Exit-KillerScript 3
-    }
-    if ($DryRun) {
-        Write-Output "[PASS] AMORT dry run complete, nothing was changed (exit 0)"
-        Exit-KillerScript 0
-    }
-    if ($script:AmortReboot) {
-        Write-Output "[PASS] AMORT complete, reboot required (exit 3010)"
-        Exit-KillerScript 3010
-    }
-    Write-Output "[PASS] AMORT complete (exit 0)"
     Exit-KillerScript 0
 }
 

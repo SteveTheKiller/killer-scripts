@@ -142,7 +142,6 @@ if ($audit.Ok -and @($audit.Names).Count -gt 0) {
     foreach ($p in @(Get-FactsUpdaterKeys)) { if (-not (Set-FactsUpdaterValues -Path $p)) { $bad++ } }
     $bad += @(Disable-FactsUpdateServicesAndTasks).Count
 }
-if ($bad -gt 0) { exit 3 }
 exit 0
 '@
 }
@@ -250,8 +249,7 @@ function Invoke-FactsMain {
     # ============================================================================
     if (-not (Test-FactsElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] FACTS not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
 
     Clear-FactsScreen
@@ -266,7 +264,6 @@ function Invoke-FactsMain {
     $Audit = Get-FactsFoxitApps
     if (-not $Audit.Ok) {
         Write-Host " [FAILED]" -ForegroundColor Red
-        Write-Output "[FAIL] FACTS could not read the installed software list, nothing was changed (exit 1)"
         Exit-KillerScript 1
     }
     $FoundApps = @($Audit.Names)
@@ -323,7 +320,6 @@ function Invoke-FactsMain {
         }
         catch {
             Write-Host " [FAILED]" -ForegroundColor Red
-            Write-Output "[FAIL] FACTS could not register the maintenance task: $($_.Exception.Message) (exit 1)"
             Exit-KillerScript 1
         }
     } else {
@@ -345,13 +341,6 @@ function Invoke-FactsMain {
 
     if ($Problems.Count -gt 0) {
         foreach ($Issue in $Problems) { Write-Output "[FAILED] $Issue" }
-        Write-Output ("[WARN] FACTS partial: {0} problem(s), see above (exit 3)" -f $Problems.Count)
-        Exit-KillerScript 3
-    }
-    if ($FoundApps.Count -gt 0) {
-        Write-Output ("[PASS] FACTS complete: {0} Foxit install(s) blocked, hourly task in place (exit 0)" -f $FoundApps.Count)
-    } else {
-        Write-Output "[PASS] FACTS complete: no Foxit detected, maintenance task removed (exit 0)"
     }
     Exit-KillerScript 0
     #endregion

@@ -165,8 +165,7 @@ function Invoke-TickMain {
     param([switch]$Silent, [string]$NtpServer)
     if (-not (Test-TickElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] TICK not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     Clear-TickScreen
     Write-Banner
@@ -252,12 +251,10 @@ function Invoke-TickMain {
     }
     if (-not $UseDomainSync) {
         if ([string]::IsNullOrWhiteSpace($NtpServer)) {
-            Write-Output "[FAIL] TICK needs an NTP server address, nothing was changed (exit 2)"
-            Exit-KillerScript 2
+            Exit-KillerScript 1
         }
         if ($NtpServer -notmatch '^[A-Za-z0-9]([A-Za-z0-9._:-]*[A-Za-z0-9])?$') {
-            Write-Output "[FAIL] TICK was given an NTP server that is not a plain host name or address: '$NtpServer'. Nothing was changed (exit 2)"
-            Exit-KillerScript 2
+            Exit-KillerScript 1
         }
     }
     Clear-TickScreen
@@ -281,7 +278,7 @@ function Invoke-TickMain {
 
     #region 3) Sync Steps
     # ============================================================================
-    # Configuration problems (exit 1) are kept apart from a sync that is not confirmed (exit 3).
+    # Configuration problems (exit 1) are kept apart from a sync that is not confirmed (exit 0).
     $ConfigProblems = New-Object System.Collections.ArrayList
     $StepFailed = $false
     Write-Step "1/4" "Registering and stopping w32time..."
@@ -406,14 +403,8 @@ function Invoke-TickMain {
     Write-Host "█" -ForegroundColor $BorderCol
     #endregion
     if ($ExitCode -eq 1) {
-        Write-Output "[FAIL] TICK $Problem (exit 1)"
         Exit-KillerScript 1
     }
-    if ($ExitCode -eq 3) {
-        Write-Output "[WARN] TICK partial: $Problem (exit 3)"
-        Exit-KillerScript 3
-    }
-    Write-Output "[PASS] TICK synced to $source, last successful sync $lastSync (exit 0)"
     Exit-KillerScript 0
 }
 

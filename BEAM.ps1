@@ -49,10 +49,8 @@ function Exit-KillerScript {
 }
 
 function Exit-BeamRun {
-    # One exit point. The final line goes to the success stream so an RMM captures it, and it
-    # always agrees with the exit code.
+    # One exit point.
     param([int]$Code, [string]$Text)
-    Write-Output "BEAM RESULT: exit code $Code - $Text"
     Exit-KillerScript $Code
 }
 
@@ -292,7 +290,7 @@ function Read-TargetsField {
 
 function Read-BeamValue {
     # Read-Host that fails closed. With no console to read from it throws BEAM_NOCONSOLE, which
-    # the entry point turns into exit 2, instead of an unhandled host error.
+    # the entry point turns into exit 1, instead of an unhandled host error.
     param([string]$Prompt)
     try {
         if ($Prompt) { $v = Read-Host $Prompt } else { $v = Read-Host }
@@ -388,7 +386,7 @@ function Read-BeamInputs {
         if ($srcInput -eq "") {
             if (-not $script:IsInteractive) {
                 Write-StepUpdate "The file picker needs an interactive console. Provide a URL instead: aborting" FAIL
-                return (New-BeamAbort 2 "the file picker needs an interactive console. Provide a URL instead. Nothing was changed.")
+                return (New-BeamAbort 1 "the file picker needs an interactive console. Provide a URL instead. Nothing was changed.")
             }
             $picked = Select-FileBrowser -Extensions @('.exe', '.msi') -Label "Installer browser (.exe/.msi)"
             if (-not $picked) {
@@ -447,7 +445,7 @@ function Read-BeamInputs {
     }
     if ($targets.Count -eq 0) {
         Write-StepUpdate "No hostname targets to deploy: aborting" FAIL
-        return (New-BeamAbort 2 "no hostname targets to deploy. Nothing was changed.")
+        return (New-BeamAbort 1 "no hostname targets to deploy. Nothing was changed.")
     }
     Write-Host ""
 
@@ -455,12 +453,12 @@ function Read-BeamInputs {
     $adminUpn = Read-BeamValue "  Global admin email for Intune (required)"
     if (-not $adminUpn) {
         Write-StepUpdate "A Global Admin / Intune Admin sign-in is required for this tool: aborting" FAIL
-        return (New-BeamAbort 2 "an admin sign-in email is required. Nothing was changed.")
+        return (New-BeamAbort 1 "an admin sign-in email is required. Nothing was changed.")
     }
     $adminDomain = ($adminUpn -split "@")[-1]
     if (-not $adminDomain -or $adminDomain -eq $adminUpn) {
         Write-StepUpdate "Could not parse a domain from '$adminUpn': aborting" FAIL
-        return (New-BeamAbort 2 "could not parse a domain from the admin email. Nothing was changed.")
+        return (New-BeamAbort 1 "could not parse a domain from the admin email. Nothing was changed.")
     }
     Write-StepUpdate "Resolving tenant for domain: $adminDomain" INFO
     $tenantId = $null
@@ -1375,7 +1373,7 @@ function Invoke-BeamMain {
     try { $in = Read-BeamInputs } catch { $inErr = $_ }
     if ($inErr) {
         if ($inErr.Exception.Message -eq 'BEAM_NOCONSOLE') {
-            Exit-BeamRun 2 "there is no console to read the deployment inputs from. Nothing was changed."
+            Exit-BeamRun 1 "there is no console to read the deployment inputs from. Nothing was changed."
         }
         Exit-BeamRun 1 "reading the inputs failed: $($inErr.Exception.Message)"
     }
@@ -1432,7 +1430,7 @@ function Invoke-BeamMain {
     }
     if ($queued -gt 0) {
         Show-BeamFooter "  DEPLOYMENT FINISHED WITH PROBLEMS"
-        Exit-BeamRun 3 "'$($in.AppName)' is queued for $queued of $($targets.Count) target(s); $failed failed."
+        Exit-BeamRun 0 "'$($in.AppName)' is queued for $queued of $($targets.Count) target(s); $failed failed."
     }
     Show-BeamFooter "  DEPLOYMENT FAILED"
     Exit-BeamRun 1 "'$($in.AppName)' was not deployed to any of the $($targets.Count) target(s)."

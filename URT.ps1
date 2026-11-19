@@ -186,22 +186,18 @@ function Invoke-UrtMain {
     # ============================================================================
     if (-not (Test-UrtElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
-        Write-Output "[FAIL] URT not elevated, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     if (-not (Test-UrtInteractive)) {
-        Write-Output "[FAIL] URT asks for the new name at a console and none is available, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     $CS = Get-UrtComputerSystem
     $RoleKind = if ($null -ne $CS) { Get-UrtRoleKind $CS.DomainRole } else { 'Unknown' }
     if ($RoleKind -eq 'DomainController') {
-        Write-Output "[FAIL] URT will not rename a domain controller (DomainRole $($CS.DomainRole)). Use netdom computername for a DC. Nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     if ($RoleKind -eq 'Unknown') {
-        Write-Output "[FAIL] URT could not tell whether this computer is a workstation, member server or domain controller. Nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     $IsDomain = ($RoleKind -eq 'Domain')
     $DomainDisplay = if ($IsDomain) { $CS.Domain } else { "No" }
@@ -223,23 +219,19 @@ function Invoke-UrtMain {
     Write-Host "[1/3] Awaiting Input..." -ForegroundColor Green
     $in = Read-UrtInput "      Enter New Computer Name"
     if ($in.Status -eq 'none') {
-        Write-Output "[FAIL] URT could not read the new name, nothing was changed (exit 2)"
-        Exit-KillerScript 2
+        Exit-KillerScript 1
     }
     if ($in.Status -eq 'cancel') {
         Write-Host "`n[!] Cancelled by user." -ForegroundColor Yellow
-        Write-Output "[PASS] URT cancelled by the user, nothing was changed (exit 0)"
         Exit-KillerScript 0
     }
     $NewName = "$($in.Value)".Trim()
     if ([string]::IsNullOrWhiteSpace($NewName)) {
         Write-Warning "No name entered. Aborting."
-        Write-Output "[PASS] URT no name entered, nothing was changed (exit 0)"
         Exit-KillerScript 0
     }
     if ($NewName -eq $env:COMPUTERNAME) {
         Write-Host "      New name matches current name. Skipping..." -ForegroundColor Gray
-        Write-Output "[PASS] URT new name matches the current name, nothing was changed (exit 0)"
         Exit-KillerScript 0
     }
     #endregion
@@ -261,20 +253,16 @@ function Invoke-UrtMain {
             $u = Read-UrtInput "      Username (DOMAIN\user)"
             if ($u.Status -ne 'ok' -or [string]::IsNullOrWhiteSpace("$($u.Value)")) {
                 if ($u.Status -eq 'cancel') {
-                    Write-Output "[PASS] URT cancelled by the user, nothing was changed (exit 0)"
                     Exit-KillerScript 0
                 }
-                Write-Output "[FAIL] URT needs a domain user name to rename a domain computer, nothing was changed (exit 2)"
-                Exit-KillerScript 2
+                Exit-KillerScript 1
             }
             $p = Read-UrtInput "      Password" -Secure
             if ($p.Status -eq 'cancel') {
-                Write-Output "[PASS] URT cancelled by the user, nothing was changed (exit 0)"
                 Exit-KillerScript 0
             }
             if ($p.Status -ne 'ok' -or $null -eq $p.Value) {
-                Write-Output "[FAIL] URT could not read the password, nothing was changed (exit 2)"
-                Exit-KillerScript 2
+                Exit-KillerScript 1
             }
             $Creds = New-Object System.Management.Automation.PSCredential("$($u.Value)".Trim(), $p.Value)
             Write-Host "      [+] Renaming in AD and locally..." -ForegroundColor Gray
@@ -288,7 +276,6 @@ function Invoke-UrtMain {
     catch {
         if ($_.Exception.Message -match 'KILLERSCRIPT_EXIT') { throw }
         Write-Host "`n[ERROR] Rename failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Output "[FAIL] URT rename to '$NewName' failed: $($_.Exception.Message) (exit 1)"
         Exit-KillerScript 1
     }
     Write-HLine -Style dashed
@@ -308,12 +295,10 @@ function Invoke-UrtMain {
     $Choice = Read-UrtInput "Press ENTER to exit, or type 'RESTART' to reboot now"
     if ($Choice.Status -eq 'ok' -and "$($Choice.Value)".Trim() -eq "RESTART") {
         Write-Host "System rebooting..." -ForegroundColor Red
-        Write-Output "[PASS] URT renamed to '$NewName', restarting now (exit 0)"
         Restart-Computer -Force
         Exit-KillerScript 0
     }
-    Write-Output "[PASS] URT renamed to '$NewName', a restart is required for the new name to take effect (exit 3010)"
-    Exit-KillerScript 3010
+    Exit-KillerScript 0
     #endregion
 }
 

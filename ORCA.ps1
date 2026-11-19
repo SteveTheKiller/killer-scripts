@@ -27,9 +27,9 @@ param(
     [switch]$FullSignOut
 )
 $EXIT_SUCCESS = 0   # Completed successfully
-$EXIT_ERROR   = 1   # Failure
-$EXIT_CANCEL  = 2   # Not elevated, precondition failed, or the operator cancelled
-$EXIT_PARTIAL = 3   # Partial success: something was skipped or failed
+$EXIT_ERROR   = 1   # Failure, or a precondition failed
+$EXIT_CANCEL  = 2   # User cancelled
+$EXIT_PARTIAL = 0   # Partial success: something was skipped or failed
 
 function Exit-KillerScript {
     param([int]$Code)
@@ -38,10 +38,8 @@ function Exit-KillerScript {
 }
 
 function Exit-OrcaRun {
-    # One exit point. The final line goes to the success stream so an RMM captures it, and it
-    # always agrees with the exit code.
+    # One exit point.
     param([int]$Code, [string]$Text)
-    Write-Output "ORCA RESULT: exit code $Code - $Text"
     Exit-KillerScript $Code
 }
 
@@ -493,7 +491,7 @@ function Invoke-OrcaMain {
         # === USER SELECTION ===
         $UserProfiles = @(Get-OrcaProfile)
         if ($UserProfiles.Count -eq 0) {
-            Exit-OrcaRun $EXIT_CANCEL "no user profiles were found in the profile list, nothing was changed."
+            Exit-OrcaRun $EXIT_ERROR "no user profiles were found in the profile list, nothing was changed."
         }
 
         if ($script:IsAdmin) {
@@ -537,7 +535,7 @@ function Invoke-OrcaMain {
                 } catch {
                     if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
                     $raw = Read-OrcaLine
-                    if ($null -eq $raw) { Exit-OrcaRun $EXIT_CANCEL "no console to ask which profile to reset, nothing was changed. Use -Silent for an unattended run." }
+                    if ($null -eq $raw) { Exit-OrcaRun $EXIT_ERROR "no console to ask which profile to reset, nothing was changed. Use -Silent for an unattended run." }
                     $userChoice = if ([string]::IsNullOrWhiteSpace($raw)) { $_defaultValue } else { $raw }
                 }
                 $script:AllUsers = ($userChoice -eq 'A' -or $userChoice -eq 'a')
@@ -559,13 +557,13 @@ function Invoke-OrcaMain {
             $_activeUser = Get-ActiveUser
             if ($null -eq $_activeUser) {
                 Write-Error "Could not determine the current user. Please run as Administrator to target other profiles."
-                Exit-OrcaRun $EXIT_CANCEL "could not determine the current user, nothing was changed."
+                Exit-OrcaRun $EXIT_ERROR "could not determine the current user, nothing was changed."
             }
             # A standard user can only act on their own profile, so bind it by SID.
             $mySid = Get-OrcaCurrentSid
             $TargetUsers = @($UserProfiles | Where-Object { $_.Sid -eq $mySid })
             if ($TargetUsers.Count -eq 0) {
-                Exit-OrcaRun $EXIT_CANCEL "no profile was found for the current user, nothing was changed."
+                Exit-OrcaRun $EXIT_ERROR "no profile was found for the current user, nothing was changed."
             }
         }
 
@@ -588,7 +586,7 @@ function Invoke-OrcaMain {
                 } catch {
                     if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
                     $raw = Read-OrcaLine
-                    if ($null -eq $raw) { Exit-OrcaRun $EXIT_CANCEL "no console to ask which Outlook to reset, nothing was changed. Use -Silent for an unattended run." }
+                    if ($null -eq $raw) { Exit-OrcaRun $EXIT_ERROR "no console to ask which Outlook to reset, nothing was changed. Use -Silent for an unattended run." }
                     if ([string]::IsNullOrWhiteSpace($raw)) { $modeChoice = "3" }
                     elseif ($raw -eq 'q' -or $raw -eq 'Q') { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "cancelled by the operator, nothing was changed." }
                     else { $modeChoice = $raw }

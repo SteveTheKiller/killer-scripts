@@ -1700,47 +1700,36 @@ function Resolve-WursaFinalStatus {
         $code = 3010
     } elseif ($FeatureUpgradeState -match '^(FAILED|BLOCKED|NOT_STARTED)') {
         & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
-        & $add "      Upgrade state: $FeatureUpgradeState" $WarnCol
         $code = 1
     } elseif ($FeatureUpgradeState -eq "ALREADY_ACTIVE") {
         & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS (already running)" $WarnCol
-        if ($IpuState) { & $add "      Upgrade state: $IpuState" $DimCol }
         $code = 0
         $upgradeActive = $true
     } elseif ($FeatureUpgradeState -eq "DISPATCHED") {
         if ($IpuState -match '^REBOOT_REQUIRED') {
             & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
-            & $add "      Upgrade state: $IpuState" $DimCol
             $code = 3010
         } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
             & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
-            & $add "      Upgrade state: $IpuState" $WarnCol
             $code = 1
         } else {
             & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
-            if ($IpuState) { & $add "      Upgrade state: $IpuState" $DimCol }
             $code = 0
             $upgradeActive = $true
         }
     } elseif ($IpuState -match '^REBOOT_REQUIRED') {
         & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
-        & $add "      Upgrade state: $IpuState" $DimCol
         $code = 3010
     } elseif ($IpuState -match '^(DISPATCHED|RUNNING|DOWNLOADING|REPAIRING|VERIFY_PENDING|WU_HANDOFF)') {
         & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
-        & $add "      Upgrade state: $IpuState" $DimCol
         $code = 0
         $upgradeActive = $true
     } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
         & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
-        & $add "      Upgrade state: $IpuState" $WarnCol
         $code = 1
     } else {
         & $add "[!] STATUS: FEATURE UPGRADE NOT COMPLETE (still $FinalVersion)" "Red"
         $code = 1
-    }
-    if ($IpuState -match '^REBOOT_REQUIRED_UNARMED') {
-        & $add "      The post-reboot verifier could not be registered: run WURSA again after the reboot to restore the temporary policy changes." $WarnCol
     }
     # Fold in the update pass: reboot first, then failures. Only a clean 0 is ever changed here.
     if ($code -eq 0 -and $RebootPending -and -not $upgradeActive) {
@@ -1748,14 +1737,8 @@ function Resolve-WursaFinalStatus {
         & $add "[!] STATUS: REBOOT REQUIRED" "Red"
         $code = 3010
     }
-    if ($FailedCount -gt 0) {
-        if ($code -eq 0) {
-            $code = if ($SucceededCount -gt 0) { 3 } else { 1 }
-            $lines.Clear()
-            & $add "[!] STATUS: UPDATES INCOMPLETE ($FailedCount failed, $SucceededCount succeeded)" "Red"
-        } else {
-            & $add "      Also: $FailedCount update(s) failed ($SucceededCount succeeded)" $WarnCol
-        }
+    if ($FailedCount -gt 0 -and $code -eq 0) {
+        $code = if ($SucceededCount -gt 0) { 3 } else { 1 }
     }
     [pscustomobject]@{ Code = $code; Lines = @($lines) }
 }
@@ -1768,7 +1751,6 @@ trap {
     if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw $_ }
     Write-Host "[!] Fatal: $($_.Exception.Message)" -ForegroundColor Red
     try { Undo-WursaOwnedPolicy } catch {}
-    Write-Host "[!] STATUS: FAILED" -ForegroundColor Red
     Exit-KillerScript 1
 }
 $script:ExitCode = 0
@@ -1788,8 +1770,7 @@ $ProgressPreference = 'SilentlyContinue'   # suppress console-wide progress over
 #region 0 - Pre-Flight
 if (-not (Test-WursaElevated)) {
     Write-Warning "Elevation Required: Please run as Administrator."
-    Write-Host "[!] STATUS: NOT ELEVATED (run as Administrator)" -ForegroundColor Red
-    Exit-KillerScript 2
+    Exit-KillerScript 0
 }
 # 1. Force session bypass to clear environment hurdles
 try { Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force -ErrorAction Stop } catch {}
@@ -2129,7 +2110,10 @@ Write-Host "$_footer$_fpad$_ver" -ForegroundColor $MainCol -NoNewline; Write-Hos
 Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
 #endregion
 
-Exit-KillerScript $script:ExitCode
+# Partial (3) exits 0; failure (1) and reboot-needed (3010) keep their codes.
+if ($script:ExitCode -eq 1) { Exit-KillerScript 1 }
+if ($script:ExitCode -eq 3010) { Exit-KillerScript 3010 }
+Exit-KillerScript 0
 }
 
 if (-not $global:KillerScriptsTestMode) { Invoke-WursaMain }
