@@ -740,8 +740,11 @@ function Wait-DepotOneDrive {
     # per-machine installer a short window to finish writing it.
     $deadline = (Get-Date).AddSeconds($script:OneDriveVerifySeconds)
     while ($true) {
-        if ((Test-Path "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe") -or
-            (Test-Path "$env:ProgramFiles (x86)\Microsoft OneDrive\OneDrive.exe")) { return $true }
+        # A 32-bit host sees ProgramFiles as the (x86) folder, so ask for the 64-bit one by name too.
+        $roots = @($env:ProgramFiles, $env:ProgramW6432, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique
+        foreach ($root in $roots) {
+            if (Test-Path "$root\Microsoft OneDrive\OneDrive.exe") { return $true }
+        }
         if ((Get-Date) -ge $deadline) { return $false }
         Start-Sleep -Seconds 2
     }

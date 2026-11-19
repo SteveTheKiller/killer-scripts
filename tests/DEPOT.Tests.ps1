@@ -26,6 +26,7 @@ Describe 'Entry-point convention' {
 
 Describe 'Exit codes at the entry point' {
     BeforeEach {
+        Mock Write-DepotRunLog { }
         Mock Start-Sleep { }
         Mock Read-Host { '' }
         Mock Clear-Host { }
@@ -780,6 +781,16 @@ Describe 'Finding 71: rename and OneDrive report what really happened' {
             Install-DepotOneDrive
             @($script:DepotResults | Where-Object { $_.Status -eq 'Done' }).Count | Should -Be 1
             @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -Be 0
+        }
+
+        It 'finds the per-machine OneDrive.exe through ProgramW6432 when a 32-bit host reports Program Files (x86)' {
+            $saved = $env:ProgramW6432
+            try {
+                $env:ProgramW6432 = 'C:\PW6432'
+                Mock Start-Installer { $script:Known = @('C:\PW6432\Microsoft OneDrive\OneDrive.exe'); 0 }
+                Install-DepotOneDrive
+            } finally { $env:ProgramW6432 = $saved }
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Done' }).Count | Should -Be 1
         }
 
         It 'a failing installer exit code is Failed whether or not a file exists' {
