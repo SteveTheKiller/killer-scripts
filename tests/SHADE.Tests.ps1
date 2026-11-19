@@ -76,4 +76,20 @@ Describe 'SHADE' {
             Should -Invoke Set-ItemProperty -Times 0 -Exactly -ParameterFilter { $Path -eq $AppPrivacy -and $Name -like 'LetAppsAccess*' -and $Value -ne 0 }
         }
     }
+
+    Context 'finding 61: dmwappushservice' {
+        It 'does not touch dmwappushservice at all' {
+            Get-Exit | Should -Be 0
+            Should -Invoke Get-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'dmwappushservice' }
+            Should -Invoke Stop-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'dmwappushservice' }
+            Should -Invoke Set-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'dmwappushservice' }
+            Should -Invoke Invoke-ScDisable -Times 0 -Exactly -ParameterFilter { $Name -eq 'dmwappushservice' }
+        }
+        It 'still disables the other telemetry services' {
+            Get-Exit | Out-Null
+            foreach ($n in 'DiagTrack', 'WerSvc', 'PcaSvc', 'lfsvc') {
+                Should -Invoke Set-Service -Times 1 -Exactly -ParameterFilter { $Name -eq $n -and $StartupType -eq 'Disabled' }
+            }
+        }
+    }
 }

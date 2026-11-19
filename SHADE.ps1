@@ -244,7 +244,8 @@ function Invoke-ShadeMain {
         @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat";                     Name="DisableInventory";                Value=1},
         @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat";                     Name="DisableUAR";                      Value=1}
     )
-    foreach ($svc in @("DiagTrack", "dmwappushservice", "WerSvc", "PcaSvc")) {
+    # dmwappushservice is left alone on purpose: MDM push and device sync depend on it.
+    foreach ($svc in @("DiagTrack", "WerSvc", "PcaSvc")) {
         Write-Host "        [!] Stopping $svc..." -ForegroundColor Cyan
         Disable-Svc $svc
     }
