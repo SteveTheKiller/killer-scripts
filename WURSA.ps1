@@ -460,7 +460,10 @@ $ThirdParty = @(
     @{ Name = "KillerNotes";     ChocoID = "killernotes";     Process = "KillerNotes" },
     @{ Name = "KillerScan";      ChocoID = "killerscan";      Process = "KillerScan" },
     @{ Name = "KillerShell";     ChocoID = "killershell";     Process = "KillerShell" },
-    @{ Name = "Killendar";       ChocoID = "killendar";       Process = "Killendar" }
+    @{ Name = "Killendar";       ChocoID = "killendar";       Process = "Killendar" },
+    @{ Name = "KillerMCP";       ChocoID = "killermcp";       Process = @("KillerMCP", "KillerMCP.Configure", "KillerMCP.Notify") },
+    @{ Name = "KillerShot";      ChocoID = "killershot";      Process = @("KillerShot", "KillerShot.PrintScreen") },
+    @{ Name = "KillerBench";     ChocoID = "killerbench";     Process = "KillerBench" }
 )
 
 # Gate the section behind a Y/N prompt. -No3rdParty skips outright,
