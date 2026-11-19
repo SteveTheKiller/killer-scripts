@@ -77,6 +77,7 @@ $script:PreviousCpu        = @{}
 $script:PreviousSampleTime = $null
 $script:CompatCacheKey       = $null
 $script:CompatCacheValue     = $null
+$script:CompatRetryAfter     = [datetime]::MinValue
 $script:BitLockerState       = "Unknown"
 $script:SetupCommandLinePath = ""
 $script:SetupCommandLine     = ""
@@ -683,15 +684,21 @@ function Get-PEEKCompatState {
             BlockCount    = 0
             Summary       = "No compatibility report"
             HasReport     = $false
+            ParseFailed   = $false
         }
     }
 
     $cacheKey = "$($file.FullName)|$($file.LastWriteTime.Ticks)|$($file.Length)"
     if ($script:CompatCacheKey -eq $cacheKey -and $script:CompatCacheValue) {
-        return $script:CompatCacheValue
+        # A failed read is only remembered for a short window. The producer may still be writing,
+        # or the read may have hit a sharing violation, so the same file is tried again.
+        if (-not $script:CompatCacheValue.ParseFailed -or (Get-Date) -lt $script:CompatRetryAfter) {
+            return $script:CompatCacheValue
+        }
     }
 
     $blocks = @()
+    $parseFailed = $false
     try {
         [xml]$xml = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
 
@@ -714,11 +721,15 @@ function Get-PEEKCompatState {
             $blocks += "DRIVER: $inf"
         }
     } catch {
-        $blocks += "Compatibility report could not be parsed"
+        # Unreadable is not the same as blocked. Report it separately and never as a block.
+        $parseFailed = $true
+        $blocks = @()
     }
 
     $blocks = @($blocks | Select-Object -Unique)
-    $summary = if ($blocks.Count -gt 0) { $blocks -join '; ' } else { "None detected" }
+    $summary = if ($parseFailed) { "Compatibility report could not be parsed (retrying)" }
+               elseif ($blocks.Count -gt 0) { $blocks -join '; ' }
+               else { "None detected" }
 
     $value = [PSCustomObject]@{
         File          = $file
@@ -726,10 +737,12 @@ function Get-PEEKCompatState {
         BlockCount    = $blocks.Count
         Summary       = $summary
         HasReport     = $true
+        ParseFailed   = $parseFailed
     }
 
     $script:CompatCacheKey   = $cacheKey
     $script:CompatCacheValue = $value
+    if ($parseFailed) { $script:CompatRetryAfter = (Get-Date).AddSeconds(10) }
     return $value
 }
 
@@ -1130,7 +1143,7 @@ function Show-PEEKSnapshot {
     if ($compat.HasReport) {
         $compatAge = Format-Age -Time $compat.LastWriteTime
         $compatValue = "$($compat.Summary)  [report age $compatAge]"
-        $compatColor = if ($compat.BlockCount -gt 0) { $script:FailFG } else { $script:DoneFG }
+        $compatColor = if ($compat.ParseFailed) { $script:WarnFG } elseif ($compat.BlockCount -gt 0) { $script:FailFG } else { $script:DoneFG }
         Write-Detail -Label "Compatibility" -Value $compatValue -ValueColor $compatColor
     } else {
         Write-Detail -Label "Compatibility" -Value $compat.Summary -ValueColor $script:MutedFG

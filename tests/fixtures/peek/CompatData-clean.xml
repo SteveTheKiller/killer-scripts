@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CompatReport Version="1" Synthetic="true">
+  <Programs>
+    <Program Name="Fabrikam Notes">
+      <Item BlockingType="None" Title="No action needed" />
+    </Program>
+  </Programs>
+  <Drivers>
+    <DriverPackage Inf="oem44.inf" BlockMigration="False" />
+  </Drivers>
+</CompatReport>

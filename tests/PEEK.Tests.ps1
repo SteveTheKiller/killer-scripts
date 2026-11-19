@@ -156,3 +156,89 @@ Describe 'PEEK finding 20: servicing state needs corroborating identity' {
         $rows[0].Path | Should -Be 'C:\$WINDOWS.~BT\Sources\setup.exe'
     }
 }
+
+Describe 'PEEK finding 34: an unreadable compatibility report is not a compatibility block' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
+        Initialize-KillerSafetyNet
+        Enable-KillerTestMode
+        . (Get-KillerScriptPath 'PEEK')
+        $script:FixtureDir = Join-Path $PSScriptRoot 'fixtures\peek'
+    }
+    AfterAll { Disable-KillerTestMode }
+
+    BeforeEach {
+        $script:CompatCacheKey = $null
+        $script:CompatCacheValue = $null
+        $script:CompatRetryAfter = [datetime]::MinValue
+        $script:Report = Join-Path $TestDrive 'CompatData_1.xml'
+        [IO.File]::Copy((Join-Path $FixtureDir 'CompatData-truncated.xml'), $Report, $true)
+        (Get-Item -LiteralPath $Report).LastWriteTime = Get-Date
+        Mock Get-ChildItem { Get-Item -LiteralPath $script:Report } -ParameterFilter { $Path -like '*CompatData*.xml' }
+    }
+
+    It 'reports a parse failure on its own, with no block count' {
+        $c = Get-PEEKCompatState
+        $c.HasReport | Should -BeTrue
+        $c.ParseFailed | Should -BeTrue
+        $c.BlockCount | Should -Be 0
+        $c.Summary | Should -Match 'could not be parsed'
+    }
+
+    It 'does not let a fresh unreadable report produce COMPATIBILITY BLOCK DETECTED' {
+        $c = Get-PEEKCompatState
+        $ctx = [pscustomobject]@{ Current = $null; ActiveStart = $null; IsFeature = $false; FeatureTarget = '' }
+        $os = [pscustomobject]@{ DisplayVersion = '24H2'; Build = '26100'; UBR = '1'; Caption = 'Windows 11 Pro'; LastBoot = (Get-Date).AddDays(-1); Uptime = [timespan]::FromDays(1) }
+        $setup = [pscustomobject]@{ ActFile = $null; ErrFile = $null; Active = $false; ActAgeSeconds = $null; Mode = 'None'; CommandLine = ''; FeatureCode = ''; FeatureText = '' }
+        $reboot = [pscustomobject]@{ WindowsUpdate = $false; CBS = $false; MoSetup = $false; FileRename = $false; UpdateExe = $false; PendingXml = $false; Any = $false; Sources = @() }
+        $r = Get-PEEKSystemState -OS $os -UpdateContext $ctx -Processes @() -Setup $setup -Compat $c -Reboot $reboot
+        $r.State | Should -Not -Match 'COMPATIBILITY BLOCK'
+        $r.CompatibilityFresh | Should -BeFalse
+    }
+
+    It 'picks up the finished report once the producer has written it' {
+        $null = Get-PEEKCompatState
+        [IO.File]::Copy((Join-Path $FixtureDir 'CompatData-block.xml'), $Report, $true)
+        (Get-Item -LiteralPath $Report).LastWriteTime = (Get-Date).AddSeconds(5)
+        $script:CompatRetryAfter = [datetime]::MinValue
+        $c = Get-PEEKCompatState
+        $c.ParseFailed | Should -BeFalse
+        $c.BlockCount | Should -Be 2
+        $c.Summary | Should -Match 'HARD: Contoso Legacy VPN'
+        $c.Summary | Should -Match 'DRIVER: oem42.inf'
+    }
+
+    It 'retries an unchanged file after the retry window, because the read itself may have failed' {
+        $null = Get-PEEKCompatState
+        [IO.File]::Copy((Join-Path $FixtureDir 'CompatData-block.xml'), $Report, $true)
+        $stamp = (Get-Item -LiteralPath $Report).LastWriteTime
+        # Same name, time and length as the cached failure, as when a read hit a sharing violation.
+        $script:CompatCacheKey = "$Report|$($stamp.Ticks)|$((Get-Item -LiteralPath $Report).Length)"
+        $script:CompatCacheValue = [pscustomobject]@{ File = (Get-Item -LiteralPath $Report); LastWriteTime = $stamp; BlockCount = 0; Summary = 'Compatibility report could not be parsed (retrying)'; HasReport = $true; ParseFailed = $true }
+        $script:CompatRetryAfter = [datetime]::MinValue
+        (Get-PEEKCompatState).BlockCount | Should -Be 2
+    }
+
+    It 'does not reread an unchanged unreadable report inside the retry window' {
+        $null = Get-PEEKCompatState
+        Mock Get-Content { throw 'should not be read again' }
+        { Get-PEEKCompatState } | Should -Not -Throw
+        (Get-PEEKCompatState).ParseFailed | Should -BeTrue
+        Should -Invoke Get-Content -Times 0 -Exactly
+    }
+
+    It 'still reports a genuine hard block from a well-formed report' {
+        [IO.File]::Copy((Join-Path $FixtureDir 'CompatData-block.xml'), $Report, $true)
+        $c = Get-PEEKCompatState
+        $c.ParseFailed | Should -BeFalse
+        $c.BlockCount | Should -Be 2
+    }
+
+    It 'reports a well-formed report without blocks as clean' {
+        [IO.File]::Copy((Join-Path $FixtureDir 'CompatData-clean.xml'), $Report, $true)
+        $c = Get-PEEKCompatState
+        $c.ParseFailed | Should -BeFalse
+        $c.BlockCount | Should -Be 0
+        $c.Summary | Should -Be 'None detected'
+    }
+}
