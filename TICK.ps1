@@ -288,9 +288,10 @@ function Invoke-TickMain {
     Complete-Step "1/4" "Registering and stopping w32time..." -Failed:$StepFailed
     Write-Step "2/4" "Configuring NTP peer..."
     if ($UseDomainSync) {
-        $res = Invoke-TickW32tm @("/config", "/syncfromflags:domhier", "/update")
+        # No /update: the service is stopped here, so /update fails (0x80070426). Step 3 starts it with these settings.
+        $res = Invoke-TickW32tm @("/config", "/syncfromflags:domhier")
     } else {
-        $res = Invoke-TickW32tm @("/config", "/manualpeerlist:$NtpServer,0x8", "/syncfromflags:manual", "/reliable:yes", "/update")
+        $res = Invoke-TickW32tm @("/config", "/manualpeerlist:$NtpServer,0x8", "/syncfromflags:manual", "/reliable:yes")
     }
     if ($res.ExitCode -ne 0) { [void]$ConfigProblems.Add("w32tm /config failed (code $($res.ExitCode))") }
     Complete-Step "2/4" "Configuring NTP peer..." -Failed:($res.ExitCode -ne 0)

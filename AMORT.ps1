@@ -351,7 +351,7 @@ function Clear-CachePath {
     foreach ($P in $Path) {
         if (-not (Test-Path $P)) { continue }
         if ($script:DryRun) { $Sum += Get-PathSize $P }
-        else { Remove-Item $P -Recurse -Force -ErrorAction SilentlyContinue }
+        else { try { Remove-Item $P -Recurse -Force -ErrorAction SilentlyContinue } catch { } }
     }
     return $Sum
 }
@@ -512,7 +512,7 @@ if (Test-Path "C:\Windows.old") {
     & robocopy.exe $EmptyDir "C:\Windows.old" /MIR /NFL /NDL /NJH /NJS /NC /NS /NP *>&1 | Out-Null
     Remove-Item $EmptyDir -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path "C:\Windows.old") {
-        Remove-Item "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue
+        try { Remove-Item "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     }
 }
 
@@ -828,7 +828,7 @@ if (Test-Path -LiteralPath $RBRoot) {
                 if ($DryRun) {
                     if (Test-Path -LiteralPath $RPath) { $RegionEst += [Math]::Max([int64]0, $OrigSize) }
                 } else {
-                    if (Test-Path -LiteralPath $RPath) { Remove-Item -LiteralPath $RPath -Recurse -Force -ErrorAction SilentlyContinue }
+                    if (Test-Path -LiteralPath $RPath) { try { Remove-Item -LiteralPath $RPath -Recurse -Force -ErrorAction SilentlyContinue } catch { } }
                     if (-not (Test-Path -LiteralPath $RPath)) { Remove-Item -LiteralPath $IFile.FullName -Force -ErrorAction SilentlyContinue }
                 }
             }
@@ -854,7 +854,8 @@ if ($UserMode) {
 } else {
     $WUWasRunning = (Get-Service wuauserv -ErrorAction SilentlyContinue).Status -eq 'Running'
     Stop-Service wuauserv -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-    if (Test-Path $WUDownload) { Remove-Item "$WUDownload\*" -Recurse -Force -ErrorAction SilentlyContinue }
+    # 5.1 throws a terminating error when Windows deletes a file mid-recurse, even with SilentlyContinue.
+    if (Test-Path $WUDownload) { try { Remove-Item "$WUDownload\*" -Recurse -Force -ErrorAction SilentlyContinue } catch { } }
     if ($WUWasRunning) { Start-ServiceSilent wuauserv }
     Complete-Step
 }
