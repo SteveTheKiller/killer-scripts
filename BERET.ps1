@@ -86,56 +86,6 @@ function Show-BeretBanner {
     Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art3 -ForegroundColor $MainCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
 }
 
-function Backup-To-AD {
-    param($KeyID, $Drive)
-    $_msg = "Escrowing key to Active Directory..."
-    Write-Host $_msg -ForegroundColor $InfoCol -NoNewline
-    try {
-        Backup-BitLockerKeyProtector -MountPoint $Drive -KeyProtectorId $KeyID -ErrorAction Stop | Out-Null
-        $_pad = " " * [math]::Max(1, $script:Width - $_msg.Length - "[SUCCESS]".Length)
-        Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-        Write-Host $_msg -ForegroundColor $DimCol -NoNewline; Write-Host "$_pad[SUCCESS]" -ForegroundColor $OkCol
-    } catch {
-        $_pad = " " * [math]::Max(1, $script:Width - $_msg.Length - "[RETRYING]".Length)
-        Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-        Write-Host $_msg -ForegroundColor $DimCol -NoNewline; Write-Host "$_pad[RETRYING]" -ForegroundColor $AccentCol
-        $_msg2 = "  Retrying via SYSTEM scheduled task..."
-        Write-Host $_msg2 -ForegroundColor $InfoCol -NoNewline
-        try {
-            $TaskName = "BitLocker_AD_Escrow"
-            $Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-Command `"Backup-BitLockerKeyProtector -MountPoint '$Drive' -KeyProtectorId '$KeyID' -ErrorAction Stop`""
-            $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-            Register-ScheduledTask -TaskName $TaskName -Action $Action -Principal $Principal -Force | Out-Null
-            Start-ScheduledTask -TaskName $TaskName
-            Start-Sleep -Seconds 8
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-            $_pad2 = " " * [math]::Max(1, $script:Width - $_msg2.Length - "[SUCCESS]".Length)
-            Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-            Write-Host $_msg2 -ForegroundColor $DimCol -NoNewline; Write-Host "$_pad2[SUCCESS]" -ForegroundColor $OkCol
-        } catch {
-            $_pad2 = " " * [math]::Max(1, $script:Width - $_msg2.Length - "[FAILED]".Length)
-            Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-            Write-Host $_msg2 -ForegroundColor $DimCol -NoNewline; Write-Host "$_pad2[FAILED]" -ForegroundColor $BorderCol
-            Write-Host "  $($_.Exception.Message)" -ForegroundColor $AccentCol
-        }
-    }
-}
-function Backup-To-Entra {
-    param($KeyID, $Drive)
-    $_msg = "Escrowing key to Microsoft Entra ID..."
-    Write-Host $_msg -ForegroundColor $InfoCol -NoNewline
-    try {
-        BackupToAAD-BitLockerKeyProtector -MountPoint $Drive -KeyProtectorId $KeyID -ErrorAction Stop | Out-Null
-        $_pad = " " * [math]::Max(1, $script:Width - $_msg.Length - "[SUCCESS]".Length)
-        Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-        Write-Host $_msg -ForegroundColor $DimCol -NoNewline; Write-Host "$_pad[SUCCESS]" -ForegroundColor $OkCol
-    } catch {
-        $_pad = " " * [math]::Max(1, $script:Width - $_msg.Length - "[FAILED]".Length)
-        Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-        Write-Host $_msg -ForegroundColor $DimCol -NoNewline; Write-Host "$_pad[FAILED]" -ForegroundColor $BorderCol
-        Write-Host "  $($_.Exception.Message)" -ForegroundColor $AccentCol
-    }
-}
 function Show-RecoveryInfo {
     param(
         [string]$Drive = "C:",
@@ -269,6 +219,202 @@ function Show-BeretKeys {
     }
 }
 
+function Test-BeretNetwork {
+    param([string]$HostName)
+    try { $null = [System.Net.Dns]::GetHostAddresses($HostName); return $true } catch { return $false }
+}
+
+function Test-BeretAdEscrow {
+    # $true when the key protector is found under this computer object in AD, $false when the
+    # lookup worked and it is not there, $null when AD could not be asked.
+    param([string]$KeyId)
+    try {
+        $name = $env:COMPUTERNAME
+        $root = [ADSI]''
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($root)
+        $searcher.Filter = "(&(objectCategory=computer)(name=$name))"
+        $computer = $searcher.FindOne()
+        if (-not $computer) { return $null }
+        $child = New-Object System.DirectoryServices.DirectorySearcher(([ADSI]$computer.Path))
+        $child.Filter = '(objectClass=msFVE-RecoveryInformation)'
+        $guid = $KeyId.Trim('{', '}')
+        foreach ($r in $child.FindAll()) {
+            if ([string]$r.Properties['distinguishedname'][0] -like "*$guid*") { return $true }
+        }
+        return $false
+    } catch { return $null }
+}
+
+function Test-BeretEntraEscrow {
+    # The BitLocker management log records 845 for a finished cloud backup and 846 for a failed
+    # one. $true or $false from the newest of those since $Since, $null when none is found.
+    param([datetime]$Since)
+    try {
+        $evts = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-BitLocker/BitLocker Management'; Id = 845, 846; StartTime = $Since } -ErrorAction Stop |
+            Sort-Object TimeCreated -Descending)
+        if ($evts.Count -eq 0) { return $null }
+        return ($evts[0].Id -eq 845)
+    } catch { return $null }
+}
+
+function Write-BeretEscrowLine {
+    param([string]$Label, [string]$Status, [string]$Detail)
+    $color = $OkCol
+    if ($Status -eq '[FAILED]') { $color = $BorderCol } elseif ($Status -eq '[UNCHECKED]') { $color = $AccentCol }
+    Write-BeretStatusLine $Label $Status $color
+    if ($Detail -and $Status -ne '[VERIFIED]') { Write-Host "  $Detail" -ForegroundColor $AccentCol }
+}
+
+function Complete-BeretEscrow {
+    # Turns a backup outcome and its read-back into one recorded result and one status line.
+    param([string]$Step, [string]$Label, [bool]$Backed, [string]$Error, $Verified)
+    if (-not $Backed) {
+        Add-BeretResult $Step 'Failed' "$Label escrow failed ($Error)"
+        Write-BeretEscrowLine $Label '[FAILED]' $Error
+    } elseif ($Verified -eq $false) {
+        Add-BeretResult $Step 'Failed' "$Label accepted the backup but the key was not found afterwards"
+        Write-BeretEscrowLine $Label '[FAILED]' 'The backup returned, but the key was not found when read back.'
+    } elseif ($null -eq $Verified) {
+        Add-BeretResult $Step 'Done' "$Label backup returned success, not read back"
+        Write-BeretEscrowLine $Label '[UNCHECKED]' 'Backup returned success but was not read back to confirm.'
+    } else {
+        Add-BeretResult $Step 'Done' "$Label verified"
+        Write-BeretEscrowLine $Label '[VERIFIED]' ''
+    }
+}
+
+function Backup-BeretToAd {
+    # Direct backup first. If that fails, the same backup as SYSTEM through a scheduled task,
+    # judged by the task's real result and always cleaned up. Returns Ok and Error.
+    param([string]$Drive, [string]$KeyId, [int]$TimeoutSeconds = 120)
+    try {
+        Backup-BitLockerKeyProtector -MountPoint $Drive -KeyProtectorId $KeyId -ErrorAction Stop | Out-Null
+        return [pscustomobject]@{ Ok = $true; Error = '' }
+    } catch {
+        $direct = $_.Exception.Message
+    }
+    $taskName = 'BitLocker_AD_Escrow'
+    $registered = $false
+    try {
+        $cmd = "try { Backup-BitLockerKeyProtector -MountPoint '$Drive' -KeyProtectorId '$KeyId' -ErrorAction Stop | Out-Null } catch { exit 1 }"
+        $action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -NonInteractive -Command `"$cmd`""
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $registered = $true
+        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        $deadline = (Get-BeretNow).AddSeconds($TimeoutSeconds)
+        $result = 267009
+        while ($true) {
+            Start-Sleep -Seconds 2
+            $result = [int64](Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop).LastTaskResult
+            # 267009 is still running and 267011 has not run yet. Neither is an answer.
+            if ($result -ne 267009 -and $result -ne 267011) { break }
+            if ((Get-BeretNow) -ge $deadline) { break }
+        }
+        if ($result -eq 0) { return [pscustomobject]@{ Ok = $true; Error = '' } }
+        if ($result -eq 267009 -or $result -eq 267011) {
+            return [pscustomobject]@{ Ok = $false; Error = "direct backup failed ($direct); the SYSTEM task did not finish in $TimeoutSeconds seconds (result $result)" }
+        }
+        return [pscustomobject]@{ Ok = $false; Error = "direct backup failed ($direct); the SYSTEM task ended with result $result" }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Error = "direct backup failed ($direct); the SYSTEM task could not run ($($_.Exception.Message))" }
+    } finally {
+        if ($registered) { try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop } catch { } }
+    }
+}
+
+function Backup-BeretToEntra {
+    param([string]$Drive, [string]$KeyId)
+    try {
+        BackupToAAD-BitLockerKeyProtector -MountPoint $Drive -KeyProtectorId $KeyId -ErrorAction Stop | Out-Null
+        return [pscustomobject]@{ Ok = $true; Error = '' }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message }
+    }
+}
+
+function Write-BeretKeyFile {
+    # Writes every recovery key to the file the operator asked for and reads it back. Returns Ok and Error.
+    param([string]$Path, [string]$Drive, [string]$DeviceName, $Keys)
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir) { [void][System.IO.Directory]::CreateDirectory($dir) }
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine("BitLocker recovery keys for $DeviceName ($Drive)")
+        foreach ($k in $Keys) {
+            [void]$sb.AppendLine("Key ID  : $($k.KeyProtectorId)")
+            [void]$sb.AppendLine("Password: $($k.RecoveryPassword)")
+        }
+        [System.IO.File]::WriteAllText($Path, $sb.ToString())
+        $back = [System.IO.File]::ReadAllText($Path)
+        foreach ($k in $Keys) {
+            if (-not $back.Contains([string]$k.RecoveryPassword)) { return [pscustomobject]@{ Ok = $false; Error = 'the file was written but the key is not in it' } }
+        }
+        return [pscustomobject]@{ Ok = $true; Error = '' }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message }
+    }
+}
+
+function Invoke-BeretEscrow {
+    # Escrows every recovery password to every available destination and records one result
+    # per destination. Never exits: Main decides from the results.
+    param([string]$Drive, [string]$DeviceName)
+    $keys = @(Get-BeretRecoveryProtectors -Drive $Drive)
+    if ($keys.Count -eq 0) {
+        Add-BeretResult 'RecoveryKey' 'Failed' "no recovery password found on $Drive to escrow"
+        Write-Host "[!] No recovery password found on $Drive. Nothing to escrow." -ForegroundColor $BorderCol
+        return
+    }
+    $sysInfo = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $isDomain = [bool]$sysInfo.PartOfDomain
+    $dsreg = [string](Get-BeretDsreg)
+    $isEntra = ($dsreg -match '(?m)^\s*AzureAdJoined\s*:\s*YES')
+    $isMsa = ($dsreg -match '(?m)^\s*MsaAccount\s*:\s*YES')
+    $keyFile = [string]$global:BeretKeyFile
+    $destinations = 0
+    $multi = ($keys.Count -gt 1)
+
+    if ($isDomain) {
+        foreach ($k in $keys) {
+            $destinations++
+            $label = 'Active Directory'
+            if ($multi) { $label = "Active Directory ($($k.KeyProtectorId))" }
+            $r = Backup-BeretToAd -Drive $Drive -KeyId $k.KeyProtectorId
+            $verified = $null
+            if ($r.Ok) { $verified = Test-BeretAdEscrow -KeyId $k.KeyProtectorId }
+            Complete-BeretEscrow 'EscrowAD' $label $r.Ok $r.Error $verified
+        }
+    }
+    if ($isEntra -or $isMsa) {
+        $name = 'Entra ID'
+        if (-not $isEntra) { $name = 'Microsoft account' }
+        $destinations++
+        if (-not (Test-BeretNetwork -HostName 'enterpriseregistration.windows.net')) {
+            Add-BeretResult 'EscrowEntra' 'Failed' "$name escrow failed (enterpriseregistration.windows.net is not reachable)"
+            Write-BeretEscrowLine $name '[FAILED]' 'enterpriseregistration.windows.net is not reachable.'
+        } else {
+            foreach ($k in $keys) {
+                $label = $name
+                if ($multi) { $label = "$name ($($k.KeyProtectorId))" }
+                $since = Get-BeretNow
+                $r = Backup-BeretToEntra -Drive $Drive -KeyId $k.KeyProtectorId
+                $verified = $null
+                if ($r.Ok) { $verified = Test-BeretEntraEscrow -Since $since }
+                Complete-BeretEscrow 'EscrowEntra' $label $r.Ok $r.Error $verified
+            }
+        }
+    }
+    if ($keyFile) {
+        $destinations++
+        $f = Write-BeretKeyFile -Path $keyFile -Drive $Drive -DeviceName $DeviceName -Keys $keys
+        Complete-BeretEscrow 'EscrowFile' "Key file $keyFile" $f.Ok $f.Error $(if ($f.Ok) { $true } else { $null })
+    }
+    if ($destinations -eq 0) {
+        Write-Host "[!] No Domain, Entra, or MSA link and no key file. The key exists only on this volume and on screen." -ForegroundColor $BorderCol
+        Add-BeretResult 'Escrow' 'Failed' 'no escrow destination (not domain joined, not Entra joined, no key file set); the key exists only on this volume and on screen'
+    }
+}
 function Add-BeretResult {
     # Records one outcome. Anything that is not Done or Skipped makes the run partial (exit 3).
     param([string]$Step, [ValidateSet('Done', 'Skipped', 'Failed')][string]$Status, [string]$Detail = '')
@@ -584,38 +730,7 @@ function Invoke-BeretMain {
 
     #region 3: Hybrid Backup Logic
     # =================================================================================
-    $KeyRows = @(Get-BeretRecoveryProtectors -Drive $DriveLetter)
-    $ExplicitKeyID = $null
-    if ($KeyRows.Count -gt 0) { $ExplicitKeyID = $KeyRows[0].KeyProtectorId }
-    if ($ExplicitKeyID) {
-        $SysInfo = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
-        $IsDomainJoined = $SysInfo.PartOfDomain
-        $Dsreg = Get-BeretDsreg
-        $IsEntraJoined = $Dsreg -match "AzureAdJoined : YES"
-        $IsMSALinked   = $Dsreg -match "MsaAccount : YES"
-        $BackupPerformed = $false
-        if ($IsDomainJoined) {
-            Backup-To-AD -KeyID $ExplicitKeyID -Drive $DriveLetter
-            $BackupPerformed = $true
-        }
-        if ($IsEntraJoined) {
-            try {
-                $null = [System.Net.Dns]::GetHostAddresses("enterpriseregistration.windows.net")
-                Backup-To-Entra -KeyID $ExplicitKeyID -Drive $DriveLetter
-                $BackupPerformed = $true
-            } catch {
-                Write-Host "[!] Entra Backup failed: Network Error." -ForegroundColor $BorderCol
-            }
-        }
-        if ($IsMSALinked) {
-            Write-Host "[INFO] Personal Microsoft Account detected." -ForegroundColor $InfoCol
-            Backup-To-Entra -KeyID $ExplicitKeyID -Drive $DriveLetter
-            $BackupPerformed = $true
-        }
-        if (-not $BackupPerformed) {
-            Write-Host "[!] No Domain, Entra, or MSA link detected. Key exists only locally and on-screen." -ForegroundColor $BorderCol
-        }
-    }
+    Invoke-BeretEscrow -Drive $DriveLetter -DeviceName $DeviceName
     #endregion
 
     #region 4: Final Status

@@ -88,7 +88,35 @@ BeforeEach {
     $script:EncryptNeverStarts = $false
     $script:EncryptMethodOverride = $null
     $script:Events = New-Object System.Collections.ArrayList
+    $script:AdVerify = $true
+    $script:EntraVerify = $true
+    $script:Net = $true
+    $script:AdDirectFails = $false
+    $script:EntraFails = $false
+    $script:TaskResults = New-Object System.Collections.Queue
+    $script:TaskUnregistered = 0
+    $global:BeretKeyFile = $null
 
+    Mock Test-BeretNetwork { $script:Net }
+    Mock Test-BeretAdEscrow { $script:AdVerify }
+    Mock Test-BeretEntraEscrow { $script:EntraVerify }
+    Mock Backup-BitLockerKeyProtector {
+        [void]$script:Events.Add('AD-BACKUP')
+        if ($script:AdDirectFails) { throw 'Access is denied (0x80070005)' }
+    }
+    Mock BackupToAAD-BitLockerKeyProtector {
+        [void]$script:Events.Add('AAD-BACKUP')
+        if ($script:EntraFails) { throw 'The device is not registered' }
+    }
+    Mock New-ScheduledTaskAction { New-CimInstance -ClientOnly -ClassName 'MSFT_TaskAction' -Namespace 'Root/Microsoft/Windows/TaskScheduler' -Property @{ Execute = [string]$Execute } }
+    Mock New-ScheduledTaskPrincipal { New-CimInstance -ClientOnly -ClassName 'MSFT_TaskPrincipal' -Namespace 'Root/Microsoft/Windows/TaskScheduler' -Property @{ UserId = [string]$UserId } }
+    Mock Register-ScheduledTask { [void]$script:Events.Add('TASK-REGISTER') }
+    Mock Start-ScheduledTask { [void]$script:Events.Add('TASK-START') }
+    Mock Get-ScheduledTaskInfo {
+        $r = if ($script:TaskResults.Count -gt 1) { $script:TaskResults.Dequeue() } elseif ($script:TaskResults.Count -eq 1) { $script:TaskResults.Peek() } else { 0 }
+        [pscustomobject]@{ LastTaskResult = $r }
+    }
+    Mock Unregister-ScheduledTask { $script:TaskUnregistered++ }
     # The fake clock moves only when the script sleeps, and a runaway loop fails the test fast.
     Mock Start-Sleep {
         $script:Sleeps++
@@ -464,4 +492,190 @@ Describe 'Finding 06 and D4: data volume auto-unlock is restored and verified' {
         Should -Invoke Enable-BitLockerAutoUnlock -Times 0 -Exactly
     }
 }
+
+Describe 'Finding 07: escrow is verified separately for every destination' {
+    BeforeEach {
+        $script:Key = '111111-111111-111111-111111-111111-111111-111111-111111'
+    }
+
+    Context 'no destination' {
+        It 'exits 3 and says the key is only on screen and on the volume when there is nowhere to escrow it' {
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match 'BERET RESULT: exit code 3'
+            $script:Text | Should -Match 'no escrow destination'
+        }
+    }
+
+    Context 'Active Directory' {
+        BeforeEach { $script:Domain = $true }
+
+        It 'reports AD verified and exits 0 when the backup succeeds and the read-back finds the key' {
+            Invoke-BeretRun
+            $script:Code | Should -Be 0
+            $script:Text | Should -Match '(?s)Active Directory.*\[VERIFIED\]'
+            $script:Text | Should -Match 'BERET RESULT: exit code 0'
+        }
+
+        It 'exits 3 when the backup worked but the read-back cannot find the key in AD' {
+            $script:AdVerify = $false
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match '(?s)Active Directory.*\[FAILED\]'
+        }
+
+        It 'reports success without a read-back when AD cannot be queried, and says so' {
+            $script:AdVerify = $null
+            Invoke-BeretRun
+            $script:Code | Should -Be 0
+            $script:Text | Should -Match 'not read back'
+        }
+
+        It 'retries through a SYSTEM task and accepts it only when the task result is 0' {
+            $script:AdDirectFails = $true
+            $script:TaskResults.Enqueue(0)
+            Invoke-BeretRun
+            $script:Code | Should -Be 0
+            ($script:Events -join ',') | Should -Match 'TASK-REGISTER,TASK-START'
+            $script:Text | Should -Match '(?s)Active Directory.*\[VERIFIED\]'
+        }
+
+        It 'exits 3 when the SYSTEM task ran and failed, instead of reporting success after a sleep' {
+            $script:AdDirectFails = $true
+            $script:TaskResults.Enqueue(1)
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match '(?s)Active Directory.*\[FAILED\]'
+            $script:Text | Should -Match 'result 1'
+        }
+
+        It 'waits through the running state and exits 3 when the task never finishes' {
+            $script:AdDirectFails = $true
+            $script:TaskResults.Enqueue(267009)
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match 'did not finish'
+        }
+
+        It 'treats a task that never ran (267011) as failed' {
+            $script:AdDirectFails = $true
+            $script:TaskResults.Enqueue(267011)
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+        }
+
+        It 'waits for a running task to finish and then reads its result' {
+            $script:AdDirectFails = $true
+            $script:TaskResults.Enqueue(267009)
+            $script:TaskResults.Enqueue(267009)
+            $script:TaskResults.Enqueue(0)
+            Invoke-BeretRun
+            $script:Code | Should -Be 0
+        }
+
+        It 'always removes the scheduled task, also when it failed' {
+            $script:AdDirectFails = $true
+            $script:TaskResults.Enqueue(1)
+            Invoke-BeretRun
+            $script:TaskUnregistered | Should -Be 1
+        }
+    }
+
+    Context 'Microsoft Entra ID' {
+        BeforeEach { $script:Dsreg = "AzureAdJoined : YES`nEnterpriseJoined : NO" }
+
+        It 'reports Entra verified when the backup event confirms it' {
+            Invoke-BeretRun
+            $script:Code | Should -Be 0
+            $script:Text | Should -Match '(?s)Entra ID.*\[VERIFIED\]'
+        }
+
+        It 'exits 3 when the backup throws' {
+            $script:EntraFails = $true
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match '(?s)Entra ID.*\[FAILED\]'
+        }
+
+        It 'exits 3 when the failure event is logged after a backup that did not throw' {
+            $script:EntraVerify = $false
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+        }
+
+        It 'exits 3 without calling the backup when Entra cannot be reached' {
+            $script:Net = $false
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+            Should -Invoke BackupToAAD-BitLockerKeyProtector -Times 0 -Exactly
+        }
+    }
+
+    Context 'several destinations' {
+        It 'reports AD and Entra independently and exits 3 when only one of them failed' {
+            $script:Domain = $true
+            $script:Dsreg = 'AzureAdJoined : YES'
+            $script:EntraFails = $true
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match '(?s)Active Directory.*\[VERIFIED\]'
+            $script:Text | Should -Match '(?s)Entra ID.*\[FAILED\]'
+            $script:Text | Should -Match 'BERET RESULT: exit code 3'
+        }
+
+        It 'escrows every recovery password on the volume' {
+            $script:Domain = $true
+            $script:Vols['C:'] = New-BeretVolume 'C:' 'FullyEncrypted' 'XtsAes128' @((New-BeretProtector 'Tpm'),
+                (New-BeretProtector 'RecoveryPassword' -Password '111111-111111-111111-111111-111111-111111-111111-111111'),
+                (New-BeretProtector 'RecoveryPassword' -Password '222222-222222-222222-222222-222222-222222-222222-222222'))
+            Invoke-BeretRun
+            Should -Invoke Backup-BitLockerKeyProtector -Times 2 -Exactly
+        }
+    }
+
+    Context 'local key file' {
+        It 'writes the key to the file the operator asked for, reads it back and counts it as a destination' {
+            $global:BeretKeyFile = Join-Path $TestDrive 'keys\C-recovery.txt'
+            Invoke-BeretRun
+            $script:Code | Should -Be 0
+            (Get-Content -LiteralPath $global:BeretKeyFile -Raw) | Should -Match '111111-111111-111111-111111-111111-111111-111111-111111'
+            $script:Text | Should -Match '(?s)Key file.*\[VERIFIED\]'
+        }
+
+        It 'exits 3 when the key file cannot be written, and still reports the other destinations' {
+            $script:Domain = $true
+            $blocker = Join-Path $TestDrive 'iamafile'
+            [IO.File]::WriteAllText($blocker, 'x')
+            $global:BeretKeyFile = Join-Path $blocker 'keys.txt'
+            Invoke-BeretRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match '(?s)Key file.*\[FAILED\]'
+            $script:Text | Should -Match '(?s)Active Directory.*\[VERIFIED\]'
+        }
+    }
+}
+}
+
+Describe 'Finding 06: a 32-bit host reaches the real System32' {
+    BeforeEach {
+        $script:SavedArch = $env:PROCESSOR_ARCHITEW6432
+        $script:SavedWin = $env:windir
+    }
+    AfterEach {
+        $env:PROCESSOR_ARCHITEW6432 = $script:SavedArch
+        $env:windir = $script:SavedWin
+    }
+
+    It 'uses System32 in a 64-bit host' {
+        if ([IntPtr]::Size -ne 8) { Set-ItResult -Skipped -Because 'needs a 64-bit host'; return }
+        $env:windir = 'C:\Windows'
+        Get-BeretNativePath 'manage-bde.exe' | Should -Be 'C:\Windows\System32\manage-bde.exe'
+    }
+
+    It 'uses Sysnative in a 32-bit host on 64-bit Windows' {
+        if ([IntPtr]::Size -ne 4) { Set-ItResult -Skipped -Because 'needs a 32-bit host'; return }
+        $env:windir = 'C:\Windows'
+        $env:PROCESSOR_ARCHITEW6432 = 'AMD64'
+        Get-BeretNativePath 'manage-bde.exe' | Should -Be 'C:\Windows\Sysnative\manage-bde.exe'
+    }
 }
