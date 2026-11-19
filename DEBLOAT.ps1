@@ -155,9 +155,14 @@ function Invoke-ScExe {
     & sc.exe @Arguments *>&1 | Out-Null
 }
 
+function Get-UserFolder {
+    # Every folder directly under C:\Users, including Default and Public.
+    Get-ChildItem "C:\Users" -Directory
+}
+
 function Get-UserProfileFolder {
     # Real user profile folders under C:\Users (Public, Default and service profiles excluded).
-    Get-ChildItem "C:\Users" -Directory |
+    Get-UserFolder |
         Where-Object { $_.Name -notmatch "Public|Default|All Users|DefaultAppPool|WDAGUtilityAccount" }
 }
 
@@ -565,14 +570,8 @@ function Invoke-DebloatMain {
         Write-Host "[*]   Cleaning User Hives for HP..." -ForegroundColor $WarnCol
         Invoke-ComprehensiveUserCleanup -RegistryOperations $HPUserOps
 
-        # Remove HP Edge Bookmarks from all profile directories
-        Get-ChildItem "C:\Users" -Directory | ForEach-Object {
-            $EdgePath = "$($_.FullName)\AppData\Local\Microsoft\Edge\User Data\Default"
-            if (Test-Path $EdgePath) {
-                Remove-Item -Path "$EdgePath\Bookmarks" -Force -ErrorAction SilentlyContinue
-                Remove-Item -Path "$EdgePath\Web Data" -Force -ErrorAction SilentlyContinue
-            }
-        }
+        # Edge Bookmarks and Web Data hold the user's own bookmarks and autofill, so they are never
+        # deleted. Nothing in them can be proven to belong to the OEM.
 
         # 2.3: HP Wolf Security & Bloatware Purge
         Write-Host "[*]   Purging HP Wolf Security via Uninstall registry..." -ForegroundColor $WarnCol

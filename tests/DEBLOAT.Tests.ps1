@@ -105,6 +105,7 @@ Describe 'DEBLOAT' {
         Mock Remove-Item {} -ParameterFilter { "$Path" -like 'HKLM:*' -or "$Path" -like 'Registry::*' }
         Mock Invoke-RegExe { 0 }
         Mock Get-LoadedUserSidMap { @{} }
+        Mock Get-UserFolder { Get-ChildItem -LiteralPath $script:Users -Directory }
         Mock Get-UserProfileFolder { Get-ChildItem -LiteralPath $script:Users -Directory | Where-Object { $_.Name -ne 'Default' } }
         Mock Get-DefaultUserHivePath { Join-Path $script:Users 'Default\NTUSER.DAT' }
         Mock Get-InstalledMsiPackage { @() }
@@ -141,6 +142,24 @@ Describe 'DEBLOAT' {
             $r = Get-Run
             $r.Code | Should -Be 3
             $r.Text | Should -Match '\[WARN\] DEBLOAT partial.*\(exit 3\)'
+        }
+    }
+
+    Context 'finding 08: HP cleanup leaves Edge user data alone' {
+        BeforeEach { $script:Mfr = 'HP' }
+        It 'keeps Bookmarks, Web Data and Preferences in every profile' {
+            Get-Exit | Should -Be 0
+            foreach ($u in $script:Alice, $script:Bob) {
+                $edge = Join-Path $u 'AppData\Local\Microsoft\Edge\User Data\Default'
+                Get-Content -LiteralPath (Join-Path $edge 'Bookmarks') | Should -Be "bookmarks of $(Split-Path -Leaf $u)"
+                Get-Content -LiteralPath (Join-Path $edge 'Web Data') | Should -Be "autofill of $(Split-Path -Leaf $u)"
+                Test-Path -LiteralPath (Join-Path $edge 'Preferences') | Should -BeTrue
+            }
+        }
+        It 'still runs the HP per-user cleanup for both profiles' {
+            Get-Exit | Should -Be 0
+            Should -Invoke Invoke-RegExe -Times 2 -Exactly -ParameterFilter { $Arguments[0] -eq 'load' -and $Arguments[1] -eq 'HKU\TempHive_alice' }
+            Should -Invoke Invoke-RegExe -Times 2 -Exactly -ParameterFilter { $Arguments[0] -eq 'load' -and $Arguments[1] -eq 'HKU\TempHive_bob' }
         }
     }
 }
