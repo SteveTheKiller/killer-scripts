@@ -507,7 +507,8 @@ function Invoke-TaskCreationWizard {
                         $comAction.Path = $action.Execute
                         if ($action.Arguments) { $comAction.Arguments = $action.Arguments }
 
-                        try { $rootFolder.DeleteTask($taskName, 0) } catch {}
+                        # Flag 6 is TASK_CREATE_OR_UPDATE. An existing task is replaced only when the new
+                        # definition is accepted, so a failed registration leaves the old task working.
                         $rootFolder.RegisterTaskDefinition($taskName, $taskDef, 6, "SYSTEM", $null, 5) | Out-Null
 
                         $finalWizardLines = $initialWizardLines + [string[]]@("Schedule     : Monthly", "Day of Month : $domDisplay", "Time         : $t")
@@ -540,9 +541,8 @@ function Invoke-TaskCreationWizard {
         Write-Host "[!] Task '$taskName' Created Successfully!" -ForegroundColor $script:DoneFG
     } else {
         try {
-            if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-            }
+            # -Force replaces an existing task of the same name in one validated call. The old task is
+            # never deleted first, so a rejected definition leaves it in place.
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger) -User "SYSTEM" -RunLevel Highest -Force -ErrorAction Stop | Out-Null
             $script:StareChanges++
             Write-Host "[!] Task '$taskName' Created Successfully!" -ForegroundColor $script:DoneFG

@@ -222,4 +222,45 @@ Describe 'STARE' {
             $r.Code | Should -Be 1 -Because $r.All
         }
     }
+
+    Context 'finding 25: a replacement never deletes the working task first' {
+        BeforeEach {
+            $script:Sched = @((New-TestTask 'Nightly' '\'), (New-TestTask 'Nightly' '\Other\'))
+        }
+        It 'keeps the existing task and exits 1 when the replacement fails (cmdlet path)' {
+            Mock Register-ScheduledTask { throw 'the scheduler rejected the definition' }
+            Set-Script -Keys 'C', '1', '4', 'X', 'Q' -Lines 'Nightly', 'shutdown.exe /r'
+            $r = Get-Run
+            Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly
+            @($script:Sched).Count | Should -Be 2
+            $r.Host | Should -Match 'Error creating task.*rejected'
+            $r.Code | Should -Be 1 -Because $r.All
+        }
+        It 'replaces an existing task in one validated call and touches no other folder (cmdlet path)' {
+            Set-Script -Keys 'C', '1', '4', 'X', 'Q' -Lines 'Nightly', 'shutdown.exe /r'
+            $r = Get-Run
+            Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly
+            Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'Nightly' -and $Force }
+            $r.Code | Should -Be 0 -Because $r.All
+            $r.Host | Should -Match "Task 'Nightly' Created Successfully"
+        }
+        It 'does not delete the existing task before registering the monthly replacement (COM path)' {
+            $script:Fake = New-FakeScheduleService -FailRegister
+            Set-Script -Keys 'C', '1', '3', 'X', 'ESC', 'Q' -Lines 'Nightly', 'shutdown.exe /r', '15', '03:00'
+            $r = Get-Run
+            $script:Fake.Folder.Calls | Should -Not -Contain 'DeleteTask:Nightly'
+            @($script:Fake.Folder.Calls | Where-Object { $_ -like 'DeleteTask*' }).Count | Should -Be 0
+            $script:Fake.Folder.Calls | Should -Contain 'Register:Nightly:6'
+            $r.Host | Should -Match 'ERR'
+            $r.Code | Should -Be 1 -Because $r.All
+        }
+        It 'registers the monthly task with create-or-update and no delete when it works (COM path)' {
+            $script:Fake = New-FakeScheduleService
+            Set-Script -Keys 'C', '1', '3', 'X', 'Q' -Lines 'Nightly', 'shutdown.exe /r', '15', '03:00'
+            $r = Get-Run
+            @($script:Fake.Folder.Calls) | Should -Be @('Register:Nightly:6')
+            $r.Code | Should -Be 0 -Because $r.All
+            $r.Host | Should -Match "Task 'Nightly' Created Successfully"
+        }
+    }
 }
