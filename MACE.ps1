@@ -376,10 +376,18 @@ function Invoke-MaceRun {
         "OfficeClickToRun", "OfficeC2RClient",
         "msedgewebview2", "WebViewHost"
     )
-    foreach ($proc in $Processes) {
-        foreach ($p in (Get-MaceProcess -Name $proc)) {
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    if ($AllUsers -or $TargetAccount) {
+        foreach ($proc in $Processes) {
+            foreach ($p in (Get-MaceProcess -Name $proc)) {
+                # A single selected profile only loses its own processes
+                if ($AllUsers -or $p.UserName -eq $TargetAccount) {
+                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
         }
+    } else {
+        Write-Host "      Could not resolve the selected user's account; no processes were stopped." -ForegroundColor $WarnCol
+        [void]$Partial.Add("processes for the selected user were not stopped")
     }
     Start-Sleep -Seconds 3
     Write-StepUpdate -Success
@@ -402,17 +410,25 @@ function Invoke-MaceRun {
     )
     # System32/SysWOW64 OneDriveSetup.exe ships with Windows itself - not an install indicator
     $ODUserFound = $null -ne ($TargetProfiles | Where-Object { Test-Path "$_\AppData\Local\Microsoft\OneDrive" } | Select-Object -First 1)
-    $ODFound = (Test-Path "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe") -or
-               (Test-Path "HKLM:\SOFTWARE\Microsoft\OneDrive") -or $ODUserFound
+    if ($AllUsers) {
+        $ODFound = (Test-Path "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe") -or
+                   (Test-Path "HKLM:\SOFTWARE\Microsoft\OneDrive") -or $ODUserFound
+    } else {
+        $ODFound = $ODUserFound
+    }
     if ($ODFound) {
-        $ODArgs = if ($AllUsers) { "/uninstall /allusers" } else { "/uninstall" }
-        foreach ($setup in $ODSetups) {
-            if (Test-Path $setup) {
-                Start-Process $setup -ArgumentList $ODArgs -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
-                break
+        if ($AllUsers -or $TargetIsSelf) {
+            $ODArgs = if ($AllUsers) { "/uninstall /allusers" } else { "/uninstall" }
+            foreach ($setup in $ODSetups) {
+                if (Test-Path $setup) {
+                    Start-Process $setup -ArgumentList $ODArgs -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
+                    break
+                }
             }
+            if ($AllUsers -and $winget) { Invoke-MaceWinget @("uninstall", "--id", "Microsoft.OneDrive", "--silent", "--accept-source-agreements") }
+        } else {
+            Write-Host " (uninstaller runs as the calling account; client files are purged instead)" -NoNewline -ForegroundColor DarkGray
         }
-        if ($winget) { Invoke-MaceWinget @("uninstall", "--id", "Microsoft.OneDrive", "--silent", "--accept-source-agreements") }
         Write-SubResult "[DONE]" $OkCol
     } else {
         Write-SubResult "[NOT-INSTALLED]" $InfoCol
@@ -420,24 +436,26 @@ function Invoke-MaceRun {
 
     # --- New Outlook ---
     Write-Host "      " -NoNewline; Write-Host ">" -NoNewline -ForegroundColor $DimCol; Write-Host " New Outlook (olk)..." -NoNewline -ForegroundColor Gray
-    $OlkFound = (Get-MaceAppx -Name "Microsoft.OutlookForWindows").Count -gt 0
-    if ($OlkFound) {
-        if ($AllUsers) {
-            Remove-MaceAppx -Name "Microsoft.OutlookForWindows"
-            Remove-MaceProvisioned -Like "*OutlookForWindows*"
-        } elseif ($TargetIsSelf) {
+    if ($AllUsers -or $TargetSid) {
+        $OlkFound = @(Get-MaceAppx -Name "Microsoft.OutlookForWindows" -Sid $TargetSid).Count -gt 0
+        if ($OlkFound) {
             Remove-MaceAppx -Name "Microsoft.OutlookForWindows" -Sid $TargetSid
+            if ($AllUsers) { Remove-MaceProvisioned -Like "*OutlookForWindows*" }
+            Write-SubResult "[DONE]" $OkCol
         } else {
-            Write-Host " (AppX skipped - target user not active session)" -NoNewline -ForegroundColor DarkGray
+            Write-SubResult "[NOT-INSTALLED]" $InfoCol
         }
-        Write-SubResult "[DONE]" $OkCol
     } else {
-        Write-SubResult "[NOT-INSTALLED]" $InfoCol
+        Write-SubResult "[SKIPPED]" $WarnCol
+        [void]$Partial.Add("New Outlook was not removed (selected user's SID not found)")
     }
 
     # --- Office / M365 ---
     Write-Host "      " -NoNewline; Write-Host ">" -NoNewline -ForegroundColor $DimCol; Write-Host " Office / M365 / Project..." -NoNewline -ForegroundColor Gray
-    if ($true) {
+    if (-not $AllUsers) {
+        Write-Host " (machine-wide, runs with All Users scope only)" -NoNewline -ForegroundColor DarkGray
+        Write-SubResult "[SKIPPED]" $WarnCol
+    } else {
         $C2RSetup = @(
             "C:\Program Files\Common Files\Microsoft Shared\ClickToRun\setup64.exe",
             "C:\Program Files (x86)\Common Files\Microsoft Shared\ClickToRun\setup64.exe"
@@ -480,10 +498,14 @@ function Invoke-MaceRun {
 
     # --- Teams ---
     Write-Host "      " -NoNewline; Write-Host ">" -NoNewline -ForegroundColor $DimCol; Write-Host " Microsoft Teams..." -NoNewline -ForegroundColor Gray
-    $TeamsPkgs = @(Get-MaceUninstallEntries |
-        Where-Object { $_.DisplayName -like "*Teams Machine-Wide*" -or $_.DisplayName -eq "Microsoft Teams" })
-    if ($true) {
-        $TeamsAppx = @(Get-MaceAppx -Name "MSTeams") + @(Get-MaceAppx -Name "MicrosoftTeams")
+    if ($AllUsers) {
+        $TeamsPkgs = @(Get-MaceUninstallEntries |
+            Where-Object { $_.DisplayName -like "*Teams Machine-Wide*" -or $_.DisplayName -eq "Microsoft Teams" })
+    } else {
+        $TeamsPkgs = @()
+    }
+    if ($AllUsers -or $TargetSid) {
+        $TeamsAppx = @(Get-MaceAppx -Name "MSTeams" -Sid $TargetSid) + @(Get-MaceAppx -Name "MicrosoftTeams" -Sid $TargetSid)
         $TeamsFound = ($TeamsPkgs.Count -gt 0) -or ($TeamsAppx.Count -gt 0)
         if ($TeamsFound) {
             foreach ($pkg in $TeamsPkgs) {
@@ -492,24 +514,22 @@ function Invoke-MaceRun {
                     if ($guid) { Start-Process "msiexec.exe" -ArgumentList "/x $guid /qn /norestart" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue }
                 }
             }
+            Remove-MaceAppx -Name "MSTeams" -Sid $TargetSid
+            Remove-MaceAppx -Name "MicrosoftTeams" -Sid $TargetSid
             if ($AllUsers) {
-                Remove-MaceAppx -Name "MSTeams"
-                Remove-MaceAppx -Name "MicrosoftTeams"
                 Remove-MaceProvisioned -Like "*Teams*"
-            } elseif ($TargetIsSelf) {
-                Remove-MaceAppx -Name "MSTeams" -Sid $TargetSid
-                Remove-MaceAppx -Name "MicrosoftTeams" -Sid $TargetSid
-            } else {
-                Write-Host " (AppX skipped - target user not active session)" -NoNewline -ForegroundColor DarkGray
-            }
-            if ($winget) {
-                Invoke-MaceWinget @("uninstall", "--id", "Microsoft.Teams", "--silent", "--accept-source-agreements")
-                Invoke-MaceWinget @("uninstall", "--name", "Microsoft Teams", "--silent", "--accept-source-agreements")
+                if ($winget) {
+                    Invoke-MaceWinget @("uninstall", "--id", "Microsoft.Teams", "--silent", "--accept-source-agreements")
+                    Invoke-MaceWinget @("uninstall", "--name", "Microsoft Teams", "--silent", "--accept-source-agreements")
+                }
             }
             Write-SubResult "[DONE]" $OkCol
         } else {
             Write-SubResult "[NOT-INSTALLED]" $InfoCol
         }
+    } else {
+        Write-SubResult "[SKIPPED]" $WarnCol
+        [void]$Partial.Add("Teams was not removed (selected user's SID not found)")
     }
     Write-StepUpdate -Success
     #endregion
@@ -546,8 +566,10 @@ function Invoke-MaceRun {
         "AppData\Local\Microsoft\Edge\User Data\Default\EBWebView",
         "AppData\Local\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy"
     )
-    foreach ($folder in $SystemFolders) {
-        if (Test-Path $folder) { Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($AllUsers) {
+        foreach ($folder in $SystemFolders) {
+            if (Test-Path $folder) { Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue }
+        }
     }
     foreach ($profilePath in $TargetProfiles) {
         foreach ($rel in $RelUserPaths) {
@@ -576,8 +598,10 @@ function Invoke-MaceRun {
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Teams",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\MicrosoftTeams"
     )
-    foreach ($key in $MachineKeys) {
-        if (Test-Path $key) { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($AllUsers) {
+        foreach ($key in $MachineKeys) {
+            if (Test-Path $key) { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue }
+        }
     }
 
     $UserRegKeys   = @(
@@ -630,13 +654,18 @@ function Invoke-MaceRun {
     Write-StepUpdate "[5/5] Flushing Cached Credentials..." -Pending
     # cmdkey only sees the vault of the account running this script. It is only valid for the
     # selected user when that user is the caller, so another profile's vault is left alone.
-    cmdkey /list 2>$null | ForEach-Object {
-        if ($_ -match "Target:\s*(.+)") {
-            $target = $Matches[1].Trim()
-            if ($target -match "Office|Outlook|Teams|OneDrive|MicrosoftOffice|MicrosoftTeams|msteams|lync") {
-                cmdkey /delete:$target 2>$null | Out-Null
+    if ($AllUsers -or $TargetIsSelf) {
+        cmdkey /list 2>$null | ForEach-Object {
+            if ($_ -match "Target:\s*(.+)") {
+                $target = $Matches[1].Trim()
+                if ($target -match "Office|Outlook|Teams|OneDrive|MicrosoftOffice|MicrosoftTeams|msteams|lync") {
+                    cmdkey /delete:$target 2>$null | Out-Null
+                }
             }
         }
+    } else {
+        Write-Host "      Skipped: cached credentials belong to the account running this script, not the selected user." -ForegroundColor $WarnCol
+        [void]$Partial.Add("cached credentials for the selected user were not cleared (sign in as that user to clear them)")
     }
     Write-StepUpdate -Success
     #endregion

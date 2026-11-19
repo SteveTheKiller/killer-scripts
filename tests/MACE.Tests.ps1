@@ -196,4 +196,51 @@ Describe 'MACE' {
         }
     }
 
+    Context 'Finding 16b: selected profile isolation' {
+        It '16b: stops only the selected user''s processes' {
+            $global:MaceScope = 'bob'
+            $null = Invoke-MaceCapture
+            $script:Stopped | Should -Contain 202
+            $script:Stopped | Should -Not -Contain 101
+        }
+
+        It '16b: leaves machine-wide apps, folders, keys and winget alone for one profile' {
+            $global:MaceScope = 'bob'
+            $null = Invoke-MaceCapture
+            @($script:Removed | Where-Object { $_ -notlike "$UsersRoot*" }).Count | Should -Be 0
+            @($script:Started | Where-Object { $_ -match 'msiexec|setup64|OneDriveSetup' }).Count | Should -Be 0
+            $script:Winget.Count | Should -Be 0
+        }
+
+        It '16b: removes AppX for the selected profile by its SID, never for all users' {
+            $global:MaceScope = 'bob'
+            $null = Invoke-MaceCapture
+            @($script:Appx).Count | Should -BeGreaterThan 0
+            foreach ($a in $script:Appx) { $a.Sid | Should -Be $script:BobSid }
+        }
+
+        It '16b: does not clear the calling account''s credentials for a different profile and reports partial success' {
+            $global:MaceScope = 'bob'
+            $r = Invoke-MaceCapture
+            $script:CmdKey.Count | Should -Be 0
+            $r.Code | Should -Be 3
+            $r.Output | Should -Match 'MACE RESULT: PARTIAL \(exit 3\)'
+        }
+
+        It '16b: clears credentials and exits 0 when the selected profile is the calling account' {
+            $global:MaceScope = 'alice'
+            $r = Invoke-MaceCapture
+            $script:CmdKey.Count | Should -BeGreaterThan 0
+            $r.Code | Should -Be 0
+            $script:Stopped | Should -Contain 101
+            $script:Stopped | Should -Not -Contain 202
+        }
+
+        It '16b: all users still performs the machine-wide removal' {
+            $global:MaceScope = 'AllUsers'
+            $null = Invoke-MaceCapture
+            @($script:Removed | Where-Object { $_ -like 'C:\Program Files*' }).Count | Should -BeGreaterThan 0
+            @($script:Started | Where-Object { $_ -match 'msiexec' }).Count | Should -BeGreaterThan 0
+        }
+    }
 }
