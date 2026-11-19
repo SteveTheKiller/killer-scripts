@@ -128,4 +128,19 @@ Describe 'PRINT' {
         }
     }
 
+    Context 'finding 59: no console and no -Silent' {
+        It 'exits 2 with a clear error instead of redrawing forever' {
+            Mock Test-PrintInteractive { $false }
+            $r = Get-Run
+            $r.Code | Should -Be 2
+            $r.Text | Should -Match '\[FAIL\].*-Silent.*exit 2'
+            Should -Invoke Read-PrintKey -Times 0 -Exactly
+        }
+        It 'stops with exit 1 when console input disappears mid-session' {
+            Mock Read-PrintKey { $script:KeyCalls++; if ($script:KeyCalls -gt 60) { throw 'RUNAWAY LOOP' }; $null }
+            $r = Get-Run
+            $r.Code | Should -Be 1
+            $r.Text | Should -Match '\[FAIL\].*exit 1'
+        }
+    }
 }
