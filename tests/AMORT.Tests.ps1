@@ -8,6 +8,7 @@ BeforeAll {
     Initialize-KillerSafetyNet
     Enable-KillerTestMode
     . (Get-KillerScriptPath AMORT)
+    $script:RealRemoveWindowsOldText = ${function:Remove-AmortWindowsOld}.ToString()
 
     # Runs Invoke-AmortMain and returns the exit code plus everything written to the output stream.
     function Invoke-AmortCapture {
@@ -336,6 +337,82 @@ Describe 'AMORT' {
             Should -Invoke Set-Service -Times 1 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' -and $StartupType -eq 'Manual' }
             Should -Invoke Start-Service -Times 1 -ParameterFilter { $Name -eq 'TrustedInstaller' }
             $script:StartedProcs.Count | Should -Be 3
+        }
+    }
+
+    Describe 'Finding 02: removing the rollback window is opt-in and refused while Windows is busy' {
+        BeforeEach {
+            Mock Test-Path { $true } -ParameterFilter { "$Path" -eq 'C:\Windows.old' }
+            Mock Get-PathSize { [int64]0 }
+            Mock Get-PathSize { [int64](30GB) } -ParameterFilter { $Path -eq 'C:\Windows.old' }
+            Remove-Variable -Name RemoveRollback -Scope Global -ErrorAction SilentlyContinue
+        }
+        AfterEach { Remove-Variable -Name RemoveRollback -Scope Global -ErrorAction SilentlyContinue }
+
+        It 'keeps Windows.old and the rollback data by default, and tells the technician how to remove it' {
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 0
+            Should -Invoke Remove-AmortWindowsOld -Times 0 -Exactly
+            ($script:ToolCalls -join "`n") | Should -Not -Match 'Remove-OSUninstall'
+            ($script:Notes -join "`n") | Should -Match 'Windows.old was kept.*-RemoveRollback'
+        }
+
+        It 'a dry run without the switch does not count Windows.old as reclaimable' {
+            [void](Invoke-AmortCapture @{ DryRun = $true })
+            $script:EstYieldBytes | Should -Be 0
+            Should -Invoke Remove-AmortWindowsOld -Times 0 -Exactly
+        }
+
+        It 'a dry run with the switch estimates Windows.old and still removes nothing' {
+            [void](Invoke-AmortCapture @{ DryRun = $true; RemoveRollback = $true })
+            $script:EstYieldBytes | Should -Be ([int64](30GB))
+            Should -Invoke Remove-AmortWindowsOld -Times 0 -Exactly
+        }
+
+        It 'removes Windows.old only when the switch is given and Windows is idle' {
+            $r = Invoke-AmortCapture @{ RemoveRollback = $true }
+            $r.Code | Should -Be 0
+            Should -Invoke Remove-AmortWindowsOld -Times 1 -Exactly
+        }
+
+        It 'treats a global RemoveRollback of true as the switch, for consoles that cannot pass arguments' {
+            $global:RemoveRollback = $true
+            Test-AmortRemoveRollbackRequested -Switch $false | Should -BeTrue
+            Remove-Variable -Name RemoveRollback -Scope Global
+            Test-AmortRemoveRollbackRequested -Switch $false | Should -BeFalse
+            Test-AmortRemoveRollbackRequested -Switch $true | Should -BeTrue
+        }
+
+        It 'refuses while Windows servicing is active' {
+            Mock Get-Process { @([pscustomobject]@{ Name = 'TiWorker'; Id = 7001 }) } -ParameterFilter { $Name -contains 'TiWorker' }
+            $r = Invoke-AmortCapture @{ RemoveRollback = $true }
+            Should -Invoke Remove-AmortWindowsOld -Times 0 -Exactly
+            $r.Code | Should -Be 3
+            $r.Output | Should -Match 'Windows.old was not removed: Windows servicing is active'
+        }
+
+        It 'refuses while a reboot is pending' {
+            Mock Test-Path { $true } -ParameterFilter { "$Path" -like '*RebootPending' }
+            $r = Invoke-AmortCapture @{ RemoveRollback = $true }
+            Should -Invoke Remove-AmortWindowsOld -Times 0 -Exactly
+            $r.Code | Should -Be 3
+            $r.Output | Should -Match 'Windows.old was not removed: a reboot is pending'
+        }
+
+        It 'refuses while a Windows upgrade is running' {
+            Mock Get-Process { @([pscustomobject]@{ Name = 'SetupHost'; Id = 7003 }) } -ParameterFilter { $Name -contains 'SetupHost' }
+            $r = Invoke-AmortCapture @{ RemoveRollback = $true }
+            Should -Invoke Remove-AmortWindowsOld -Times 0 -Exactly
+            $r.Code | Should -Be 3
+            $r.Output | Should -Match 'Windows.old was not removed: a Windows upgrade is running'
+        }
+
+        It 'strips the uninstall protection only inside the explicit removal, and checks the result' {
+            # The real function, captured before the per-test mock replaced it, with its own boundaries mocked.
+            Mock Start-Process { $null }
+            Mock Test-Path { $false } -ParameterFilter { "$Path" -like 'C:*' }
+            & ([scriptblock]::Create($script:RealRemoveWindowsOldText))
+            Should -Invoke Invoke-AmortTool -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'DISM.exe' -and ($ArgumentList -contains '/Remove-OSUninstall') }
         }
     }
 }

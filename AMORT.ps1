@@ -10,9 +10,9 @@
     be needed is age-gated or retained.
 
     Removes Dell SupportAssist snapshots, feature-upgrade leftovers, OEM driver
-    extracts, Windows.old, Delivery Optimization and Windows Update download
-    caches, browser/Teams/GPU caches, and aged temp files, crash dumps, error
-    reports, and Recycle Bin items. Trims restore points to the newest few,
+    extracts, Delivery Optimization and Windows Update download caches, browser/Teams/GPU caches, and aged temp files, crash dumps, error
+    reports, and Recycle Bin items. Windows.old and the previous-version rollback
+    data are kept unless -RemoveRollback is given. Trims restore points to the newest few,
     compresses system logs in place, runs DISM and SFC repair, disables
     hibernation, and performs SSD TRIM. Each step reports the measured space
     it recovered, and the summary is sized to screenshot into a ticket.
@@ -24,11 +24,17 @@
     Crash dumps, error reports, and Recycle Bin items newer than this are kept. Default 14.
 .PARAMETER KeepRestorePoints
     Number of newest restore points (shadow copies of C:) to keep. Default 2.
+.PARAMETER RemoveRollback
+    Opt in to removing Windows.old and the "Go back to a previous version of Windows"
+    option. Off by default. Refused while Windows servicing is active, a reboot is
+    pending or a Windows upgrade is running. A console that cannot pass arguments can
+    set $RemoveRollback = $true before running the script.
 #>
 param(
     [switch]$DryRun,
     [ValidateRange(1, 365)][int]$RetainDays = 14,
-    [ValidateRange(1, 64)][int]$KeepRestorePoints = 2
+    [ValidateRange(1, 64)][int]$KeepRestorePoints = 2,
+    [switch]$RemoveRollback
 )
 
 function Exit-KillerScript {
@@ -394,11 +400,30 @@ function Remove-AmortShadowCopy {
     return (@($left).Count -eq 0)
 }
 
+# Removing the rollback window is opt-in. The switch is the contract; a global $RemoveRollback of
+# exactly $true also counts, for consoles that cannot pass arguments.
+function Test-AmortRemoveRollbackRequested {
+    param([bool]$Switch)
+    [bool]($Switch -or ($global:RemoveRollback -is [bool] -and $global:RemoveRollback))
+}
+# Decides whether Windows.old and the rollback data may be removed right now.
+function Get-AmortRollbackDecision {
+    param([bool]$Requested, [bool]$ServicingActive, [bool]$PendingReboot, [bool]$UpgradeActive)
+    $reason = $null
+    if (-not $Requested) { $reason = 'not requested' }
+    elseif ($ServicingActive) { $reason = 'Windows servicing is active' }
+    elseif ($PendingReboot) { $reason = 'a reboot is pending' }
+    elseif ($UpgradeActive) { $reason = 'a Windows upgrade is running' }
+    [pscustomobject]@{ Allowed = (-not $reason); Requested = $Requested; Reason = $reason }
+}
+
 # Removes C:\Windows.old. Strips the previous-installation protection first, then tries rd,
-# an ownership retry, a robocopy mirror and finally a delete-on-reboot.
+# an ownership retry, a robocopy mirror and finally a delete-on-reboot. Only called after an
+# explicit -RemoveRollback and a clear Get-AmortRollbackDecision.
 function Remove-AmortWindowsOld {
 # Strip the previous-installation protection so Windows.old is deletable.
-& DISM.exe /Online /Remove-OSUninstall /NoRestart *>&1 | Out-Null
+$dismResult = Invoke-AmortTool "DISM.exe" @("/Online", "/Remove-OSUninstall", "/NoRestart")
+if ($dismResult.ExitCode -ne 0) { $script:Notes += "DISM /Remove-OSUninstall returned $($dismResult.ExitCode); removing Windows.old anyway." }
 
 # cleanmgr is skipped entirely: it ignores -WindowStyle Hidden (spawns an uncontrolled
 # child process), shows its UI in interactive sessions, and silently fails under
@@ -455,7 +480,8 @@ function Invoke-AmortCleanup {
     param(
         [switch]$DryRun,
         [int]$RetainDays = 14,
-        [int]$KeepRestorePoints = 2
+        [int]$KeepRestorePoints = 2,
+        [switch]$RemoveRollback
     )
 $TempAgeDays = 2
 $_fver   = "| v17.0"
@@ -611,17 +637,20 @@ foreach ($D in $OemDirs) {
     }
 }
 
-# --- Windows.old cleanup (no age gate) ---
-# This removes Windows.old as soon as it is found, regardless of how old it is. That
-# means the "Go back to a previous version of Windows" rollback option is closed off the
-# moment this step runs, even if the feature update happened minutes ago. This is an
-# intentional tradeoff, not an oversight; if that rollback path ever needs to be
-# preserved on a specific machine, skip this run or exclude that machine.
+# --- Windows.old and the rollback window (opt-in only) ---
+# Removing Windows.old closes the "Go back to a previous version of Windows" option for good, so
+# it only happens with -RemoveRollback, and never while servicing is active, a reboot is pending
+# or an upgrade is running. By default it is kept and the technician is told how to remove it.
 if (Test-Path "C:\Windows.old") {
-    if ($DryRun) {
-        $RegionEst += Get-PathSize "C:\Windows.old"
+    $Decision = Get-AmortRollbackDecision -Requested (Test-AmortRemoveRollbackRequested -Switch $RemoveRollback) -ServicingActive $ServicingActive -PendingReboot $PendingReboot -UpgradeActive $UpgradeActive
+    if ($Decision.Allowed) {
+        if ($DryRun) { $RegionEst += Get-PathSize "C:\Windows.old" }
+        else { Remove-AmortWindowsOld }
+    } elseif ($Decision.Requested) {
+        $script:Notes += "Windows.old was not removed: $($Decision.Reason)."
+        if (-not $DryRun) { $script:AmortSkips += "Windows.old was not removed: $($Decision.Reason)" }
     } else {
-        Remove-AmortWindowsOld
+        $script:Notes += "Windows.old was kept because it holds the option to go back to a previous version of Windows. Run with -RemoveRollback to remove it."
     }
 }
 Complete-Step -Estimate $RegionEst
@@ -1121,7 +1150,8 @@ function Invoke-AmortMain {
     param(
         [switch]$DryRun,
         [int]$RetainDays = 14,
-        [int]$KeepRestorePoints = 2
+        [int]$KeepRestorePoints = 2,
+        [switch]$RemoveRollback
     )
     if (-not (Test-AmortElevated)) {
         Write-Warning "Elevation Required: Please run as Administrator."
@@ -1136,7 +1166,7 @@ function Invoke-AmortMain {
     $fatal = $null
     $precondition = $false
     try {
-        Invoke-AmortCleanup -DryRun:$DryRun -RetainDays $RetainDays -KeepRestorePoints $KeepRestorePoints
+        Invoke-AmortCleanup -DryRun:$DryRun -RetainDays $RetainDays -KeepRestorePoints $KeepRestorePoints -RemoveRollback:$RemoveRollback
     } catch {
         $fatal = $_.Exception.Message
         if ($fatal -like 'PRECONDITION:*') { $precondition = $true; $fatal = $fatal.Substring(13).Trim() }
@@ -1169,4 +1199,4 @@ function Invoke-AmortMain {
     Exit-KillerScript 0
 }
 
-if (-not $global:KillerScriptsTestMode) { Invoke-AmortMain -DryRun:$DryRun -RetainDays $RetainDays -KeepRestorePoints $KeepRestorePoints }
+if (-not $global:KillerScriptsTestMode) { Invoke-AmortMain -DryRun:$DryRun -RetainDays $RetainDays -KeepRestorePoints $KeepRestorePoints -RemoveRollback:$RemoveRollback }
