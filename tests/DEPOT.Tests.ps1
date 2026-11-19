@@ -301,3 +301,28 @@ Describe 'Finding 51: MSI Office is left for ODT RemoveMSI to remove' {
         Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { "$FilePath" -match 'setup\.exe$' }
     }
 }
+
+Describe 'Finding 52: the update cache is not wiped while USO is running' {
+    BeforeEach {
+        Reset-DepotState
+        Mock Write-Host { }
+        Mock Write-StatusTag { }
+        Mock Stop-Service { }
+        Mock Start-Service { }
+        Mock Remove-Item { } -ParameterFilter { $true }
+        Mock Clear-RecycleBin { }
+        Mock Get-Service { [pscustomobject]@{ Name = 'wuauserv'; Status = 'Running' } }
+    }
+
+    It 'does not stop wuauserv or delete SoftwareDistribution\Download during cleanup' {
+        Invoke-DepotCleanup
+        Should -Invoke Stop-Service -Times 0 -Exactly -ParameterFilter { "$Name" -eq 'wuauserv' }
+        Should -Invoke Remove-Item -Times 0 -Exactly -ParameterFilter { "$Path" -match 'SoftwareDistribution' }
+    }
+
+    It 'still purges the temp folders and the recycle bin' {
+        Invoke-DepotCleanup
+        Should -Invoke Remove-Item -Times 1 -Exactly -ParameterFilter { "$Path" -like 'C:\Windows\Temp\*' }
+        Should -Invoke Clear-RecycleBin -Times 1 -Exactly
+    }
+}

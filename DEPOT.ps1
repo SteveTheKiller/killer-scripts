@@ -803,11 +803,11 @@ function Install-DepotApps {
 function Invoke-DepotCleanup {
     Write-Host "[*] Commencing Deep System Clean..." -ForegroundColor DarkRed
 
-    Write-Host "      > Clearing Update Cache..." -NoNewline -ForegroundColor Gray
-    Stop-Service -Name "wuauserv" -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-    Remove-Item -Path "$env:SystemRoot\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
-    Start-Service -Name "wuauserv" -ErrorAction SilentlyContinue
-    Write-StatusTag "[DONE]" "Green"
+    # The update cache is not cleared here. UsoClient started a background download and install earlier in
+    # this run, and stopping wuauserv or deleting SoftwareDistribution\Download now would pull files out from
+    # under it. The cache is reset before USO starts instead.
+    Write-Host "      > Update Cache..." -NoNewline -ForegroundColor Gray
+    Write-StatusTag "[LEFT IN PLACE - updates running]" "Yellow"
     Write-Host "      > Purging Temp Folders..." -NoNewline -ForegroundColor Gray
     $TempPaths = @(
         "C:\Windows\Temp\*", 
