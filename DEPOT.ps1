@@ -562,7 +562,12 @@ function Show-DepotBanner {
     Write-Host $script:ArtPfx -ForegroundColor $script:LineCol -NoNewline; Write-Host $script:Art3 -ForegroundColor $script:AccentCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $script:LineCol
     Write-Host "[>] Device Name    : " -NoNewline -ForegroundColor $script:LineCol
     Write-Host "$($env:COMPUTERNAME)" -ForegroundColor $script:AccentCol
-    $Admins = Get-LocalGroupMember -Group "Administrators" | Where-Object { $_.ObjectClass -eq "User" }
+    # By SID: the group name is localized. A host without the LocalAccounts module (32-bit) shows no list.
+    try {
+        $Admins = Get-LocalGroupMember -SID $script:AdminsGroupSid -ErrorAction Stop | Where-Object { $_.ObjectClass -eq "User" }
+    } catch {
+        $Admins = $null
+    }
     $AdminPrefix = "[>] Local Admins   : "
     Write-Host $AdminPrefix -NoNewline -ForegroundColor $script:LineCol
     $AdminList = $Admins.Name

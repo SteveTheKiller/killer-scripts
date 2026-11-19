@@ -789,3 +789,22 @@ Describe 'Finding 71: rename and OneDrive report what really happened' {
         }
     }
 }
+
+Describe 'Banner survives a host without local account cmdlets' {
+    It 'Show-DepotBanner does not throw when Get-LocalGroupMember is unavailable (32-bit host)' {
+        Mock Write-Host { }
+        Mock Write-HLine { }
+        Mock Clear-Host { }
+        Mock Get-LocalGroupMember { throw 'The term is not recognized' }
+        { Show-DepotBanner } | Should -Not -Throw
+    }
+
+    It 'Show-DepotBanner asks for the Administrators group by SID, not by its localized name' {
+        Mock Write-Host { }
+        Mock Write-HLine { }
+        Mock Clear-Host { }
+        Mock Get-LocalGroupMember { @() }
+        Show-DepotBanner
+        Should -Invoke Get-LocalGroupMember -Times 1 -Exactly -ParameterFilter { $SID -and "$SID" -eq 'S-1-5-32-544' }
+    }
+}
