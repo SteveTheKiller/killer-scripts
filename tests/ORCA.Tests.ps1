@@ -74,7 +74,8 @@ Describe 'ORCA' {
         Mock Get-ActiveUser { $script:Active }
         Mock Read-OrcaKey { if ($script:Keys.Count -gt 0) { $script:Keys.Dequeue() } else { throw 'no console' } }
         Mock Read-Host { throw 'Read-Host must not be reached in this test' }
-        Mock Read-OrcaLine { throw 'Read-OrcaLine must not be reached in this test' }
+        # No console: a line prompt gets no answer, which means no launch and no profile choice.
+        Mock Read-OrcaLine { $null }
         Mock Clear-Host { }
         Mock Write-HLine { }
         Mock Write-Host { }
@@ -85,6 +86,15 @@ Describe 'ORCA' {
         Mock Get-AppxPackage { $script:UserPkgs }
         Mock Remove-AppxPackage { }
         Mock Get-AppxProvisionedPackage { $script:Provisioned }
+        # winget download writes a package into the requested folder so All Users provisioning has something to add.
+        Mock Invoke-OrcaWinget {
+            if ($Arguments -like 'download*') {
+                $m = [regex]::Match($Arguments, '--download-directory "([^"]+)"')
+                New-Item -ItemType Directory -Path $m.Groups[1].Value -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path $m.Groups[1].Value 'Outlook.msix') -Value 'synthetic package'
+            }
+            0
+        }
         Mock Add-AppxProvisionedPackage { }
         Mock Remove-AppxProvisionedPackage { }
         Mock cmdkey { $global:LASTEXITCODE = 0 }
