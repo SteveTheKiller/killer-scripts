@@ -230,7 +230,8 @@ BeforeEach {
     Mock Start-Sleep { }
     Mock Write-StepUpdate { [void]$script:Log.Add("[$Status] $Message") }
     Mock Write-Detail { [void]$script:Log.Add("<$Label> $Value ($Status)") }
-    Mock Get-BeamWorkRoot { Join-Path $TestDrive 'BEAMWORK' }
+    $script:WorkRoot = Join-Path $TestDrive ('w' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    Mock Get-BeamWorkRoot { $script:WorkRoot }
     Mock Invoke-RestMethod { Invoke-FakeGraph -Uri $Uri -Method $Method -Body $Body }
     Mock Get-GraphToken { 'fake-token' }
     Mock Initialize-BeamTool { 'C:\Fake\IntuneWinAppUtil.exe' }
@@ -291,6 +292,71 @@ Context 'Exit codes at the entry point' {
         Invoke-BeamRun
         $script:Code | Should -Be 1
         $script:Text | Should -Match 'BEAM RESULT: exit code 1 -'
+    }
+}
+
+Context 'Finding 03b: the install wrapper stamps the marker only on an accepted result' {
+    BeforeAll {
+        function Invoke-InstallWrapper {
+            # Runs the generated SYSTEM install command in a child Windows PowerShell with a fake setup.cmd
+            # that exits with $SetupExit. The marker folder is redirected into TestDrive.
+            param($App, [int]$SetupExit)
+            $dir = Join-Path $TestDrive ('run' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $dir 'setup.cmd') -Value "@exit /b $SetupExit" -Encoding ASCII
+            $orig = Get-AppInstallScript $App
+            $pd = Join-Path $dir 'ProgramData'
+            $marker = (Get-MarkerPathFromScript $orig).Replace('C:\ProgramData\BEAM', (Join-Path $pd 'BEAM'))
+            $scr = $orig.Replace('C:\ProgramData\BEAM', (Join-Path $pd 'BEAM'))
+            $file = Join-Path $dir 'wrap.ps1'
+            Set-Content -LiteralPath $file -Value $scr -Encoding ASCII
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$file`""
+            $psi.WorkingDirectory = $dir
+            $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $null = $p.StandardOutput.ReadToEnd(); $null = $p.StandardError.ReadToEnd()
+            $p.WaitForExit()
+            $text = $null
+            if (Test-Path -LiteralPath $marker) { $text = (Get-Content -LiteralPath $marker -Raw).Trim() }
+            [pscustomobject]@{ ExitCode = $p.ExitCode; MarkerExists = (Test-Path -LiteralPath $marker); MarkerText = $text }
+        }
+    }
+
+    BeforeEach {
+        Invoke-Deploy -RunId 'RUN-ID-0001' -SetupFile 'setup.cmd' | Out-Null
+        $script:App = $script:G.Apps[0]
+    }
+
+    It 'does not stamp the marker when the installer fails, and returns the installer exit code' {
+        $r = Invoke-InstallWrapper -App $script:App -SetupExit 5
+        $r.MarkerExists | Should -BeFalse
+        $r.ExitCode | Should -Be 5
+    }
+
+    It 'does not stamp the marker for the retry code 1618' {
+        $r = Invoke-InstallWrapper -App $script:App -SetupExit 1618
+        $r.MarkerExists | Should -BeFalse
+        $r.ExitCode | Should -Be 1618
+    }
+
+    It 'stamps this run ID and exits 0 when the installer succeeds' {
+        $r = Invoke-InstallWrapper -App $script:App -SetupExit 0
+        $r.MarkerText | Should -Be 'RUN-ID-0001'
+        $r.ExitCode | Should -Be 0
+    }
+
+    It 'stamps the marker and keeps 3010 when the installer needs a reboot' {
+        $r = Invoke-InstallWrapper -App $script:App -SetupExit 3010
+        $r.MarkerText | Should -Be 'RUN-ID-0001'
+        $r.ExitCode | Should -Be 3010
+    }
+
+    It 'treats 1641 (restart initiated) as a success that needs a reboot, reported as 3010' {
+        $r = Invoke-InstallWrapper -App $script:App -SetupExit 1641
+        $r.MarkerText | Should -Be 'RUN-ID-0001'
+        $r.ExitCode | Should -Be 3010
     }
 }
 }

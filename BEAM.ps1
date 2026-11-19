@@ -709,6 +709,39 @@ function Resolve-DirectDownload {
     } catch { return $pick }
 }
 
+function New-BeamInstallScript {
+    # The PowerShell the Intune SYSTEM install command runs (wrapped in -EncodedCommand). It runs the
+    # package, reads the installer's real exit code, and stamps the run ID marker only for an accepted
+    # success: 0, or a reboot-required 3010 / 1641 (both reported to Intune as 3010, a soft reboot).
+    # Any other code is returned unchanged with no marker, so detection fails and Intune sees the failure.
+    # Working directory at install time is the extracted content folder, so the file is referenced
+    # relatively. Single quotes in the file name / switches are doubled for the PS literal.
+    param([string]$SetupFile, [string]$InstallArgs, [bool]$IsMsi, [string]$MarkerDir, [string]$MarkerPath, [string]$RunId)
+    $sfEsc = $SetupFile   -replace "'", "''"
+    $iaEsc = $InstallArgs -replace "'", "''"
+    if ($IsMsi) {
+        $al = "/i `"$sfEsc`""
+        if ($iaEsc) { $al = "$al $iaEsc" }
+        $runLine = "`$p = Start-Process -FilePath 'msiexec.exe' -ArgumentList '$al' -Wait -PassThru"
+    } else {
+        if ($iaEsc) {
+            $runLine = "`$p = Start-Process -FilePath '.\$sfEsc' -ArgumentList '$iaEsc' -Wait -PassThru"
+        } else {
+            $runLine = "`$p = Start-Process -FilePath '.\$sfEsc' -Wait -PassThru"
+        }
+    }
+    @"
+`$ErrorActionPreference = 'Stop'
+`$c = 1
+try { $runLine; `$c = [int]`$p.ExitCode } catch { `$c = 1 }
+if (`$c -eq 0 -or `$c -eq 3010 -or `$c -eq 1641) {
+    try { New-Item -ItemType Directory -Path '$MarkerDir' -Force | Out-Null; Set-Content -Path '$MarkerPath' -Value '$RunId' -Encoding ascii -Force } catch { `$c = 1 }
+    if (`$c -eq 1641) { `$c = 3010 }
+}
+exit `$c
+"@
+}
+
 function Invoke-IntuneInstall {
     param(
         [string[]]$Targets,
@@ -846,26 +879,10 @@ exit 1
 "@
     $detectB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($detectScript))
 
-    # Build the install command per file type. Everything is wrapped in a single powershell.exe
-    # -EncodedCommand so it runs the package and then stamps the marker regardless of the installer's
-    # exit code. Working directory at install time is the extracted content folder, so the file is
-    # referenced relatively. Single quotes in the file name / switches are doubled for the PS literal.
-    $sfEsc = $SetupFile   -replace "'", "''"
-    $iaEsc = $InstallArgs -replace "'", "''"
-    if ($IsMsi) {
-        $al = "/i `"$sfEsc`""
-        if ($iaEsc) { $al = "$al $iaEsc" }
-        $runLine = "Start-Process -FilePath 'msiexec.exe' -ArgumentList '$al' -Wait"
-    } else {
-        if ($iaEsc) {
-            $runLine = "Start-Process -FilePath '.\$sfEsc' -ArgumentList '$iaEsc' -Wait"
-        } else {
-            $runLine = "Start-Process -FilePath '.\$sfEsc' -Wait"
-        }
-    }
-    $stampInner = "$runLine; New-Item -ItemType Directory -Path '$markerDir' -Force | Out-Null; Set-Content -Path '$markerPath' -Value '$runId' -Encoding ascii -Force"
-    $stampB64   = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($stampInner))
-    $installCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $stampB64"
+    # The install command is one powershell.exe -EncodedCommand (see New-BeamInstallScript).
+    $installScript = New-BeamInstallScript -SetupFile $SetupFile -InstallArgs $InstallArgs -IsMsi $IsMsi -MarkerDir $markerDir -MarkerPath $markerPath -RunId $runId
+    $stampB64      = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($installScript))
+    $installCmd    = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $stampB64"
 
     # Uninstall command line is required by Intune. MSI uninstalls by file; EXE is a no-op so a manual
     # uninstall never re-runs the installer (detection is marker-based and won't trigger it anyway).
