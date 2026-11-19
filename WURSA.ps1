@@ -31,55 +31,7 @@ $LatestVersion = "26H2"
 # (24H2 = 26100, 25H2 = 26200, 26H2 = 26300), so the upgrade is never offered as a downgrade.
 $LatestBuild   = 26300
 
-# Feature-upgrade state is tracked separately from ordinary Windows Update.
-# A surfaced/downloaded feature update is NOT considered staged. Region 5 owns
-# the deterministic feature upgrade path unless Windows reports a real reboot-ready
-# feature update.
-$script:FeatureUpdateStaged = $false
-$script:FeatureUpgradeState = "UNKNOWN"
-
-#region 0 - Pre-Flight & Helpers
-$script:ExitCode = 0
-$ProgressPreference = 'SilentlyContinue'   # suppress console-wide progress overlays (VSS/BITS/Invoke-WebRequest)
-trap { Write-Host "[!] Fatal: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Warning "Elevation Required: Please run as Administrator."
-    Exit
-}
-# 1. Force session bypass to clear environment hurdles
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
-# 2. Re-register core paths to bypass the LiveConnect temp-path bug
-$env:PSModulePath = [Environment]::GetEnvironmentVariable("PSModulePath","Machine") + ";" + [Environment]::GetEnvironmentVariable("PSModulePath","User")
-# UI Helpers
-$script:StepRow = -1
-$script:StepMsg = ""
-function Write-StepUpdate {
-    param([string]$Message, [switch]$Success, [string]$CustomInfo)
-    if ($Success) {
-        $savedTop = [Console]::CursorTop
-        if ($script:StepRow -ge 0 -and $script:StepRow -lt $savedTop) {
-            [Console]::SetCursorPosition(0, $script:StepRow)
-            $combined = if ($CustomInfo) { "$($script:StepMsg) $CustomInfo" } else { $script:StepMsg }
-            $_pad = " " * [math]::Max(1, $script:Width - $combined.Length - "[SUCCESS]".Length)
-            Write-Host $script:StepMsg -ForegroundColor $DimCol -NoNewline
-            if ($CustomInfo) { Write-Host " $CustomInfo" -ForegroundColor $WarnCol -NoNewline }
-            Write-Host "$_pad[SUCCESS]" -ForegroundColor $OkCol
-            [Console]::SetCursorPosition(0, $savedTop)
-        }
-        $script:StepRow = -1
-    } else {
-        $script:StepRow = [Console]::CursorTop
-        $script:StepMsg = $Message
-        Write-Host $Message -ForegroundColor $InfoCol
-    }
-}
-
-# Baseline Data for UI
-$OS = Get-CimInstance Win32_OperatingSystem
-
-Clear-Host
 $script:Width  = 95
-
 $LineCol   = "DarkCyan"
 $MainCol   = "Cyan"
 $WarnCol   = "DarkYellow"
@@ -90,9 +42,150 @@ $DimCol    = "DarkGray"
 $OkCol     = "Green"
 $InfoCol   = "Cyan"
 
+#region Exit and system boundaries
+# Every exit goes through Exit-KillerScript. In test mode it throws instead of exiting.
+# Exit codes: 0 success, 1 failure, 2 not elevated or precondition failed, 3 partial success,
+# 3010 success with a reboot required. The final status line always agrees with the code.
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
+}
+
+# Each function below wraps one system boundary so tests can replace it.
+function Test-WursaElevated {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+}
+
+function Invoke-WursaNative {
+    # Runs a native tool with a real argument array and returns its exit code and output lines.
+    param([string]$FilePath, [string[]]$Arguments)
+    $out = & $FilePath @Arguments 2>&1
+    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out | ForEach-Object { [string]$_ }) }
+}
+
+function Invoke-WursaChoco {
+    param([string[]]$Arguments)
+    Invoke-WursaNative -FilePath 'choco' -Arguments $Arguments
+}
+
+function New-WursaUpdateSession { New-Object -ComObject Microsoft.Update.Session }
+function New-WursaUpdateColl    { New-Object -ComObject Microsoft.Update.UpdateColl }
+
+function Register-WursaProductService {
+    $sm = New-Object -ComObject Microsoft.Update.ServiceManager
+    $sm.AddService2("7971f918-a847-4430-9279-4a52d1efe18d", 7, "") | Out-Null
+}
+
+function Get-WursaPowerLineStatus {
+    # 'Online', 'Offline' or 'Unknown' from the OS power line state, or $null when it cannot be read.
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        return [string][System.Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus
+    } catch { return $null }
+}
+
+function Save-WursaFile {
+    param([string]$Uri, [string]$OutFile)
+    (New-Object System.Net.WebClient).DownloadFile($Uri, $OutFile)
+}
+
+function Expand-WursaZip {
+    param([string]$ZipPath, [string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+}
+
+function Invoke-WursaScriptFile {
+    param([string]$Path)
+    & $Path *>&1 | Out-Null
+}
+
+function Invoke-WursaRestorePoint {
+    # Creates a restore point in a timeboxed child job. Returns @{ Result = OK|ERR|TIMEOUT; Message }.
+    param([int]$TimeoutSeconds = 90)
+    # Bypass the 24-hour cooldown Windows enforces between restore points
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "SystemRestorePointCreationFrequency" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+    # The checkpoint calls into VSS/SrClient, which can stall or hard-fault the host
+    # process under RMM and take the whole run down before try/catch can fire. Run it
+    # in a timeboxed child job so a VSS hang can't kill WURSA; treat it as non-fatal.
+    $desc = "WURSA Pre-Update $($env:COMPUTERNAME) $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+    $job = Start-Job -ScriptBlock {
+        param($Desc)
+        try {
+            $ProgressPreference = 'SilentlyContinue'
+            # Ensure System Protection is enabled on C: (often disabled on managed endpoints)
+            Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue *>$null
+            # Call the SystemRestore WMI method directly. Checkpoint-Computer wraps the
+            # same call but also emits a native progress bar that ignores $ProgressPreference
+            # (it comes from SrClient/VSS, not Write-Progress) and paints past the shell
+            # width. The WMI call is silent. 12 = MODIFY_SETTINGS, 100 = BEGIN_SYSTEM_CHANGE.
+            $sr = [wmiclass]"\\.\root\default:SystemRestore"
+            $r  = $sr.CreateRestorePoint($Desc, 12, 100)
+            if ($r.ReturnValue -eq 0) { "OK" } else { "ERR: CreateRestorePoint returned $($r.ReturnValue)" }
+        } catch {
+            "ERR: $($_.Exception.Message)"
+        }
+    } -ArgumentList $desc
+    $result = $null
+    if (Wait-Job -Job $job -Timeout $TimeoutSeconds) {
+        $text = [string](Receive-Job -Job $job)
+        if ($text -match '^OK') { $result = @{ Result = 'OK'; Message = '' } }
+        else { $result = @{ Result = 'ERR'; Message = ($text -replace '^ERR: ', '') } }
+    } else {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        $result = @{ Result = 'TIMEOUT'; Message = "timed out after ${TimeoutSeconds}s (VSS stalled)" }
+    }
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    $result
+}
+#endregion
+
+#region UI helpers
+$script:StepRow  = -1
+$script:StepMsg  = ""
+$script:StepOpen = $false
+
+# RMM output panes have no cursor. Every cursor call degrades to plain sequential output.
+function Get-WursaCursorTop {
+    try { return [int][Console]::CursorTop } catch { return -1 }
+}
+function Set-WursaCursor {
+    param([int]$Left, [int]$Top)
+    try { [Console]::SetCursorPosition($Left, $Top); return $true } catch { return $false }
+}
+
+function Write-StepUpdate {
+    param([string]$Message, [switch]$Success, [string]$CustomInfo)
+    if ($Success) {
+        if ($script:StepOpen) {
+            $combined = if ($CustomInfo) { "$($script:StepMsg) $CustomInfo" } else { $script:StepMsg }
+            $_pad = " " * [math]::Max(1, $script:Width - $combined.Length - "[SUCCESS]".Length)
+            $savedTop = Get-WursaCursorTop
+            if ($script:StepRow -ge 0 -and $script:StepRow -lt $savedTop -and (Set-WursaCursor 0 $script:StepRow)) {
+                Write-Host $script:StepMsg -ForegroundColor $DimCol -NoNewline
+                if ($CustomInfo) { Write-Host " $CustomInfo" -ForegroundColor $WarnCol -NoNewline }
+                Write-Host "$_pad[SUCCESS]" -ForegroundColor $OkCol
+                [void](Set-WursaCursor 0 $savedTop)
+            } elseif ($script:StepRow -lt 0) {
+                Write-Host "$combined$_pad[SUCCESS]" -ForegroundColor $OkCol
+            }
+        }
+        $script:StepRow  = -1
+        $script:StepOpen = $false
+    } else {
+        $script:StepRow  = Get-WursaCursorTop
+        $script:StepMsg  = $Message
+        $script:StepOpen = $true
+        Write-Host $Message -ForegroundColor $InfoCol
+    }
+}
+
 function Write-SubResult {
     param([string]$Tag, [string]$Color)
-    $_pad = " " * [math]::Max(1, $script:Width - [Console]::CursorLeft - $Tag.Length)
+    $left = -1
+    try { $left = [int][Console]::CursorLeft } catch {}
+    $_pad = if ($left -ge 0) { " " * [math]::Max(1, $script:Width - $left - $Tag.Length) } else { "  " }
     Write-Host "$_pad$Tag" -ForegroundColor $Color
 }
 
@@ -136,6 +229,568 @@ function Write-HLine {
         Write-Host ""
     }
 }
+#endregion
+
+#region Windows Update pass (discovery and installation)
+function Get-WursaRebootPending {
+    # A pending reboot from prior updates means Windows won't commit any further
+    # updates until the boot happens.
+    foreach ($rp in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting'
+    )) { if (Test-Path $rp) { return $true } }
+    $pfro = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+    if ($pfro -and $pfro.PendingFileRenameOperations) { return $true }
+    return $false
+}
+
+function Install-WursaUpdate {
+    # Downloads and installs one update. Success is decided by ResultCode (2=Succeeded,
+    # 3=SucceededWithErrors) and HResult (0=clean; 0x80242014 = WU_E_UH_POSTREBOOTREQUIRED).
+    param($Session, $Update)
+    $coll = New-WursaUpdateColl
+    $coll.Add($Update) | Out-Null
+    $Downloader = $Session.CreateUpdateDownloader()
+    $Downloader.Updates = $coll
+    $null = $Downloader.Download()
+    $Installer = $Session.CreateUpdateInstaller()
+    $Installer.Updates = $coll
+    $Installer.AllowSourcePrompts = $false
+    $r  = $Installer.Install()
+    $rc = $r.ResultCode
+    $hr = $r.HResult
+    $res = [pscustomobject]@{ Tag = ''; Color = $OkCol; Outcome = 'Success'; RebootRequired = $false }
+    if ($rc -eq 2 -and $hr -eq 0) {
+        $res.Tag = "[SUCCESS]"
+        if ($r.RebootRequired) { $res.Tag = "[REBOOT REQ]"; $res.Color = $WarnCol; $res.Outcome = 'Reboot'; $res.RebootRequired = $true }
+    } elseif ($hr -eq -2145116140 -or $hr -eq 0x80242014) {   # WU_E_UH_POSTREBOOTREQUIRED
+        $res.Tag = "[REBOOT REQ]"; $res.Color = $WarnCol; $res.Outcome = 'Reboot'; $res.RebootRequired = $true
+    } elseif ($rc -eq 3) {
+        $res.Tag = "[SUCCESS*]"; $res.Color = $WarnCol; $res.Outcome = 'Warn'   # succeeded with errors
+    } else {
+        $res.Tag = "[FAILED 0x$('{0:X8}' -f $hr)]"; $res.Color = "Red"; $res.Outcome = 'Failed'
+    }
+    $res
+}
+
+function Write-WursaUpdateLines {
+    # Appends the result tag to the last wrapped title line. Without cursor control the
+    # tag is printed on its own line instead.
+    param([string[]]$Lines, [int]$Row, [string]$Tag, [string]$Color)
+    $savedTop = Get-WursaCursorTop
+    if ($Row -ge 0 -and $savedTop -ge 0 -and (Set-WursaCursor 0 $Row)) {
+        for ($li = 0; $li -lt $Lines.Count; $li++) {
+            if ($li -eq $Lines.Count - 1) {
+                $pad = " " * [math]::Max(1, $script:Width - $Lines[$li].Length - $Tag.Length)
+                Write-Host "$($Lines[$li])$pad" -NoNewline -ForegroundColor $DimCol
+                Write-Host $Tag -ForegroundColor $Color
+            } else {
+                Write-Host $Lines[$li] -ForegroundColor $DimCol
+            }
+        }
+        [void](Set-WursaCursor 0 $savedTop)
+    } else {
+        Write-Host "        $Tag" -ForegroundColor $Color
+    }
+}
+
+function Invoke-WursaWindowsUpdatePass {
+    # Regions 2 and 3: discovery, then one-at-a-time installation. Returns a result object.
+    $res = [pscustomobject]@{
+        Status = 'UpToDate'; Found = 0; Succeeded = 0; Failed = 0
+        RebootRequired = $false; Error = $null; Searcher = $null; FeatureOffered = $false
+    }
+    Write-StepUpdate "[3/5] Scanning for Drivers & OS Patches..."
+    # Detect a pending reboot, skip cleanly to the rest of the script, and let the caller
+    # decide when to reboot. Feature-upgrade check still runs.
+    if (Get-WursaRebootPending) {
+        Write-StepUpdate -Success -CustomInfo "(Deferred - Reboot Pending)"
+        Write-Host "[4/5] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
+        Write-SubResult "[DEFERRED]" $WarnCol
+        $res.Status = 'Deferred'
+        return $res
+    }
+    # Resume Windows Update if it is paused. While paused, WU returns nothing, so an
+    # update run would silently find zero updates and the feature upgrade is never
+    # offered. Clears the local "Pause updates" values (UX\Settings); leaves any
+    # policy-driven pause alone.
+    $_uxk = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+    if (Test-Path $_uxk) {
+        $_wasPaused = $false
+        foreach ($_pn in 'PauseUpdatesExpiryTime','PauseUpdatesStartTime','PauseFeatureUpdatesStartTime','PauseFeatureUpdatesEndTime','PauseQualityUpdatesStartTime','PauseQualityUpdatesEndTime') {
+            if ($null -ne (Get-ItemProperty -Path $_uxk -Name $_pn -ErrorAction SilentlyContinue)) {
+                Remove-ItemProperty -Path $_uxk -Name $_pn -ErrorAction SilentlyContinue
+                $_wasPaused = $true
+            }
+        }
+        if ($_wasPaused) { Write-Host "      [i] Windows Update was paused - resumed." -ForegroundColor $WarnCol }
+    }
+    # Direct API search to bypass the 'remoteIpNoProxy' crash
+    $UpdateSession = New-WursaUpdateSession
+    $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+    $res.Searcher = $UpdateSearcher
+    $UpdateList = $null
+    try {
+        # IsPresent=0 excludes updates that are already staged on disk and only pending
+        # a reboot to commit, so the same KBs are not re-staged on every run.
+        $s1 = $UpdateSearcher.Search("IsInstalled=0 and IsPresent=0 and Type='Software' and IsHidden=0").Updates
+        $s2 = $UpdateSearcher.Search("IsInstalled=0 and IsPresent=0 and Type='Driver' and IsHidden=0").Updates
+        $UpdateList = New-WursaUpdateColl
+        foreach ($u in $s1) {
+            # Do not install a feature update through the generic WU loop. A download or
+            # pre-download is not a completed upgrade. Region 5 handles the feature upgrade.
+            if ($u.Title -match [regex]::Escape($LatestVersion) -or $u.Title -match 'Feature update to Windows') {
+                $res.FeatureOffered = $true
+                continue
+            }
+            $UpdateList.Add($u) | Out-Null
+        }
+        foreach ($u in $s2) { $UpdateList.Add($u) | Out-Null }
+        if ($res.FeatureOffered) {
+            Write-Host "      [i] $LatestVersion detected; reserved for the upgrade path." -ForegroundColor $DimCol
+        }
+    } catch {
+        Write-StepUpdate -Success -CustomInfo "(Scan Error)"
+        Write-Host "      [!] WU search failed: $($_.Exception.Message)" -ForegroundColor Red
+        $UpdateList = $null
+    }
+    if (-not $UpdateList -or $UpdateList.Count -eq 0) {
+        Write-StepUpdate -Success -CustomInfo "(System Up to Date)"
+        Write-Host "[4/5] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
+        Write-SubResult "[SKIPPED]" $WarnCol
+        return $res
+    }
+    $res.Found = $UpdateList.Count
+    Write-StepUpdate -Success -CustomInfo "($($UpdateList.Count) Found)"
+    Write-StepUpdate "[4/5] Installing Windows Updates..."
+    foreach ($Update in $UpdateList) {
+        # Word-wrap the title at word boundaries so long names don't blow the
+        # cursor-reposition math. All lines use the same indent; the tag is appended
+        # to the last line only.
+        $_uPrefix = "      > Deploying: "
+        $_uIndent = " " * $_uPrefix.Length
+        $_uAvail  = $script:Width - "[SUCCESS]".Length - $_uPrefix.Length
+        $_uLines  = @()
+        $_rem     = $Update.Title
+        $_first   = $true
+        while ($_rem.Length -gt 0) {
+            $_pfx = if ($_first) { $_uPrefix } else { $_uIndent }
+            if ($_rem.Length -le $_uAvail) {
+                $_uLines += "$_pfx$_rem"
+                break
+            }
+            $_chunk = $_rem.Substring(0, $_uAvail)
+            $_split = $_chunk.LastIndexOf(' ')
+            if ($_split -le 0) { $_split = $_uAvail }   # no space found - hard break
+            $_uLines += "$_pfx$($_rem.Substring(0, $_split).TrimEnd())"
+            $_rem    = $_rem.Substring($_split).TrimStart()
+            $_first  = $false
+        }
+        $_uRow = Get-WursaCursorTop
+        foreach ($_line in $_uLines) { Write-Host $_line -ForegroundColor $InfoCol }
+        try {
+            $r = Install-WursaUpdate -Session $UpdateSession -Update $Update
+            if ($r.RebootRequired) { $res.RebootRequired = $true }
+            if ($r.Outcome -eq 'Failed') { $res.Failed++ } else { $res.Succeeded++ }
+            Write-WursaUpdateLines -Lines $_uLines -Row $_uRow -Tag $r.Tag -Color $r.Color
+        } catch {
+            $res.Failed++
+            Write-WursaUpdateLines -Lines $_uLines -Row $_uRow -Tag "[FAILED]" -Color "Red"
+        }
+    }
+    Write-Progress -Activity "W.U.R.S.A.: Deploying Updates" -Completed
+    Write-StepUpdate "[4/5] Windows Updates" -Success
+    $res.Status = 'Installed'
+    $res
+}
+#endregion
+
+#region Third-party software updates
+function Get-WursaThirdPartyCatalog {
+    # Install detection uses Chocolatey's own local package DB rather than probing
+    # filesystem paths. ChocoID may carry install args after the package id; the id
+    # itself is the first token.
+    @(
+        @{ Name = "Google Chrome";   ChocoID = "googlechrome --install-arguments='--system-level' --ignore-checksums"; Process = "chrome" },
+        @{ Name = "Microsoft Edge";  ChocoID = "microsoft-edge";  Process = "msedge" },
+        @{ Name = "Mozilla Firefox"; ChocoID = "firefox";         Process = "firefox" },
+        @{ Name = "Brave";           ChocoID = "brave";           Process = "brave" },
+        @{ Name = "Adobe Acrobat";   ChocoID = "adobereader";     Process = @("Acrobat","AcroRd32") },
+        @{ Name = "Zoom";            ChocoID = "zoom --install-arguments='/quiet /norestart'"; Process = "Zoom" },
+        @{ Name = "Microsoft Teams"; ChocoID = "microsoft-teams"; Process = @("Teams","ms-teams") },
+        @{ Name = "Webex";           ChocoID = "webex";           Process = "CiscoCollabHost" },
+        @{ Name = "Slack";           ChocoID = "slack";           Process = "slack" },
+        @{ Name = "RingCentral";     ChocoID = "ringcentral";     Process = "RingCentral" },
+        @{ Name = "Notepad++";       ChocoID = "notepadplusplus"; Process = "notepad++" },
+        @{ Name = "VLC";             ChocoID = "vlc";             Process = "vlc" },
+        @{ Name = "7-Zip";           ChocoID = "7zip";            Process = "7zFM" },
+        @{ Name = "KillerPDF";       ChocoID = "killerpdf";       Process = "KillerPDF" },
+        @{ Name = "KillerNotes";     ChocoID = "killernotes";     Process = "KillerNotes" },
+        @{ Name = "KillerScan";      ChocoID = "killerscan";      Process = "KillerScan" },
+        @{ Name = "KillerShell";     ChocoID = "killershell";     Process = "KillerShell" },
+        @{ Name = "Killendar";       ChocoID = "killendar";       Process = "Killendar" },
+        @{ Name = "KillerMCP";       ChocoID = "killermcp";       Process = @("KillerMCP", "KillerMCP.Configure", "KillerMCP.Notify") },
+        @{ Name = "KillerShot";      ChocoID = "killershot";      Process = @("KillerShot", "KillerShot.PrintScreen") },
+        @{ Name = "KillerBench";     ChocoID = "killerbench";     Process = "KillerBench" }
+    )
+}
+
+function Install-WursaChocolatey {
+    # Returns $true when choco is available afterwards.
+    try {
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        $ChocoInstallDir = "$env:ProgramData\chocolatey"
+        $ZipPath = "$env:TEMP\chocolatey.zip"
+        $ExtractPath = "$env:TEMP\chocoInstall"
+        Save-WursaFile -Uri "https://community.chocolatey.org/api/v2/package/chocolatey" -OutFile $ZipPath
+        # Extract using pure .NET - bypasses Microsoft.PowerShell.Archive entirely
+        # Clear any leftover extraction folder from a previous failed attempt
+        if (Test-Path $ExtractPath) { Remove-Item $ExtractPath -Recurse -Force }
+        Expand-WursaZip -ZipPath $ZipPath -Destination $ExtractPath
+        # Run the embedded install script directly
+        $ChocoInstallScript = Get-ChildItem "$ExtractPath" -Recurse -Filter "chocolateyInstall.ps1" | Select-Object -First 1
+        if ($ChocoInstallScript) {
+            $env:ChocolateyInstall = $ChocoInstallDir
+            Invoke-WursaScriptFile -Path $ChocoInstallScript.FullName
+        }
+        # Refresh PATH
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        if (Get-Command choco -ErrorAction SilentlyContinue) {
+            Write-Host "      Chocolatey installed successfully." -ForegroundColor Green
+            return $true
+        }
+        Write-Host "      [!] Chocolatey install failed - skipping third-party updates." -ForegroundColor Red
+    } catch {
+        Write-Host "      [!] Chocolatey install failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    return $false
+}
+
+function Get-WursaChocoLocalInventory {
+    # Local package ids installed through Chocolatey, as a hashtable of lowercase ids.
+    $inv = @{}
+    try {
+        $r = Invoke-WursaChoco -Arguments @('list', '--limit-output')
+        foreach ($line in $r.Output) {
+            if ($line -match '^([^|]+)\|') { $inv[$Matches[1].ToLower()] = $true }
+        }
+    } catch {}
+    $inv
+}
+
+function Invoke-WursaThirdPartyUpdate {
+    # Region 4. Gated behind a Y/N prompt. -No3rdParty skips outright, -Update3rdParty and
+    # -InplaceUpgrade auto-confirm (unattended/RMM), and a non-interactive console defaults to skip.
+    param([bool]$Skip, [bool]$AutoConfirm, [string]$AutoFlag)
+    $res = [pscustomobject]@{ Status = 'Skipped'; Succeeded = 0; Failed = 0; RebootRequired = $false }
+    $ThirdParty = Get-WursaThirdPartyCatalog
+    $run3rdParty = $false
+    if ($Skip) {
+        Write-Host "[i] Third-party updates skipped (-No3rdParty)." -ForegroundColor $DimCol
+    } elseif ($AutoConfirm) {
+        Write-Host "      [$AutoFlag] Auto-confirming third-party updates." -ForegroundColor $DimCol
+        $run3rdParty = $true
+    } else {
+        try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
+        try {
+            Write-Host "Would you like to update installed third-party software via Chocolatey? (Y/N): " -NoNewline -ForegroundColor $WarnCol
+            $key    = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $choice = $key.Character
+            if ($choice -ne "`n" -and $choice -ne "`r") { Write-Host $choice -NoNewline }
+            Write-Host ""
+            if ($choice -in @('Y','y')) { $run3rdParty = $true }
+        } catch {
+            Write-Host "      [i] Non-interactive - defaulting to NO. Use -Update3rdParty for unattended runs." -ForegroundColor $DimCol
+        }
+    }
+    if (-not $run3rdParty) {
+        if (-not $Skip) { $res.Status = 'Declined' }
+        return $res
+    }
+
+    # Chocolatey install-if-missing runs only after the user (or a switch) has said
+    # yes, so a decline is never paid for with a Chocolatey install.
+    $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
+    if (-not $ChocoAvailable) {
+        Write-Host "`n[!] Chocolatey not found - Installing..." -ForegroundColor Yellow
+        $null = Install-WursaChocolatey
+        $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
+    }
+    if (-not $ChocoAvailable) { $res.Status = 'ChocoUnavailable'; return $res }
+
+    Write-StepUpdate "[5/5] Updating Installed Third-Party Software..."
+    # Update Chocolatey itself first
+    Write-Host "      > " -NoNewline -ForegroundColor $DimCol
+    Write-Host "Chocolatey: " -NoNewline -ForegroundColor $DimCol
+    $self = Invoke-WursaChoco -Arguments @('upgrade', 'chocolatey', '-y', '--no-progress')
+    $chocoSelfMatch = $self.Output | Select-String -Pattern 'upgraded (\d+)/'
+    if ($chocoSelfMatch -and [int]$chocoSelfMatch.Matches[0].Groups[1].Value -gt 0) {
+        Write-SubResult "[UPDATED]" Green
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    } else {
+        Write-SubResult "[ALREADY UPDATED]" Cyan
+    }
+    # Cache Chocolatey's local package list once. One shell-out per run beats one per app.
+    $ChocoLocal = Get-WursaChocoLocalInventory
+    # Cache Add/Remove Programs display names once. If an app is installed outside
+    # Chocolatey (MSI, the app's own installer) we still want to upgrade it - the
+    # per-app installer's own /silent handler is idempotent, so choco upgrade will
+    # refresh the existing install in place rather than orphan it.
+    $ArpNames = New-Object System.Collections.Generic.List[string]
+    foreach ($_arpRoot in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )) {
+        try {
+            Get-ItemProperty $_arpRoot -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName } |
+                ForEach-Object { $ArpNames.Add($_.DisplayName) }
+        } catch {}
+    }
+    foreach ($App in $ThirdParty) {
+        # The choco package id is the first whitespace-separated token in ChocoID;
+        # anything after is install/upgrade arguments passed straight to choco.
+        $_pkgId = ($App.ChocoID -split '\s+', 2)[0].ToLower()
+        $_procs = @($App.Process)
+
+        Write-Host "      > " -NoNewline -ForegroundColor Gray
+        Write-Host "$($App.Name): " -NoNewline -ForegroundColor White
+
+        # Two ways an app counts as installed on this box: Chocolatey knows about
+        # it OR Add/Remove Programs shows it. Either one is enough to run choco
+        # upgrade. Nothing in either list means the app is not on this machine and we
+        # do not install it fresh.
+        $_inChoco = $ChocoLocal.ContainsKey($_pkgId)
+        $_inArp   = ($ArpNames | Where-Object { $_ -like "*$($App.Name)*" } | Select-Object -First 1) -ne $null
+        if (-not $_inChoco -and -not $_inArp) {
+            Write-SubResult "[NOT INSTALLED]" DarkGray
+            continue
+        }
+        $IsRunning = $_procs | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+        if ($IsRunning) {
+            Write-SubResult "[IN USE - SKIPPED]" Yellow
+            continue
+        }
+        $up = Invoke-WursaChoco -Arguments @('upgrade', $App.ChocoID, '-y', '--no-progress')
+        if ($App.Name -eq "Google Chrome") {
+            $GUpdate = "C:\Program Files (x86)\Google\Update\GoogleUpdate.exe"
+            if (Test-Path $GUpdate) {
+                $null = Invoke-WursaNative -FilePath $GUpdate -Arguments @('/ua', '/installsource', 'scheduler')
+            }
+        }
+        $upgradeMatch = $up.Output | Select-String -Pattern 'upgraded (\d+)/'
+        $upgradeCount = if ($upgradeMatch) { [int]$upgradeMatch.Matches[0].Groups[1].Value } else { 0 }
+        if ($upgradeCount -gt 0) {
+            Write-SubResult "[UPDATED]" Green
+        } elseif (-not $_inChoco -and $_inArp) {
+            Write-SubResult "[ADOPTED]" Green
+        } else {
+            Write-SubResult "[ALREADY UPDATED]" Cyan
+        }
+    }
+    Write-StepUpdate "[5/5] Third-Party Updates" -Success
+    $res.Status = 'Done'
+    $res
+}
+#endregion
+
+#region Feature upgrade helpers
+function Restore-WUUpgradeOverrides {
+    # Runs in the MAIN script (not the detached runner), when the box is found already
+    # on the latest build. Undoes Set-WUUpgradeOverrides: each value is put back exactly,
+    # or removed if it did not exist before. The runner only ever sets the overrides;
+    # the main script is what restores them.
+    if (-not (Test-Path $IPU_AURestoreFile)) { return }
+    $polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auk  = "$polk\AU"
+    $map  = @{}
+    foreach ($line in (Get-Content $IPU_AURestoreFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^([^=]+)=(.+)$') { $map[$matches[1]] = $matches[2] }
+    }
+    $targets = @{ NoAutoUpdate = $auk; AUOptions = $auk; SetActiveHours = $polk; ActiveHoursStart = $polk; ActiveHoursEnd = $polk; ProductVersion = $polk; TargetReleaseVersion = $polk; TargetReleaseVersionInfo = $polk }
+    foreach ($name in @($targets.Keys)) {
+        $key = $targets[$name]; $orig = $map[$name]
+        # The release pin is restored only when it was recorded (it is set only on a Windows Update handoff).
+        if ($null -eq $orig -and $name -match '^(ProductVersion|TargetReleaseVersion)') { continue }
+        if ($null -eq $orig -or $orig -eq 'ABSENT') { Remove-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue }
+        elseif ($name -in @('ProductVersion','TargetReleaseVersionInfo')) { Set-ItemProperty -Path $key -Name $name -Value $orig -Type String -Force }
+        else { Set-ItemProperty -Path $key -Name $name -Value ([int]$orig) -Type DWord -Force }
+    }
+    Remove-Item $IPU_AURestoreFile -Force -ErrorAction SilentlyContinue
+    Write-Host "      Restored original Windows Update policy values (auto-update, active hours and release pin)." -ForegroundColor $DimCol
+}
+
+function Test-WUFeatureUpdateStaged {
+    # Only a feature update that Windows reports as reboot-required is considered staged.
+    # Offered, downloading, and pre-downloaded updates do not suppress the deterministic
+    # Region 5 upgrade path. This prevents WURSA from declaring a handoff while the box
+    # remains on the old feature release.
+    param($Searcher)
+    try {
+        $_res = $Searcher.Search("RebootRequired=1").Updates
+        foreach ($_u in $_res) {
+            if ($_u.Title -match [regex]::Escape($LatestVersion) -or $_u.Title -match 'Feature update to Windows') { return $true }
+        }
+    } catch {}
+    return $false
+}
+
+function Get-WursaVerifierScript {
+    # Builds a one-shot post-reboot verifier. It runs as SYSTEM at startup, waits
+    # for normal boot to settle, verifies DisplayVersion, and restores the temporary
+    # Windows Update policy overrides only after the target release is actually committed.
+    param([string]$StatusFile, [string]$RestoreFile, [string]$VerifyTaskName, [int]$TargetBuild)
+    @"
+`$ErrorActionPreference = 'SilentlyContinue'
+Start-Sleep -Seconds 180
+`$cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+`$ver = `$cv.DisplayVersion
+`$build = `$cv.CurrentBuild
+`$ubr = `$cv.UBR
+`$stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+if ([int]`$build -ge $TargetBuild) {
+    "VERIFIED `$ver `$build.`$ubr `$stamp" | Out-File -FilePath '$StatusFile' -Encoding ASCII -Force
+    if (Test-Path '$RestoreFile') {
+        `$polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+        `$auk  = "`$polk\AU"
+        `$map  = @{}
+        foreach (`$line in (Get-Content '$RestoreFile' -ErrorAction SilentlyContinue)) {
+            if (`$line -match '^([^=]+)=(.+)$') { `$map[`$matches[1]] = `$matches[2] }
+        }
+        `$targets = @{ NoAutoUpdate = `$auk; AUOptions = `$auk; SetActiveHours = `$polk; ActiveHoursStart = `$polk; ActiveHoursEnd = `$polk; ProductVersion = `$polk; TargetReleaseVersion = `$polk; TargetReleaseVersionInfo = `$polk }
+        foreach (`$name in @(`$targets.Keys)) {
+            `$key = `$targets[`$name]; `$orig = `$map[`$name]
+            if (`$null -eq `$orig -and `$name -match '^(ProductVersion|TargetReleaseVersion)') { continue }
+            if (`$null -eq `$orig -or `$orig -eq 'ABSENT') { Remove-ItemProperty -Path `$key -Name `$name -ErrorAction SilentlyContinue }
+            elseif (`$name -in @('ProductVersion','TargetReleaseVersionInfo')) { Set-ItemProperty -Path `$key -Name `$name -Value `$orig -Type String -Force }
+            else { Set-ItemProperty -Path `$key -Name `$name -Value ([int]`$orig) -Type DWord -Force }
+        }
+        Remove-Item '$RestoreFile' -Force -ErrorAction SilentlyContinue
+    }
+    schtasks.exe /Delete /TN '$VerifyTaskName' /F | Out-Null
+    exit 0
+}
+`$setupActive = Test-Path 'HKLM:\SYSTEM\Setup\MoSetup\Volatile'
+if (`$setupActive) {
+    "VERIFY_PENDING VERSION_`$ver BUILD_`$build.`$ubr `$stamp" | Out-File -FilePath '$StatusFile' -Encoding ASCII -Force
+    exit 0
+}
+"FAILED_POSTREBOOT VERSION_`$ver BUILD_`$build.`$ubr `$stamp" | Out-File -FilePath '$StatusFile' -Encoding ASCII -Force
+schtasks.exe /Delete /TN '$VerifyTaskName' /F | Out-Null
+exit 1
+"@
+}
+
+function Test-WursaOnBattery {
+    $OnBattery = $false
+    try {
+        $Battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+        if ($Battery -and $Battery.BatteryStatus -ne 2) { $OnBattery = $true }
+    } catch {}
+    $OnBattery
+}
+#endregion
+
+#region Final status
+function Resolve-WursaFinalStatus {
+    # Maps the run state to the exit code and the status lines. The text always agrees with the code.
+    param(
+        [bool]$NoUpgrade, [int]$FinalBuild, [string]$FinalVersion, [string]$FeatureUpgradeState,
+        [string]$IpuState, [bool]$RebootPending
+    )
+    $lines = New-Object System.Collections.ArrayList
+    $code = 0
+    $add = { param($t, $c) [void]$lines.Add(@{ Text = $t; Color = $c }) }
+    if (-not $NoUpgrade -and $FinalBuild -ge $LatestBuild) {
+        & $add "STATUS: SYSTEM CURRENT ($FinalVersion)" $OkCol
+        $code = 0
+    } elseif ($NoUpgrade) {
+        if ($RebootPending) {
+            & $add "[!] STATUS: REBOOT REQUIRED" "Red"
+            $code = 3010
+        } else {
+            & $add "STATUS: UPDATE PASS COMPLETE" $OkCol
+            $code = 0
+        }
+    } elseif ($FeatureUpgradeState -eq "REBOOT_REQUIRED") {
+        & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
+        $code = 3010
+    } elseif ($FeatureUpgradeState -match '^(FAILED|BLOCKED|NOT_STARTED)') {
+        & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
+        & $add "      Upgrade state: $FeatureUpgradeState" $WarnCol
+        $code = 1
+    } elseif ($FeatureUpgradeState -eq "DISPATCHED") {
+        if ($IpuState -match '^REBOOT_REQUIRED') {
+            & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
+            & $add "      Upgrade state: $IpuState" $DimCol
+            $code = 3010
+        } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
+            & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
+            & $add "      Upgrade state: $IpuState" $WarnCol
+            $code = 1
+        } else {
+            & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
+            if ($IpuState) { & $add "      Upgrade state: $IpuState" $DimCol }
+            $code = 0
+        }
+    } elseif ($IpuState -match '^REBOOT_REQUIRED') {
+        & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
+        & $add "      Upgrade state: $IpuState" $DimCol
+        $code = 3010
+    } elseif ($IpuState -match '^(DISPATCHED|RUNNING|DOWNLOADING|REPAIRING|VERIFY_PENDING|WU_HANDOFF)') {
+        & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
+        & $add "      Upgrade state: $IpuState" $DimCol
+        $code = 0
+    } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
+        & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
+        & $add "      Upgrade state: $IpuState" $WarnCol
+        $code = 1
+    } else {
+        & $add "[!] STATUS: FEATURE UPGRADE NOT COMPLETE (still $FinalVersion)" "Red"
+        $code = 1
+    }
+    [pscustomobject]@{ Code = $code; Lines = @($lines) }
+}
+#endregion
+
+function Invoke-WursaMain {
+# The body below is deliberately not indented: it keeps the diff small and keeps the
+# here-string terminators in the generated scripts at column 0.
+trap {
+    if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw $_ }
+    Write-Host "[!] Fatal: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "[!] STATUS: FAILED" -ForegroundColor Red
+    Exit-KillerScript 1
+}
+$script:ExitCode = 0
+$script:StepRow  = -1
+$script:StepMsg  = ""
+$script:StepOpen = $false
+# Feature-upgrade state is tracked separately from ordinary Windows Update.
+# A surfaced/downloaded feature update is NOT considered staged. Region 5 owns
+# the deterministic feature upgrade path unless Windows reports a real reboot-ready
+# feature update.
+$script:FeatureUpdateStaged = $false
+$script:FeatureUpgradeState = "UNKNOWN"
+$ProgressPreference = 'SilentlyContinue'   # suppress console-wide progress overlays (VSS/BITS/Invoke-WebRequest)
+
+#region 0 - Pre-Flight
+if (-not (Test-WursaElevated)) {
+    Write-Warning "Elevation Required: Please run as Administrator."
+    Write-Host "[!] STATUS: NOT ELEVATED (run as Administrator)" -ForegroundColor Red
+    Exit-KillerScript 2
+}
+# 1. Force session bypass to clear environment hurdles
+try { Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force -ErrorAction Stop } catch {}
+# 2. Re-register core paths to bypass the LiveConnect temp-path bug
+$env:PSModulePath = [Environment]::GetEnvironmentVariable("PSModulePath","Machine") + ";" + [Environment]::GetEnvironmentVariable("PSModulePath","User")
+
+# Baseline Data for UI
+$OS = Get-CimInstance Win32_OperatingSystem
+try { Clear-Host } catch {}
 
 # Header
 $_pfx  = "█  "
@@ -162,50 +817,21 @@ Write-HLine -Style dashed
 #region 0.5 - System Restore Point
 # ============================================================================
 Write-StepUpdate "[1/5] Creating System Restore Point..."
-# Bypass the 24-hour cooldown Windows enforces between restore points
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "SystemRestorePointCreationFrequency" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
-# The checkpoint calls into VSS/SrClient, which can stall or hard-fault the host
-# process under RMM and take the whole run down before try/catch can fire. Run it
-# in a timeboxed child job so a VSS hang can't kill WURSA; treat it as non-fatal.
-$_rpTimeout = 90
-$_rpDesc    = "WURSA Pre-Update $($env:COMPUTERNAME) $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-$_rpJob = Start-Job -ScriptBlock {
-    param($Desc)
-    try {
-        $ProgressPreference = 'SilentlyContinue'
-        # Ensure System Protection is enabled on C: (often disabled on managed endpoints)
-        Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue *>$null
-        # Call the SystemRestore WMI method directly. Checkpoint-Computer wraps the
-        # same call but also emits a native progress bar that ignores $ProgressPreference
-        # (it comes from SrClient/VSS, not Write-Progress) and paints past the shell
-        # width. The WMI call is silent. 12 = MODIFY_SETTINGS, 100 = BEGIN_SYSTEM_CHANGE.
-        $sr = [wmiclass]"\\.\root\default:SystemRestore"
-        $r  = $sr.CreateRestorePoint($Desc, 12, 100)
-        if ($r.ReturnValue -eq 0) { "OK" } else { "ERR: CreateRestorePoint returned $($r.ReturnValue)" }
-    } catch {
-        "ERR: $($_.Exception.Message)"
-    }
-} -ArgumentList $_rpDesc
-if (Wait-Job -Job $_rpJob -Timeout $_rpTimeout) {
-    $_rpResult = Receive-Job -Job $_rpJob
-    if ($_rpResult -match '^OK') {
-        Write-StepUpdate -Success
-    } else {
-        Write-Host "      [!] Restore point failed: $($_rpResult -replace '^ERR: ','')" -ForegroundColor $WarnCol
-    }
+$_rp = Invoke-WursaRestorePoint -TimeoutSeconds 90
+if ($_rp.Result -eq 'OK') {
+    Write-StepUpdate -Success
+} elseif ($_rp.Result -eq 'TIMEOUT') {
+    Write-Host "      [!] Restore point $($_rp.Message); continuing." -ForegroundColor $WarnCol
 } else {
-    Write-Host "      [!] Restore point timed out after ${_rpTimeout}s (VSS stalled); continuing." -ForegroundColor $WarnCol
-    Stop-Job -Job $_rpJob -ErrorAction SilentlyContinue
+    Write-Host "      [!] Restore point failed: $($_rp.Message)" -ForegroundColor $WarnCol
 }
-Remove-Job -Job $_rpJob -Force -ErrorAction SilentlyContinue
 #endregion
 
 #region 1 - Service Registration
 # ============================================================================
 Write-StepUpdate "[2/5] Opting-in to Microsoft Product Updates..."
 try {
-    $ServiceManager = New-Object -ComObject Microsoft.Update.ServiceManager
-    $ServiceManager.AddService2("7971f918-a847-4430-9279-4a52d1efe18d", 7, "") | Out-Null
+    Register-WursaProductService
     Write-StepUpdate -Success
     Start-Sleep -Seconds 3
 } catch {
@@ -261,361 +887,16 @@ if (-not $NoUpgrade -and $WinBuild -lt $LatestBuild) {
 }
 #endregion
 
-#region 2 - Discovery
+#region 2 and 3 - Windows Update discovery and installation
 # ============================================================================
-Write-StepUpdate "[3/5] Scanning for Drivers & OS Patches..."
-# A pending reboot from prior updates means Windows won't commit any further
-# updates until the boot happens. Attempting install on a pending-reboot box
-# either returns WU_E_UH_POSTREBOOTREQUIRED (0x80242014) again or leaves an
-# already-staged KB re-staged - which is why the same KB reappeared on every run.
-# Detect it, skip cleanly to the rest of the script, and let the caller decide
-# when to reboot. Feature-upgrade check still runs.
-$_rebootPending = $false
-foreach ($_rp in @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting'
-)) { if (Test-Path $_rp) { $_rebootPending = $true; break } }
-if (-not $_rebootPending) {
-    $_pfro = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
-    if ($_pfro -and $_pfro.PendingFileRenameOperations) { $_rebootPending = $true }
-}
-if ($_rebootPending) {
-    Write-StepUpdate -Success -CustomInfo "(Deferred - Reboot Pending)"
-    Write-Host "[4/5] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
-    Write-SubResult "[DEFERRED]" $WarnCol
-} else {
-# Resume Windows Update if it is paused. While paused, WU returns nothing, so an
-# update run would silently find zero updates and the feature upgrade is never
-# offered. Clears the local "Pause updates" values (UX\Settings); leaves any
-# policy-driven pause alone.
-$_uxk = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
-if (Test-Path $_uxk) {
-    $_wasPaused = $false
-    foreach ($_pn in 'PauseUpdatesExpiryTime','PauseUpdatesStartTime','PauseFeatureUpdatesStartTime','PauseFeatureUpdatesEndTime','PauseQualityUpdatesStartTime','PauseQualityUpdatesEndTime') {
-        if ($null -ne (Get-ItemProperty -Path $_uxk -Name $_pn -ErrorAction SilentlyContinue)) {
-            Remove-ItemProperty -Path $_uxk -Name $_pn -ErrorAction SilentlyContinue
-            $_wasPaused = $true
-        }
-    }
-    if ($_wasPaused) { Write-Host "      [i] Windows Update was paused - resumed." -ForegroundColor $WarnCol }
-}
-# Direct API search to bypass the 'remoteIpNoProxy' crash
-$UpdateSession = New-Object -ComObject Microsoft.Update.Session
-$UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-try {
-    # IsPresent=0 excludes updates that are already staged on disk and only pending
-    # a reboot to commit. Without it, IsInstalled=0 alone returns the SAME KBs on
-    # every run until reboot, causing WURSA to re-download and re-stage the same
-    # payload three or more times in a row.
-    $s1 = $UpdateSearcher.Search("IsInstalled=0 and IsPresent=0 and Type='Software' and IsHidden=0").Updates
-    $s2 = $UpdateSearcher.Search("IsInstalled=0 and IsPresent=0 and Type='Driver' and IsHidden=0").Updates
-    $UpdateList = New-Object -ComObject Microsoft.Update.UpdateColl
-    $script:FeatureUpdateOffered = $false
-    foreach ($u in $s1) {
-        # Do not install a feature update through the generic WU loop. A download or
-        # pre-download is not a completed upgrade and used to cause false WU_HANDOFF
-        # success. Region 5 handles the feature upgrade with a deterministic mechanism.
-        if ($u.Title -match [regex]::Escape($LatestVersion) -or $u.Title -match 'Feature update to Windows') {
-            $script:FeatureUpdateOffered = $true
-            continue
-        }
-        $UpdateList.Add($u) | Out-Null
-    }
-    foreach ($u in $s2) { $UpdateList.Add($u) | Out-Null }
-    if ($script:FeatureUpdateOffered) {
-        Write-Host "      [i] $LatestVersion detected; reserved for the upgrade path." -ForegroundColor $DimCol
-    }
-} catch {
-    Write-StepUpdate -Success -CustomInfo "(Scan Error)"
-    Write-Host "      [!] WU search failed: $($_.Exception.Message)" -ForegroundColor Red
-    $UpdateList = $null
-}
-if (-not $UpdateList -or $UpdateList.Count -eq 0) {
-    Write-StepUpdate -Success -CustomInfo "(System Up to Date)"
-    Write-Host "[4/5] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
-    Write-SubResult "[SKIPPED]" $WarnCol
-} else {
-    Write-StepUpdate -Success -CustomInfo "($($UpdateList.Count) Found)"
-#endregion
-
-#region 3 - Installation & Progress
-# ========================================================================
-    $ProgressPreference = 'SilentlyContinue'
-    Write-StepUpdate "[4/5] Installing Windows Updates..."
-    $Counter = 0
-    foreach ($Update in $UpdateList) {
-        $Counter++
-
-        # Word-wrap the title at word boundaries so long names don't blow the
-        # cursor-reposition math. All lines use the same indent; [SUCCESS]/[FAILED]
-        # is appended to the last line only.
-        $_uPrefix = "      > Deploying: "
-        $_uIndent = " " * $_uPrefix.Length
-        $_uAvail  = $script:Width - "[SUCCESS]".Length - $_uPrefix.Length
-        $_uLines  = @()
-        $_rem     = $Update.Title
-        $_first   = $true
-        while ($_rem.Length -gt 0) {
-            $_pfx = if ($_first) { $_uPrefix } else { $_uIndent }
-            if ($_rem.Length -le $_uAvail) {
-                $_uLines += "$_pfx$_rem"
-                break
-            }
-            $_chunk = $_rem.Substring(0, $_uAvail)
-            $_split = $_chunk.LastIndexOf(' ')
-            if ($_split -le 0) { $_split = $_uAvail }   # no space found - hard break
-            $_uLines += "$_pfx$($_rem.Substring(0, $_split).TrimEnd())"
-            $_rem    = $_rem.Substring($_split).TrimStart()
-            $_first  = $false
-        }
-
-        $_uRow = [Console]::CursorTop
-        foreach ($_line in $_uLines) { Write-Host $_line -ForegroundColor $InfoCol }
-
-        try {
-            # Bypassing Install-WindowsUpdate to clear path errors
-            $UpdatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
-            $UpdatesToInstall.Add($Update) | Out-Null
-            $Downloader = $UpdateSession.CreateUpdateDownloader()
-            $Downloader.Updates = $UpdatesToInstall
-            $null = $Downloader.Download()
-            $Installer = $UpdateSession.CreateUpdateInstaller()
-            $Installer.Updates = $UpdatesToInstall
-            $Installer.AllowSourcePrompts = $false
-            $InstallResult = $Installer.Install()
-            # IUpdateInstaller.Install always returns; success is decided by ResultCode
-            # (2=Succeeded, 3=SucceededWithErrors) and HResult (0=clean; 0x80242014 =
-            # WU_E_UH_POSTREBOOTREQUIRED, install genuinely pending a boot). Previous
-            # code wrote [SUCCESS] for any non-throwing call, hiding failures and
-            # letting the same KB re-install every WURSA run.
-            $_rc = $InstallResult.ResultCode
-            $_hr = $InstallResult.HResult
-            if ($_rc -eq 2 -and $_hr -eq 0) {
-                $_tag = "[SUCCESS]"; $_col = $OkCol
-                if ($InstallResult.RebootRequired) { $_tag = "[REBOOT REQ]"; $_col = $WarnCol; $script:_rebootRequired = $true }
-            } elseif ($_hr -eq -2145116140 -or $_hr -eq 0x80242014) {   # WU_E_UH_POSTREBOOTREQUIRED
-                $_tag = "[REBOOT REQ]"; $_col = $WarnCol
-                $script:_rebootRequired = $true
-            } elseif ($_rc -eq 3) {
-                $_tag = "[SUCCESS*]"; $_col = $WarnCol   # succeeded with errors
-            } else {
-                $_tag = "[FAILED 0x$('{0:X8}' -f $_hr)]"; $_col = "Red"
-            }
-            $_savedTop = [Console]::CursorTop
-            [Console]::SetCursorPosition(0, $_uRow)
-            for ($_li = 0; $_li -lt $_uLines.Count; $_li++) {
-                if ($_li -eq $_uLines.Count - 1) {
-                    $_pad = " " * [math]::Max(1, $script:Width - $_uLines[$_li].Length - $_tag.Length)
-                    Write-Host "$($_uLines[$_li])$_pad" -NoNewline -ForegroundColor $DimCol
-                    Write-Host $_tag -ForegroundColor $_col
-                } else {
-                    Write-Host $_uLines[$_li] -ForegroundColor $DimCol
-                }
-            }
-            [Console]::SetCursorPosition(0, $_savedTop)
-        } catch {
-            $_savedTop = [Console]::CursorTop
-            [Console]::SetCursorPosition(0, $_uRow)
-            for ($_li = 0; $_li -lt $_uLines.Count; $_li++) {
-                if ($_li -eq $_uLines.Count - 1) {
-                    $_pad = " " * [math]::Max(1, $script:Width - $_uLines[$_li].Length - "[FAILED]".Length)
-                    Write-Host "$($_uLines[$_li])$_pad" -NoNewline -ForegroundColor $DimCol
-                    Write-Host "[FAILED]" -ForegroundColor Red
-                } else {
-                    Write-Host $_uLines[$_li] -ForegroundColor $DimCol
-                }
-            }
-            [Console]::SetCursorPosition(0, $_savedTop)
-        }
-    }
-    Write-Progress -Activity "W.U.R.S.A.: Deploying Updates" -Completed
-    Write-StepUpdate "[4/5] Windows Updates" -Success
-}
-}   # end reboot-pending else
+$passRes = Invoke-WursaWindowsUpdatePass
+$UpdateSearcher = $passRes.Searcher
 #endregion
 
 #region 4 - Third-Party Software Updates
 # ============================================================================
-# Install detection uses Chocolatey's own local package DB rather than probing
-# filesystem paths. A package known to Chocolatey is a package it can upgrade,
-# whatever install shape the package uses (Program Files, LOCALAPPDATA, portable
-# under $env:ProgramData\chocolatey\lib\<id>\tools). ChocoID may carry install
-# args after the package id; the id itself is the first token.
-$ThirdParty = @(
-    @{ Name = "Google Chrome";   ChocoID = "googlechrome --install-arguments='--system-level' --ignore-checksums"; Process = "chrome" },
-    @{ Name = "Microsoft Edge";  ChocoID = "microsoft-edge";  Process = "msedge" },
-    @{ Name = "Mozilla Firefox"; ChocoID = "firefox";         Process = "firefox" },
-    @{ Name = "Brave";           ChocoID = "brave";           Process = "brave" },
-    @{ Name = "Adobe Acrobat";   ChocoID = "adobereader";     Process = @("Acrobat","AcroRd32") },
-    @{ Name = "Zoom";            ChocoID = "zoom --install-arguments='/quiet /norestart'"; Process = "Zoom" },
-    @{ Name = "Microsoft Teams"; ChocoID = "microsoft-teams"; Process = @("Teams","ms-teams") },
-    @{ Name = "Webex";           ChocoID = "webex";           Process = "CiscoCollabHost" },
-    @{ Name = "Slack";           ChocoID = "slack";           Process = "slack" },
-    @{ Name = "RingCentral";     ChocoID = "ringcentral";     Process = "RingCentral" },
-    @{ Name = "Notepad++";       ChocoID = "notepadplusplus"; Process = "notepad++" },
-    @{ Name = "VLC";             ChocoID = "vlc";             Process = "vlc" },
-    @{ Name = "7-Zip";           ChocoID = "7zip";            Process = "7zFM" },
-    @{ Name = "KillerPDF";       ChocoID = "killerpdf";       Process = "KillerPDF" },
-    @{ Name = "KillerNotes";     ChocoID = "killernotes";     Process = "KillerNotes" },
-    @{ Name = "KillerScan";      ChocoID = "killerscan";      Process = "KillerScan" },
-    @{ Name = "KillerShell";     ChocoID = "killershell";     Process = "KillerShell" },
-    @{ Name = "Killendar";       ChocoID = "killendar";       Process = "Killendar" },
-    @{ Name = "KillerMCP";       ChocoID = "killermcp";       Process = @("KillerMCP", "KillerMCP.Configure", "KillerMCP.Notify") },
-    @{ Name = "KillerShot";      ChocoID = "killershot";      Process = @("KillerShot", "KillerShot.PrintScreen") },
-    @{ Name = "KillerBench";     ChocoID = "killerbench";     Process = "KillerBench" }
-)
-
-# Gate the section behind a Y/N prompt. -No3rdParty skips outright,
-# -Update3rdParty and -InplaceUpgrade auto-confirm (unattended/RMM), and a
-# non-interactive console defaults to skip - same shape as the feature-upgrade
-# prompt in region 5.
-$run3rdParty = $false
-if ($No3rdParty) {
-    Write-Host "[i] Third-party updates skipped (-No3rdParty)." -ForegroundColor $DimCol
-} elseif ($Update3rdParty -or $InplaceUpgrade) {
-    $flag = if ($Update3rdParty) { "-Update3rdParty" } else { "-InplaceUpgrade" }
-    Write-Host "      [$flag] Auto-confirming third-party updates." -ForegroundColor $DimCol
-    $run3rdParty = $true
-} else {
-    try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
-    try {
-        Write-Host "Would you like to update installed third-party software via Chocolatey? (Y/N): " -NoNewline -ForegroundColor $WarnCol
-        $key    = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-        $choice = $key.Character
-        if ($choice -ne "`n" -and $choice -ne "`r") { Write-Host $choice -NoNewline }
-        Write-Host ""
-        if ($choice -in @('Y','y')) { $run3rdParty = $true }
-    } catch {
-        Write-Host "      [i] Non-interactive - defaulting to NO. Use -Update3rdParty for unattended runs." -ForegroundColor $DimCol
-    }
-}
-
-# Chocolatey install-if-missing runs only after the user (or a switch) has said
-# yes, so a decline is never paid for with a Chocolatey install.
-$ChocoAvailable = $null
-if ($run3rdParty) {
-    $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
-    if (-not $ChocoAvailable) {
-        Write-Host "`n[!] Chocolatey not found - Installing..." -ForegroundColor Yellow
-        try {
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-            $ChocoInstallDir = "$env:ProgramData\chocolatey"
-            $ZipPath = "$env:TEMP\chocolatey.zip"
-            $ExtractPath = "$env:TEMP\chocoInstall"
-            # Download the zip directly
-            (New-Object System.Net.WebClient).DownloadFile(
-                "https://community.chocolatey.org/api/v2/package/chocolatey",
-                $ZipPath
-            )
-            # Extract using pure .NET - bypasses Microsoft.PowerShell.Archive entirely
-            # Clear any leftover extraction folder from a previous failed attempt
-            if (Test-Path $ExtractPath) { Remove-Item $ExtractPath -Recurse -Force }
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractPath)
-            # Run the embedded install script directly
-            $ChocoInstallScript = Get-ChildItem "$ExtractPath" -Recurse -Filter "chocolateyInstall.ps1" | Select-Object -First 1
-            if ($ChocoInstallScript) {
-                $env:ChocolateyInstall = $ChocoInstallDir
-                & $ChocoInstallScript.FullName *>&1 | Out-Null
-            }
-            # Refresh PATH
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-            $ChocoAvailable = Get-Command choco -ErrorAction SilentlyContinue
-            if ($ChocoAvailable) {
-                Write-Host "      Chocolatey installed successfully." -ForegroundColor Green
-            } else {
-                Write-Host "      [!] Chocolatey install failed - skipping third-party updates." -ForegroundColor Red
-            }
-        } catch {
-            Write-Host "      [!] Chocolatey install failed: $($_.Exception.Message)" -ForegroundColor Red
-        }
-    }
-}
-
-if ($run3rdParty -and $ChocoAvailable) {
-    Write-StepUpdate "[5/5] Updating Installed Third-Party Software..."
-    # Update Chocolatey itself first
-    Write-Host "      > " -NoNewline -ForegroundColor $DimCol
-    Write-Host "Chocolatey: " -NoNewline -ForegroundColor $DimCol
-    $chocoSelfOut = choco upgrade chocolatey -y --no-progress 2>&1
-    $chocoSelfMatch = $chocoSelfOut | Select-String -Pattern 'upgraded (\d+)/'
-    if ($chocoSelfMatch -and [int]$chocoSelfMatch.Matches[0].Groups[1].Value -gt 0) {
-        Write-SubResult "[UPDATED]" Green
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-    } else {
-        Write-SubResult "[ALREADY UPDATED]" Cyan
-    }
-    # Cache Chocolatey's local package list once. One shell-out per run beats one
-    # per app, and the emitted format id|version is stable across choco v1 and v2.
-    $ChocoLocal = @{}
-    try {
-        $localList = choco list --limit-output 2>&1
-        foreach ($line in $localList) {
-            if ($line -match '^([^|]+)\|') { $ChocoLocal[$Matches[1].ToLower()] = $true }
-        }
-    } catch {}
-    # Cache Add/Remove Programs display names once. If an app is installed outside
-    # Chocolatey (MSI, the app's own installer) we still want to upgrade it - the
-    # per-app installer's own /silent handler is idempotent, so choco upgrade will
-    # refresh the existing install in place rather than orphan it.
-    $ArpNames = New-Object System.Collections.Generic.List[string]
-    foreach ($_arpRoot in @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    )) {
-        try {
-            Get-ItemProperty $_arpRoot -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName } |
-                ForEach-Object { $ArpNames.Add($_.DisplayName) }
-        } catch {}
-    }
-    foreach ($App in $ThirdParty) {
-        # The choco package id is the first whitespace-separated token in ChocoID;
-        # anything after is install/upgrade arguments passed straight to choco.
-        $_pkgId = ($App.ChocoID -split '\s+', 2)[0].ToLower()
-        $_procs = @($App.Process)
-
-        Write-Host "      > " -NoNewline -ForegroundColor Gray
-        Write-Host "$($App.Name): " -NoNewline -ForegroundColor White
-
-        # Two ways an app counts as installed on this box: Chocolatey knows about
-        # it OR Add/Remove Programs shows it. Either one is enough to run choco
-        # upgrade; choco will install-if-missing-and-adopt the manual copy, or
-        # upgrade the choco-managed copy. Nothing in either list means the app is
-        # not on this machine and we do not install it fresh.
-        $_inChoco = $ChocoLocal.ContainsKey($_pkgId)
-        $_inArp   = ($ArpNames | Where-Object { $_ -like "*$($App.Name)*" } | Select-Object -First 1) -ne $null
-        if (-not $_inChoco -and -not $_inArp) {
-            Write-SubResult "[NOT INSTALLED]" DarkGray
-            continue
-        }
-        $IsRunning = $_procs | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
-        if ($IsRunning) {
-            Write-SubResult "[IN USE - SKIPPED]" Yellow
-            continue
-        }
-        $chocoOut = choco upgrade $App.ChocoID -y --no-progress 2>&1
-        if ($App.Name -eq "Google Chrome") {
-            $GUpdate = "C:\Program Files (x86)\Google\Update\GoogleUpdate.exe"
-            if (Test-Path $GUpdate) {
-                & $GUpdate /ua /installsource scheduler 2>&1 | Out-Null
-            }
-        }
-        $upgradeMatch = $chocoOut | Select-String -Pattern 'upgraded (\d+)/'
-        $upgradeCount = if ($upgradeMatch) { [int]$upgradeMatch.Matches[0].Groups[1].Value } else { 0 }
-        if ($upgradeCount -gt 0) {
-            Write-SubResult "[UPDATED]" Green
-        } elseif (-not $_inChoco -and $_inArp) {
-            Write-SubResult "[ADOPTED]" Green
-        } else {
-            Write-SubResult "[ALREADY UPDATED]" Cyan
-        }
-    }
-    Write-StepUpdate "[5/5] Third-Party Updates" -Success
-}
+$_tpFlag = if ($Update3rdParty) { "-Update3rdParty" } else { "-InplaceUpgrade" }
+$tpRes = Invoke-WursaThirdPartyUpdate -Skip ([bool]$No3rdParty) -AutoConfirm ([bool]($Update3rdParty -or $InplaceUpgrade)) -AutoFlag $_tpFlag
 #endregion
 
 #region 5 - Post-Update Version Check & Optional In-Place Upgrade
@@ -668,44 +949,6 @@ $IPU_EkbMinUBR    = 9278
 $IPU_IAUrl      = "https://iso.killertools.net/Windows11InstallationAssistant.exe"
 $IPU_IASha256   = ""
 
-function Restore-WUUpgradeOverrides {
-    # Runs in the MAIN script (not the detached runner), when the box is found already
-    # on the latest build. Undoes Set-WUUpgradeOverrides: each value is put back exactly,
-    # or removed if it did not exist before. The runner only ever sets the overrides;
-    # the main script is what restores them.
-    if (-not (Test-Path $IPU_AURestoreFile)) { return }
-    $polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $auk  = "$polk\AU"
-    $map  = @{}
-    foreach ($line in (Get-Content $IPU_AURestoreFile -ErrorAction SilentlyContinue)) {
-        if ($line -match '^([^=]+)=(.+)$') { $map[$matches[1]] = $matches[2] }
-    }
-    $targets = @{ NoAutoUpdate = $auk; AUOptions = $auk; SetActiveHours = $polk; ActiveHoursStart = $polk; ActiveHoursEnd = $polk; ProductVersion = $polk; TargetReleaseVersion = $polk; TargetReleaseVersionInfo = $polk }
-    foreach ($name in @($targets.Keys)) {
-        $key = $targets[$name]; $orig = $map[$name]
-        # The release pin is restored only when it was recorded (it is set only on a Windows Update handoff).
-        if ($null -eq $orig -and $name -match '^(ProductVersion|TargetReleaseVersion)') { continue }
-        if ($null -eq $orig -or $orig -eq 'ABSENT') { Remove-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue }
-        elseif ($name -in @('ProductVersion','TargetReleaseVersionInfo')) { Set-ItemProperty -Path $key -Name $name -Value $orig -Type String -Force }
-        else { Set-ItemProperty -Path $key -Name $name -Value ([int]$orig) -Type DWord -Force }
-    }
-    Remove-Item $IPU_AURestoreFile -Force -ErrorAction SilentlyContinue
-    Write-Host "      Restored original Windows Update policy values (auto-update, active hours and release pin)." -ForegroundColor $DimCol
-}
-
-function Test-WUFeatureUpdateStaged {
-    # Only a feature update that Windows reports as reboot-required is considered staged.
-    # Offered, downloading, and pre-downloaded updates do not suppress the deterministic
-    # Region 5 upgrade path. This prevents WURSA from declaring a handoff while the box
-    # remains on the old feature release.
-    try {
-        $_res = $UpdateSearcher.Search("RebootRequired=1").Updates
-        foreach ($_u in $_res) {
-            if ($_u.Title -match [regex]::Escape($LatestVersion) -or $_u.Title -match 'Feature update to Windows') { return $true }
-        }
-    } catch {}
-    return $false
-}
 
 Write-HLine -Style dashed
 Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
@@ -731,7 +974,7 @@ $IPU_ArmWUOnly = $IPU_IsArm64 -and $InstalledBuild -notin @(26100, 26200)
 if ($NoUpgrade) {
     $script:FeatureUpgradeState = "SKIPPED"
     Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
-} elseif ($InstalledBuild -lt $LatestBuild -and (Test-WUFeatureUpdateStaged)) {
+} elseif ($InstalledBuild -lt $LatestBuild -and (Test-WUFeatureUpdateStaged -Searcher $UpdateSearcher)) {
     # This is the only Windows Update state that suppresses the dedicated upgrade path.
     # Windows has actually staged the feature update and is asking for a reboot.
     $script:FeatureUpdateStaged = $true
@@ -742,11 +985,7 @@ if ($NoUpgrade) {
 } elseif ($InstalledBuild -lt $LatestBuild) {
     Write-Host "      > Feature update available." -ForegroundColor $WarnCol
     # Battery safety
-    $OnBattery = $false
-    try {
-        $Battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
-        if ($Battery -and $Battery.BatteryStatus -ne 2) { $OnBattery = $true }
-    } catch {}
+    $OnBattery = Test-WursaOnBattery
 
     $proceed = $false
     if ($OnBattery) {
@@ -791,48 +1030,8 @@ if ($NoUpgrade) {
 
         if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
 
-        # Build a one-shot post-reboot verifier. It runs as SYSTEM at startup, waits
-        # for normal boot to settle, verifies DisplayVersion, and restores the temporary
-        # Windows Update policy overrides only after the target release is actually committed.
-        $VerifierBody = @"
-`$ErrorActionPreference = 'SilentlyContinue'
-Start-Sleep -Seconds 180
-`$cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
-`$ver = `$cv.DisplayVersion
-`$build = `$cv.CurrentBuild
-`$ubr = `$cv.UBR
-`$stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-if ([int]`$build -ge $LatestBuild) {
-    "VERIFIED `$ver `$build.`$ubr `$stamp" | Out-File -FilePath '$IPU_StatusFile' -Encoding ASCII -Force
-    if (Test-Path '$IPU_AURestoreFile') {
-        `$polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-        `$auk  = "`$polk\AU"
-        `$map  = @{}
-        foreach (`$line in (Get-Content '$IPU_AURestoreFile' -ErrorAction SilentlyContinue)) {
-            if (`$line -match '^([^=]+)=(.+)$') { `$map[`$matches[1]] = `$matches[2] }
-        }
-        `$targets = @{ NoAutoUpdate = `$auk; AUOptions = `$auk; SetActiveHours = `$polk; ActiveHoursStart = `$polk; ActiveHoursEnd = `$polk; ProductVersion = `$polk; TargetReleaseVersion = `$polk; TargetReleaseVersionInfo = `$polk }
-        foreach (`$name in @(`$targets.Keys)) {
-            `$key = `$targets[`$name]; `$orig = `$map[`$name]
-            if (`$null -eq `$orig -and `$name -match '^(ProductVersion|TargetReleaseVersion)') { continue }
-            if (`$null -eq `$orig -or `$orig -eq 'ABSENT') { Remove-ItemProperty -Path `$key -Name `$name -ErrorAction SilentlyContinue }
-            elseif (`$name -in @('ProductVersion','TargetReleaseVersionInfo')) { Set-ItemProperty -Path `$key -Name `$name -Value `$orig -Type String -Force }
-            else { Set-ItemProperty -Path `$key -Name `$name -Value ([int]`$orig) -Type DWord -Force }
-        }
-        Remove-Item '$IPU_AURestoreFile' -Force -ErrorAction SilentlyContinue
-    }
-    schtasks.exe /Delete /TN '$IPU_VerifyTaskName' /F | Out-Null
-    exit 0
-}
-`$setupActive = Test-Path 'HKLM:\SYSTEM\Setup\MoSetup\Volatile'
-if (`$setupActive) {
-    "VERIFY_PENDING VERSION_`$ver BUILD_`$build.`$ubr `$stamp" | Out-File -FilePath '$IPU_StatusFile' -Encoding ASCII -Force
-    exit 0
-}
-"FAILED_POSTREBOOT VERSION_`$ver BUILD_`$build.`$ubr `$stamp" | Out-File -FilePath '$IPU_StatusFile' -Encoding ASCII -Force
-schtasks.exe /Delete /TN '$IPU_VerifyTaskName' /F | Out-Null
-exit 1
-"@
+        # One-shot post-reboot verifier, built by Get-WursaVerifierScript.
+        $VerifierBody = Get-WursaVerifierScript -StatusFile $IPU_StatusFile -RestoreFile $IPU_AURestoreFile -VerifyTaskName $IPU_VerifyTaskName -TargetBuild $LatestBuild
         $VerifierBody | Out-File -FilePath $IPU_VerifierPath -Encoding ASCII -Force
 
         # --- Build the standalone runner the scheduled task executes as SYSTEM ---
@@ -1343,11 +1542,10 @@ schtasks.exe /Delete /TN "$IPU_TaskName" /F | Out-Null
 }
 #endregion
 
-
 #region 6 - Finalization
 # ============================================================================
 # Checking reboot status via direct API to bypass Get-WURebootStatus crash.
-$RebootPending = if ($InstallResult) { $InstallResult.RebootRequired } else { $false }
+$RebootPending = [bool]$passRes.RebootRequired
 if (-not $RebootPending) {
     $RebootPending = $null -ne (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue)
 }
@@ -1362,54 +1560,10 @@ if (Test-Path $IPU_StatusFile) {
 }
 
 Write-HLine -Style dashed
-if (-not $NoUpgrade -and [int]$_finalCV.CurrentBuild -ge $LatestBuild) {
-    Write-Host "STATUS: SYSTEM CURRENT ($_finalVersion)" -ForegroundColor Green
-    $script:ExitCode = 0
-} elseif ($NoUpgrade) {
-    if ($RebootPending) {
-        Write-Host "[!] STATUS: REBOOT REQUIRED" -ForegroundColor Red
-        $script:ExitCode = 3010
-    } else {
-        Write-Host "STATUS: UPDATE PASS COMPLETE" -ForegroundColor Green
-        $script:ExitCode = 0
-    }
-} elseif ($script:FeatureUpgradeState -eq "REBOOT_REQUIRED") {
-    Write-Host "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" -ForegroundColor Red
-    $script:ExitCode = 3010
-} elseif ($script:FeatureUpgradeState -match '^(FAILED|BLOCKED|NOT_STARTED)') {
-    Write-Host "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" -ForegroundColor Red
-    if ($script:FeatureUpgradeState) { Write-Host "      Upgrade state: $($script:FeatureUpgradeState)" -ForegroundColor $WarnCol }
-    $script:ExitCode = 1
-} elseif ($script:FeatureUpgradeState -eq "DISPATCHED") {
-    if ($_ipuState -match '^REBOOT_REQUIRED') {
-        Write-Host "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" -ForegroundColor Red
-        Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol
-        $script:ExitCode = 3010
-    } elseif ($_ipuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
-        Write-Host "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" -ForegroundColor Red
-        Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $WarnCol
-        $script:ExitCode = 1
-    } else {
-        Write-Host "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" -ForegroundColor $WarnCol
-        if ($_ipuState) { Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol }
-        $script:ExitCode = 0
-    }
-} elseif ($_ipuState -match '^REBOOT_REQUIRED') {
-    Write-Host "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" -ForegroundColor Red
-    Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol
-    $script:ExitCode = 3010
-} elseif ($_ipuState -match '^(DISPATCHED|RUNNING|DOWNLOADING|REPAIRING|VERIFY_PENDING|WU_HANDOFF)') {
-    Write-Host "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" -ForegroundColor $WarnCol
-    Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $DimCol
-    $script:ExitCode = 0
-} elseif ($_ipuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
-    Write-Host "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" -ForegroundColor Red
-    Write-Host "      Upgrade state: $_ipuState" -ForegroundColor $WarnCol
-    $script:ExitCode = 1
-} else {
-    Write-Host "[!] STATUS: FEATURE UPGRADE NOT COMPLETE (still $_finalVersion)" -ForegroundColor Red
-    $script:ExitCode = 1
-}
+$_final = Resolve-WursaFinalStatus -NoUpgrade ([bool]$NoUpgrade) -FinalBuild ([int]$_finalCV.CurrentBuild) -FinalVersion $_finalVersion `
+    -FeatureUpgradeState $script:FeatureUpgradeState -IpuState $_ipuState -RebootPending $RebootPending
+foreach ($_l in $_final.Lines) { Write-Host $_l.Text -ForegroundColor $_l.Color }
+$script:ExitCode = $_final.Code
 # Footer
 $_sfx    = "█"
 $_ftrW   = $_artW + 1
@@ -1421,4 +1575,7 @@ Write-Host "$_footer$_fpad$_ver" -ForegroundColor $MainCol -NoNewline; Write-Hos
 Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
 #endregion
 
-exit $script:ExitCode
+Exit-KillerScript $script:ExitCode
+}
+
+if (-not $global:KillerScriptsTestMode) { Invoke-WursaMain }
