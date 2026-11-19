@@ -353,7 +353,12 @@ function Invoke-WursaWindowsUpdatePass {
     } catch {
         Write-StepUpdate -Success -CustomInfo "(Scan Error)"
         Write-Host "      [!] WU search failed: $($_.Exception.Message)" -ForegroundColor Red
-        $UpdateList = $null
+        Write-Host "[4/5] Windows Update Installation..." -NoNewline -ForegroundColor $DimCol
+        Write-SubResult "[FAILED]" "Red"
+        $res.Status = 'ScanFailed'
+        $res.Error = $_.Exception.Message
+        $res.Failed++
+        return $res
     }
     if (-not $UpdateList -or $UpdateList.Count -eq 0) {
         Write-StepUpdate -Success -CustomInfo "(System Up to Date)"
@@ -1365,9 +1370,13 @@ function Resolve-WursaFinalStatus {
     # Maps the run state to the exit code and the status lines. The text always agrees with the code.
     param(
         [bool]$NoUpgrade, [int]$FinalBuild, [string]$FinalVersion, [string]$FeatureUpgradeState,
-        [string]$IpuState, [bool]$RebootPending
+        [string]$IpuState, [bool]$RebootPending, [int]$FailedCount = 0, [int]$SucceededCount = 0
     )
+    # Precedence: a failed feature upgrade (1) beats everything, then a needed reboot (3010), then
+    # update failures (3 when something else succeeded, 1 when nothing did), then 0. While a detached
+    # upgrade is running, a reboot request from the update pass must not interrupt it, so it is not reported.
     $lines = New-Object System.Collections.ArrayList
+    $upgradeActive = $false
     $code = 0
     $add = { param($t, $c) [void]$lines.Add(@{ Text = $t; Color = $c }) }
     if (-not $NoUpgrade -and $FinalBuild -ge $LatestBuild) {
@@ -1401,6 +1410,7 @@ function Resolve-WursaFinalStatus {
             & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
             if ($IpuState) { & $add "      Upgrade state: $IpuState" $DimCol }
             $code = 0
+            $upgradeActive = $true
         }
     } elseif ($IpuState -match '^REBOOT_REQUIRED') {
         & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
@@ -1410,6 +1420,7 @@ function Resolve-WursaFinalStatus {
         & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
         & $add "      Upgrade state: $IpuState" $DimCol
         $code = 0
+        $upgradeActive = $true
     } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
         & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
         & $add "      Upgrade state: $IpuState" $WarnCol
@@ -1417,6 +1428,21 @@ function Resolve-WursaFinalStatus {
     } else {
         & $add "[!] STATUS: FEATURE UPGRADE NOT COMPLETE (still $FinalVersion)" "Red"
         $code = 1
+    }
+    # Fold in the update pass: reboot first, then failures. Only a clean 0 is ever changed here.
+    if ($code -eq 0 -and $RebootPending -and -not $upgradeActive) {
+        $lines.Clear()
+        & $add "[!] STATUS: REBOOT REQUIRED" "Red"
+        $code = 3010
+    }
+    if ($FailedCount -gt 0) {
+        if ($code -eq 0) {
+            $code = if ($SucceededCount -gt 0) { 3 } else { 1 }
+            $lines.Clear()
+            & $add "[!] STATUS: UPDATES INCOMPLETE ($FailedCount failed, $SucceededCount succeeded)" "Red"
+        } else {
+            & $add "      Also: $FailedCount update(s) failed ($SucceededCount succeeded)" $WarnCol
+        }
     }
     [pscustomobject]@{ Code = $code; Lines = @($lines) }
 }
@@ -1779,7 +1805,7 @@ if ($NoUpgrade) {
 #region 6 - Finalization
 # ============================================================================
 # Checking reboot status via direct API to bypass Get-WURebootStatus crash.
-$RebootPending = [bool]$passRes.RebootRequired
+$RebootPending = [bool]$passRes.RebootRequired -or [bool]$tpRes.RebootRequired
 if (-not $RebootPending) {
     $RebootPending = $null -ne (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue)
 }
@@ -1796,7 +1822,8 @@ if (-not (Get-WursaDirectoryProblem -Path $IPU_WorkDir) -and (Test-Path $IPU_Sta
 
 Write-HLine -Style dashed
 $_final = Resolve-WursaFinalStatus -NoUpgrade ([bool]$NoUpgrade) -FinalBuild ([int]$_finalCV.CurrentBuild) -FinalVersion $_finalVersion `
-    -FeatureUpgradeState $script:FeatureUpgradeState -IpuState $_ipuState -RebootPending $RebootPending
+    -FeatureUpgradeState $script:FeatureUpgradeState -IpuState $_ipuState -RebootPending $RebootPending `
+    -FailedCount ([int]$passRes.Failed + [int]$tpRes.Failed) -SucceededCount ([int]$passRes.Succeeded + [int]$tpRes.Succeeded)
 foreach ($_l in $_final.Lines) { Write-Host $_l.Text -ForegroundColor $_l.Color }
 $script:ExitCode = $_final.Code
 # Footer

@@ -568,3 +568,106 @@ Describe 'Secure temp directory (finding 66)' {
         New-WursaSecureTempDir -Base 'C:\ProgramData\WURSA' | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Windows Update pass outcomes (finding 30a)' {
+    BeforeEach {
+        $script:Lines = New-Object System.Collections.ArrayList
+        Mock Write-Host { [void]$script:Lines.Add([string]$Object) }
+        Mock Write-StepUpdate { if ($CustomInfo) { [void]$script:Lines.Add([string]$CustomInfo) } }
+        Mock Write-SubResult { [void]$script:Lines.Add([string]$Tag) }
+        Mock Write-WursaUpdateLines { [void]$script:Lines.Add([string]$Tag) }
+        Mock Write-Progress { }
+        Mock Get-WursaCursorTop { -1 }
+        Mock Get-WursaRebootPending { $false }
+        Mock Test-Path { $false }
+        Mock New-WursaUpdateColl { New-Object System.Collections.ArrayList }
+        $script:SearchBlock = { param($q) [pscustomobject]@{ Updates = @() } }
+        $script:Results = @{}
+        function script:New-FakeSession {
+            $searcher = [pscustomobject]@{}
+            $searcher | Add-Member -MemberType ScriptMethod -Name Search -Value { param($q) & $script:SearchBlock $q }
+            $session = [pscustomobject]@{}
+            $session | Add-Member -MemberType ScriptMethod -Name CreateUpdateSearcher -Value { $searcher }.GetNewClosure()
+            $session
+        }
+        Mock New-WursaUpdateSession { New-FakeSession }
+        Mock Install-WursaUpdate { $script:Results[$Update.Title] }
+    }
+
+    It 'reports a scan error as a failed scan, not as up to date' {
+        $script:SearchBlock = { param($q) throw 'WU search exploded' }
+        $r = Invoke-WursaWindowsUpdatePass
+        $r.Status | Should -Be 'ScanFailed'
+        $r.Failed | Should -BeGreaterThan 0
+        ($script:Lines -join "`n") | Should -Match '\[FAILED\]'
+        ($script:Lines -join "`n") | Should -Not -Match 'System Up to Date'
+    }
+
+    It 'aggregates failures, successes, warnings and reboot flags across every update' {
+        $mk = { param($t) [pscustomobject]@{ Title = $t } }
+        $script:SearchBlock = { param($q) if ($q -match 'Driver') { [pscustomobject]@{ Updates = @() } } else { [pscustomobject]@{ Updates = @((& $mk 'KB1'), (& $mk 'KB2'), (& $mk 'KB3'), (& $mk 'KB4')) } } }
+        $script:Results = @{
+            'KB1' = [pscustomobject]@{ Tag = '[SUCCESS]';   Color = 'Green';  Outcome = 'Success'; RebootRequired = $false }
+            'KB2' = [pscustomobject]@{ Tag = '[REBOOT REQ]'; Color = 'Yellow'; Outcome = 'Reboot';  RebootRequired = $true }
+            'KB3' = [pscustomobject]@{ Tag = '[FAILED 0x80070005]'; Color = 'Red'; Outcome = 'Failed'; RebootRequired = $false }
+            'KB4' = [pscustomobject]@{ Tag = '[SUCCESS*]';  Color = 'Yellow'; Outcome = 'Warn';    RebootRequired = $false }
+        }
+        $r = Invoke-WursaWindowsUpdatePass
+        $r.Found | Should -Be 4
+        $r.Succeeded | Should -Be 3
+        $r.Failed | Should -Be 1
+        $r.RebootRequired | Should -BeTrue
+    }
+
+    It 'counts an install that throws as a failure and keeps going' {
+        $mk = { param($t) [pscustomobject]@{ Title = $t } }
+        $script:SearchBlock = { param($q) if ($q -match 'Driver') { [pscustomobject]@{ Updates = @() } } else { [pscustomobject]@{ Updates = @((& $mk 'KB1'), (& $mk 'KB2')) } } }
+        $script:Results = @{ 'KB2' = [pscustomobject]@{ Tag = '[SUCCESS]'; Color = 'Green'; Outcome = 'Success'; RebootRequired = $false } }
+        Mock Install-WursaUpdate { if ($Update.Title -eq 'KB1') { throw 'boom' } $script:Results[$Update.Title] }
+        $r = Invoke-WursaWindowsUpdatePass
+        $r.Failed | Should -Be 1
+        $r.Succeeded | Should -Be 1
+    }
+}
+
+Describe 'Final status with failures and reboots (finding 30a)' {
+    It 'maps failures <Failed>/successes <Succ>, reboot <Reboot>, state <State>/<Ipu> to exit <Code>' -ForEach @(
+        @{ NoUp = $true;  Build = 26100; State = 'SKIPPED';   Ipu = '';                Failed = 1; Succ = 2; Reboot = $false; Code = 3;    Like = '*INCOMPLETE*' }
+        @{ NoUp = $true;  Build = 26100; State = 'SKIPPED';   Ipu = '';                Failed = 1; Succ = 0; Reboot = $false; Code = 1;    Like = '*INCOMPLETE*' }
+        @{ NoUp = $true;  Build = 26100; State = 'SKIPPED';   Ipu = '';                Failed = 1; Succ = 1; Reboot = $true;  Code = 3010; Like = '*REBOOT REQUIRED*' }
+        @{ NoUp = $false; Build = 26300; State = 'CURRENT';   Ipu = '';                Failed = 1; Succ = 0; Reboot = $false; Code = 1;    Like = '*INCOMPLETE*' }
+        @{ NoUp = $false; Build = 26300; State = 'CURRENT';   Ipu = '';                Failed = 0; Succ = 3; Reboot = $true;  Code = 3010; Like = '*REBOOT REQUIRED*' }
+        @{ NoUp = $false; Build = 26300; State = 'CURRENT';   Ipu = '';                Failed = 0; Succ = 3; Reboot = $false; Code = 0;    Like = '*SYSTEM CURRENT*' }
+        @{ NoUp = $false; Build = 26100; State = 'DISPATCHED'; Ipu = 'RUNNING x';       Failed = 0; Succ = 1; Reboot = $true;  Code = 0;    Like = '*IN PROGRESS*' }
+        @{ NoUp = $false; Build = 26100; State = 'DISPATCHED'; Ipu = 'FAILED URL x';    Failed = 1; Succ = 1; Reboot = $true;  Code = 1;    Like = '*NOT COMPLETE*' }
+        @{ NoUp = $false; Build = 26100; State = 'REBOOT_REQUIRED'; Ipu = '';          Failed = 1; Succ = 1; Reboot = $false; Code = 3010; Like = '*REBOOT REQUIRED TO FINISH*' }
+    ) {
+        $r = Resolve-WursaFinalStatus -NoUpgrade $NoUp -FinalBuild $Build -FinalVersion '25H2' -FeatureUpgradeState $State -IpuState $Ipu -RebootPending $Reboot -FailedCount $Failed -SucceededCount $Succ
+        $r.Code | Should -Be $Code
+        ($r.Lines | ForEach-Object { $_.Text }) -join "`n" | Should -BeLike $Like
+    }
+}
+
+Describe 'Failures reach the exit code in a full run (finding 30a)' {
+    BeforeEach { Set-MainMocks -Build 26300 -Version '26H2' }
+
+    It 'exits 3 when some updates installed and one failed' {
+        Mock Invoke-WursaWindowsUpdatePass { [pscustomobject]@{ Status = 'Installed'; Found = 2; Succeeded = 1; Failed = 1; RebootRequired = $false; Error = $null; Searcher = $null; FeatureOffered = $false } }
+        $NoUpgrade = $true; $No3rdParty = $true
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 3
+    }
+
+    It 'exits 1 when the scan itself failed' {
+        Mock Invoke-WursaWindowsUpdatePass { [pscustomobject]@{ Status = 'ScanFailed'; Found = 0; Succeeded = 0; Failed = 1; RebootRequired = $false; Error = 'x'; Searcher = $null; FeatureOffered = $false } }
+        $NoUpgrade = $true; $No3rdParty = $true
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 1
+    }
+
+    It 'counts third-party failures and a third-party reboot request' {
+        Mock Invoke-WursaThirdPartyUpdate { [pscustomobject]@{ Status = 'Done'; Succeeded = 1; Failed = 1; RebootRequired = $false } }
+        $NoUpgrade = $true; $No3rdParty = $false; $Update3rdParty = $true
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 3
+        Mock Invoke-WursaThirdPartyUpdate { [pscustomobject]@{ Status = 'Done'; Succeeded = 1; Failed = 0; RebootRequired = $true } }
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 3010
+    }
+}
