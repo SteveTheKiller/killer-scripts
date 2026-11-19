@@ -298,9 +298,10 @@ function Invoke-ShadeMain {
     }
 
     Set-RegKeys @(
-        # Value=1: User decides — allows Teams/Zoom to prompt for permission normally
-        @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"; Name="LetAppsAccessCamera";     Value=1},
-        @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"; Name="LetAppsAccessMicrophone"; Value=1}
+        # Policy values: 0 = user in control (apps may prompt, so Teams and Zoom work), 1 = force allow, 2 = force deny.
+        # 0 leaves the choice to the user. The ConsentStore "Deny" above is the only deny that SHADE sets.
+        @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"; Name="LetAppsAccessCamera";     Value=0},
+        @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"; Name="LetAppsAccessMicrophone"; Value=0}
     )
     Write-StepUpdate -Success
     #endregion

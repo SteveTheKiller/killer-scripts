@@ -63,4 +63,17 @@ Describe 'SHADE' {
             Should -Invoke Stop-Service -Times 0 -Exactly
         }
     }
+
+    Context 'finding 49: camera and microphone policy' {
+        BeforeEach { $script:AppPrivacy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' }
+        It 'sets LetAppsAccessCamera and LetAppsAccessMicrophone to 0 (user in control)' {
+            Get-Exit | Should -Be 0
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter { $Path -eq $AppPrivacy -and $Name -eq 'LetAppsAccessCamera' -and $Value -eq 0 }
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter { $Path -eq $AppPrivacy -and $Name -eq 'LetAppsAccessMicrophone' -and $Value -eq 0 }
+        }
+        It 'never force-allows (1) camera or microphone for every app' {
+            Get-Exit | Out-Null
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly -ParameterFilter { $Path -eq $AppPrivacy -and $Name -like 'LetAppsAccess*' -and $Value -ne 0 }
+        }
+    }
 }
