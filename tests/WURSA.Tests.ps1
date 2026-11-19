@@ -11,7 +11,8 @@ BeforeAll {
     # reaches one of these without its own mock fails loudly instead of touching the host.
     foreach ($fn in 'Invoke-WursaNative', 'Invoke-WursaChoco', 'Save-WursaFile', 'Expand-WursaZip',
                     'Invoke-WursaScriptFile', 'Invoke-WursaRestorePoint', 'Register-WursaProductService',
-                    'New-WursaUpdateSession', 'New-WursaUpdateColl', 'Get-WursaPowerLineStatus') {
+                    'New-WursaUpdateSession', 'New-WursaUpdateColl', 'Get-WursaPowerLineStatus',
+                    'Get-WursaPolicyValue', 'Set-WursaPolicyValue', 'Remove-WursaPolicyValue', 'Initialize-WursaPolicyKey') {
         $name = $fn
         Mock $name { throw "UNMOCKED WURSA BOUNDARY: $name" }.GetNewClosure()
     }
@@ -29,6 +30,21 @@ BeforeAll {
         }
         return $null
     }
+
+    # In-memory stand-in for the Windows Update policy values. Keys are "path|name".
+    function Initialize-FakePolicyRegistry {
+        param([hashtable]$Initial = @{})
+        $script:Reg = @{}
+        foreach ($k in $Initial.Keys) { $script:Reg[$k] = $Initial[$k] }
+        $script:FailRemove = @()
+        $script:FailSet = @()
+        Mock Initialize-WursaPolicyKey { }
+        Mock Get-WursaPolicyValue { $k = "$Key|$Name"; if ($script:Reg.ContainsKey($k)) { $script:Reg[$k] } else { $null } }
+        Mock Set-WursaPolicyValue { if ($script:FailSet -notcontains $Name) { $script:Reg["$Key|$Name"] = $Value } }
+        Mock Remove-WursaPolicyValue { if ($script:FailRemove -notcontains $Name) { [void]$script:Reg.Remove("$Key|$Name") } }
+    }
+    $script:Polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $script:Auk  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
 
     $script:SidSystem = 'S-1-5-18'
     $script:SidAdmins = 'S-1-5-32-544'
@@ -748,5 +764,139 @@ Describe 'Power state gates the upgrade (finding 31)' {
         $InplaceUpgrade = $true; $NoUpgrade = $false; $No3rdParty = $true
         Get-ExitCode { Invoke-WursaMain } | Should -Be 1
         ($script:said -join "`n") | Should -Match 'battery'
+    }
+}
+
+Describe 'Policy record restore and verifier (finding 43)' {
+    BeforeEach {
+        Initialize-FakePolicyRegistry -Initial @{
+            "$script:Auk|NoAutoUpdate" = 0; "$script:Auk|AUOptions" = 4
+            "$script:Polk|SetActiveHours" = 1; "$script:Polk|ActiveHoursStart" = 7; "$script:Polk|ActiveHoursEnd" = 19
+            "$script:Polk|ProductVersion" = 'Windows 11'; "$script:Polk|TargetReleaseVersion" = 1; "$script:Polk|TargetReleaseVersionInfo" = '26H2'
+        }
+        $script:Rec = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '.txt')
+        Set-Content -LiteralPath $script:Rec -Value @('NoAutoUpdate=1', 'AUOptions=ABSENT', 'SetActiveHours=ABSENT', 'ActiveHoursStart=ABSENT', 'ActiveHoursEnd=ABSENT', 'ProductVersion=ABSENT', 'TargetReleaseVersion=ABSENT', 'TargetReleaseVersionInfo=ABSENT')
+    }
+
+    It 'puts every recorded value back, verifies it, and only then deletes the record' {
+        Restore-WursaPolicyRecord -RecordFile $script:Rec | Should -BeTrue
+        $script:Reg["$script:Auk|NoAutoUpdate"] | Should -Be 1
+        $script:Reg.ContainsKey("$script:Auk|AUOptions") | Should -BeFalse
+        $script:Reg.ContainsKey("$script:Polk|ProductVersion") | Should -BeFalse
+        Test-Path -LiteralPath $script:Rec | Should -BeFalse
+    }
+
+    It 'restores a recorded string value as a string' {
+        Set-Content -LiteralPath $script:Rec -Value @('ProductVersion=Windows 10', 'TargetReleaseVersion=ABSENT', 'TargetReleaseVersionInfo=22H2')
+        Restore-WursaPolicyRecord -RecordFile $script:Rec | Should -BeTrue
+        $script:Reg["$script:Polk|ProductVersion"] | Should -Be 'Windows 10'
+        $script:Reg["$script:Polk|TargetReleaseVersionInfo"] | Should -Be '22H2'
+    }
+
+    It 'leaves values alone that the record does not mention' {
+        Set-Content -LiteralPath $script:Rec -Value @('NoAutoUpdate=ABSENT')
+        Restore-WursaPolicyRecord -RecordFile $script:Rec | Should -BeTrue
+        $script:Reg["$script:Polk|ProductVersion"] | Should -Be 'Windows 11'
+    }
+
+    It 'keeps the record and reports failure when a value does not read back' {
+        $script:FailSet = @('NoAutoUpdate')
+        Restore-WursaPolicyRecord -RecordFile $script:Rec | Should -BeFalse
+        Test-Path -LiteralPath $script:Rec | Should -BeTrue
+    }
+
+    It 'keeps the record and reports failure when a value cannot be removed' {
+        $script:FailRemove = @('AUOptions')
+        Restore-WursaPolicyRecord -RecordFile $script:Rec | Should -BeFalse
+        Test-Path -LiteralPath $script:Rec | Should -BeTrue
+    }
+
+    It 'still restores the other values when one fails' {
+        $script:FailRemove = @('AUOptions')
+        Restore-WursaPolicyRecord -RecordFile $script:Rec | Out-Null
+        $script:Reg.ContainsKey("$script:Polk|ActiveHoursStart") | Should -BeFalse
+    }
+
+    It 'succeeds quietly when there is no record' {
+        Remove-Item -LiteralPath $script:Rec -Force
+        Restore-WursaPolicyRecord -RecordFile $script:Rec | Should -BeTrue
+    }
+
+    Context 'the post-reboot verifier run' {
+        BeforeEach {
+            $script:Status = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '-status.txt')
+            $script:Native = New-Object System.Collections.ArrayList
+            $script:Build = '26300'
+            $script:SetupActive = $false
+            Mock Invoke-WursaNative { [void]$script:Native.Add(($Arguments -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = @() } }
+            Mock Get-ItemProperty { [pscustomobject]@{ DisplayVersion = '26H2'; CurrentBuild = $script:Build; UBR = 100 } } -ParameterFilter { $Path -like '*Windows NT*CurrentVersion' }
+            Mock Test-Path { $script:SetupActive } -ParameterFilter { $Path -like '*MoSetup*' }
+        }
+        It 'on a committed build restores policy, marks VERIFIED and removes its task' {
+            (Invoke-WursaVerifyRun -StatusFile $script:Status -RestoreFile $script:Rec -VerifyTaskName 'T' -TargetBuild 26300 -SettleSeconds 0) | Should -Be 0
+            (Get-Content -LiteralPath $script:Status) | Should -Match '^VERIFIED '
+            Test-Path -LiteralPath $script:Rec | Should -BeFalse
+            ($script:Native -join "`n") | Should -Match '/Delete'
+        }
+        It 'keeps its task and the record when the restore does not stick, so the next boot retries' {
+            $script:FailRemove = @('AUOptions')
+            (Invoke-WursaVerifyRun -StatusFile $script:Status -RestoreFile $script:Rec -VerifyTaskName 'T' -TargetBuild 26300 -SettleSeconds 0) | Should -Be 1
+            (Get-Content -LiteralPath $script:Status) | Should -Match '^VERIFIED_RESTORE_PENDING'
+            Test-Path -LiteralPath $script:Rec | Should -BeTrue
+            ($script:Native -join "`n") | Should -Not -Match '/Delete'
+        }
+        It 'reports VERIFY_PENDING and keeps the task while setup is still running' {
+            $script:Build = '26100'; $script:SetupActive = $true
+            (Invoke-WursaVerifyRun -StatusFile $script:Status -RestoreFile $script:Rec -VerifyTaskName 'T' -TargetBuild 26300 -SettleSeconds 0) | Should -Be 0
+            (Get-Content -LiteralPath $script:Status) | Should -Match '^VERIFY_PENDING'
+            ($script:Native -join "`n") | Should -Not -Match '/Delete'
+        }
+        It 'reports FAILED_POSTREBOOT and removes the task when the build never moved' {
+            $script:Build = '26100'
+            (Invoke-WursaVerifyRun -StatusFile $script:Status -RestoreFile $script:Rec -VerifyTaskName 'T' -TargetBuild 26300 -SettleSeconds 0) | Should -Be 1
+            (Get-Content -LiteralPath $script:Status) | Should -Match '^FAILED_POSTREBOOT'
+            ($script:Native -join "`n") | Should -Match '/Delete'
+        }
+    }
+
+    It 'generates a verifier script that parses, is plain ASCII, and embeds the tested restore code' {
+        $text = Get-WursaVerifierScript -StatusFile 'C:\x\s.txt' -RestoreFile 'C:\x\r.txt' -VerifyTaskName 'T' -TargetBuild 26300
+        $errs = $null; $toks = $null
+        [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$toks, [ref]$errs)
+        @($errs).Count | Should -Be 0
+        ($text.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count | Should -Be 0
+        $text | Should -Match 'function Restore-WursaPolicyRecord'
+        $text | Should -Match 'function Invoke-WursaVerifyRun'
+        $text | Should -Match 'exit \(Invoke-WursaVerifyRun'
+    }
+}
+
+Describe 'Reboot status and the verifier arming (finding 43)' {
+    BeforeEach {
+        $script:Work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:Work | Out-Null
+        $IPU_StatusFile = Join-Path $script:Work 'ipu_status.txt'
+        . ([scriptblock]::Create((Get-RunnerFunctionText 'Set-Status')))
+        . ([scriptblock]::Create((Get-RunnerFunctionText 'Set-RebootRequired')))
+    }
+    It 'records REBOOT_REQUIRED when the verifier task was registered' {
+        function Register-IPUPostRebootVerifier { $true }
+        Set-RebootRequired -Detail '3010 now'
+        (Get-Content -LiteralPath $IPU_StatusFile) | Should -Be 'REBOOT_REQUIRED 3010 now'
+    }
+    It 'records REBOOT_REQUIRED_UNARMED when the verifier task could not be registered' {
+        function Register-IPUPostRebootVerifier { $false }
+        Set-RebootRequired -Detail '3010 now'
+        (Get-Content -LiteralPath $IPU_StatusFile) | Should -Be 'REBOOT_REQUIRED_UNARMED 3010 now'
+    }
+    It 'has no runner path that sets REBOOT_REQUIRED without going through the helper' {
+        $body = Get-WursaRunnerBody
+        # The two Set-Status lines inside Set-RebootRequired itself (armed and unarmed) are the only ones.
+        ($body -split "`n" | Where-Object { $_ -match 'Set-Status "REBOOT_REQUIRED' }).Count | Should -Be 2
+    }
+    It 'still counts the unarmed state as a reboot and tells the technician what to do' {
+        $r = Resolve-WursaFinalStatus -NoUpgrade $false -FinalBuild 26100 -FinalVersion '25H2' -FeatureUpgradeState 'DISPATCHED' -IpuState 'REBOOT_REQUIRED_UNARMED 3010 x' -RebootPending $false
+        $r.Code | Should -Be 3010
+        ($r.Lines | ForEach-Object { $_.Text }) -join "`n" | Should -Match 'run WURSA again'
     }
 }

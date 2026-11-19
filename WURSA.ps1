@@ -672,29 +672,84 @@ function Invoke-WursaThirdPartyUpdate {
 #endregion
 
 #region Feature upgrade helpers
-function Restore-WUUpgradeOverrides {
-    # Runs in the MAIN script (not the detached runner), when the box is found already
-    # on the latest build. Undoes Set-WUUpgradeOverrides: each value is put back exactly,
-    # or removed if it did not exist before. The runner only ever sets the overrides;
-    # the main script is what restores them.
-    if (-not (Test-Path $IPU_AURestoreFile)) { return }
+# Windows Update policy values. These wrappers are the only code that touches the policy hive, and they are
+# copied verbatim into the post-reboot verifier script, so keep them self-contained and plain ASCII.
+function Initialize-WursaPolicyKey {
+    param([string]$Key)
+    if (-not (Test-Path $Key)) { New-Item -Path $Key -Force | Out-Null }
+}
+
+function Get-WursaPolicyValue {
+    param([string]$Key, [string]$Name)
+    $p = Get-ItemProperty -Path $Key -Name $Name -ErrorAction SilentlyContinue
+    if ($p) { return $p.$Name }
+    return $null
+}
+
+function Set-WursaPolicyValue {
+    param([string]$Key, [string]$Name, $Value, [string]$Type = 'DWord')
+    Initialize-WursaPolicyKey -Key $Key
+    Set-ItemProperty -Path $Key -Name $Name -Value $Value -Type $Type -Force
+}
+
+function Remove-WursaPolicyValue {
+    param([string]$Key, [string]$Name)
+    Remove-ItemProperty -Path $Key -Name $Name -ErrorAction SilentlyContinue
+}
+
+function Restore-WursaPolicyRecord {
+    # Puts every value in the restore record back exactly (or removes it if it did not exist before),
+    # reads each one back, and deletes the record only when every value verified. Returns $true when the
+    # policy is back as it was, $false when anything did not stick (the record is kept so it can retry).
+    param([string]$RecordFile)
+    if (-not [System.IO.File]::Exists($RecordFile)) { return $true }
     $polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $auk  = "$polk\AU"
+    $auk  = $polk + '\AU'
     $map  = @{}
-    foreach ($line in (Get-Content $IPU_AURestoreFile -ErrorAction SilentlyContinue)) {
-        if ($line -match '^([^=]+)=(.+)$') { $map[$matches[1]] = $matches[2] }
-    }
+    try {
+        foreach ($line in [System.IO.File]::ReadAllLines($RecordFile)) {
+            if ($line -match '^([^=]+)=(.+)$') { $map[$Matches[1]] = $Matches[2] }
+        }
+    } catch { return $false }
     $targets = @{ NoAutoUpdate = $auk; AUOptions = $auk; SetActiveHours = $polk; ActiveHoursStart = $polk; ActiveHoursEnd = $polk; ProductVersion = $polk; TargetReleaseVersion = $polk; TargetReleaseVersionInfo = $polk }
+    $allOk = $true
     foreach ($name in @($targets.Keys)) {
-        $key = $targets[$name]; $orig = $map[$name]
+        $key = $targets[$name]
+        $orig = $map[$name]
         # The release pin is restored only when it was recorded (it is set only on a Windows Update handoff).
         if ($null -eq $orig -and $name -match '^(ProductVersion|TargetReleaseVersion)') { continue }
-        if ($null -eq $orig -or $orig -eq 'ABSENT') { Remove-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue }
-        elseif ($name -in @('ProductVersion','TargetReleaseVersionInfo')) { Set-ItemProperty -Path $key -Name $name -Value $orig -Type String -Force }
-        else { Set-ItemProperty -Path $key -Name $name -Value ([int]$orig) -Type DWord -Force }
+        $isString = ($name -eq 'ProductVersion' -or $name -eq 'TargetReleaseVersionInfo')
+        $absent = ($null -eq $orig -or $orig -eq 'ABSENT')
+        try {
+            if ($absent) {
+                Remove-WursaPolicyValue -Key $key -Name $name
+            } elseif ($isString) {
+                Set-WursaPolicyValue -Key $key -Name $name -Value $orig -Type 'String'
+            } else {
+                Set-WursaPolicyValue -Key $key -Name $name -Value ([int]$orig) -Type 'DWord'
+            }
+            $now = Get-WursaPolicyValue -Key $key -Name $name
+            if ($absent) { $good = ($null -eq $now) } else { $good = ($null -ne $now -and ([string]$now -eq [string]$orig)) }
+            if (-not $good) { $allOk = $false }
+        } catch {
+            $allOk = $false
+        }
     }
-    Remove-Item $IPU_AURestoreFile -Force -ErrorAction SilentlyContinue
-    Write-Host "      Restored original Windows Update policy values (auto-update, active hours and release pin)." -ForegroundColor $DimCol
+    if ($allOk) {
+        try { [System.IO.File]::Delete($RecordFile) } catch { $allOk = $false }
+    }
+    return $allOk
+}
+
+function Restore-WUUpgradeOverrides {
+    # Runs in the MAIN script (not the detached runner), when the box is found already on the latest
+    # build. Undoes the temporary Windows Update policy changes through the verified restore.
+    if (-not (Test-Path $IPU_AURestoreFile)) { return }
+    if (Restore-WursaPolicyRecord -RecordFile $IPU_AURestoreFile) {
+        Write-Host "      Restored original Windows Update policy values (auto-update, active hours and release pin)." -ForegroundColor $DimCol
+    } else {
+        Write-Host "      [!] Could not fully restore the Windows Update policy values; the record is kept and the next run will retry." -ForegroundColor $WarnCol
+    }
 }
 
 function Test-WUFeatureUpdateStaged {
@@ -712,50 +767,49 @@ function Test-WUFeatureUpdateStaged {
     return $false
 }
 
-function Get-WursaVerifierScript {
-    # Builds a one-shot post-reboot verifier. It runs as SYSTEM at startup, waits
-    # for normal boot to settle, verifies DisplayVersion, and restores the temporary
-    # Windows Update policy overrides only after the target release is actually committed.
-    param([string]$StatusFile, [string]$RestoreFile, [string]$VerifyTaskName, [int]$TargetBuild)
-    @"
-`$ErrorActionPreference = 'SilentlyContinue'
-Start-Sleep -Seconds 180
-`$cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
-`$ver = `$cv.DisplayVersion
-`$build = `$cv.CurrentBuild
-`$ubr = `$cv.UBR
-`$stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-if ([int]`$build -ge $TargetBuild) {
-    "VERIFIED `$ver `$build.`$ubr `$stamp" | Out-File -FilePath '$StatusFile' -Encoding ASCII -Force
-    if (Test-Path '$RestoreFile') {
-        `$polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-        `$auk  = "`$polk\AU"
-        `$map  = @{}
-        foreach (`$line in (Get-Content '$RestoreFile' -ErrorAction SilentlyContinue)) {
-            if (`$line -match '^([^=]+)=(.+)$') { `$map[`$matches[1]] = `$matches[2] }
+function Write-WursaStatusFile {
+    param([string]$Path, [string]$Text)
+    try { [System.IO.File]::WriteAllText($Path, ($Text + "`r`n"), [System.Text.Encoding]::ASCII) } catch {}
+}
+
+function Invoke-WursaVerifyRun {
+    # The post-reboot check, as a function so the shipped code is the tested code. Returns the exit code.
+    # A committed build restores the temporary policy changes and removes the task, but only if the
+    # restore verified; otherwise the task and the record stay so the next boot retries.
+    param([string]$StatusFile, [string]$RestoreFile, [string]$VerifyTaskName, [int]$TargetBuild, [int]$SettleSeconds = 180)
+    if ($SettleSeconds -gt 0) { Start-Sleep -Seconds $SettleSeconds }
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $ver = $cv.DisplayVersion
+    $build = $cv.CurrentBuild
+    $ubr = $cv.UBR
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    if ([int]$build -ge $TargetBuild) {
+        if (Restore-WursaPolicyRecord -RecordFile $RestoreFile) {
+            Write-WursaStatusFile -Path $StatusFile -Text "VERIFIED $ver $build.$ubr $stamp"
+            $null = Invoke-WursaNative -FilePath 'schtasks.exe' -Arguments @('/Delete', '/TN', $VerifyTaskName, '/F')
+            return 0
         }
-        `$targets = @{ NoAutoUpdate = `$auk; AUOptions = `$auk; SetActiveHours = `$polk; ActiveHoursStart = `$polk; ActiveHoursEnd = `$polk; ProductVersion = `$polk; TargetReleaseVersion = `$polk; TargetReleaseVersionInfo = `$polk }
-        foreach (`$name in @(`$targets.Keys)) {
-            `$key = `$targets[`$name]; `$orig = `$map[`$name]
-            if (`$null -eq `$orig -and `$name -match '^(ProductVersion|TargetReleaseVersion)') { continue }
-            if (`$null -eq `$orig -or `$orig -eq 'ABSENT') { Remove-ItemProperty -Path `$key -Name `$name -ErrorAction SilentlyContinue }
-            elseif (`$name -in @('ProductVersion','TargetReleaseVersionInfo')) { Set-ItemProperty -Path `$key -Name `$name -Value `$orig -Type String -Force }
-            else { Set-ItemProperty -Path `$key -Name `$name -Value ([int]`$orig) -Type DWord -Force }
-        }
-        Remove-Item '$RestoreFile' -Force -ErrorAction SilentlyContinue
+        Write-WursaStatusFile -Path $StatusFile -Text "VERIFIED_RESTORE_PENDING $ver $build.$ubr $stamp"
+        return 1
     }
-    schtasks.exe /Delete /TN '$VerifyTaskName' /F | Out-Null
-    exit 0
+    if (Test-Path 'HKLM:\SYSTEM\Setup\MoSetup\Volatile') {
+        Write-WursaStatusFile -Path $StatusFile -Text "VERIFY_PENDING VERSION_$ver BUILD_$build.$ubr $stamp"
+        return 0
+    }
+    Write-WursaStatusFile -Path $StatusFile -Text "FAILED_POSTREBOOT VERSION_$ver BUILD_$build.$ubr $stamp"
+    $null = Invoke-WursaNative -FilePath 'schtasks.exe' -Arguments @('/Delete', '/TN', $VerifyTaskName, '/F')
+    return 1
 }
-`$setupActive = Test-Path 'HKLM:\SYSTEM\Setup\MoSetup\Volatile'
-if (`$setupActive) {
-    "VERIFY_PENDING VERSION_`$ver BUILD_`$build.`$ubr `$stamp" | Out-File -FilePath '$StatusFile' -Encoding ASCII -Force
-    exit 0
-}
-"FAILED_POSTREBOOT VERSION_`$ver BUILD_`$build.`$ubr `$stamp" | Out-File -FilePath '$StatusFile' -Encoding ASCII -Force
-schtasks.exe /Delete /TN '$VerifyTaskName' /F | Out-Null
-exit 1
-"@
+
+function Get-WursaVerifierScript {
+    # Builds a one-shot post-reboot verifier. It runs as SYSTEM at startup and carries the tested
+    # functions it needs as source text, so what ships is what the tests ran.
+    param([string]$StatusFile, [string]$RestoreFile, [string]$VerifyTaskName, [int]$TargetBuild)
+    $names = 'Invoke-WursaNative', 'Initialize-WursaPolicyKey', 'Get-WursaPolicyValue', 'Set-WursaPolicyValue',
+             'Remove-WursaPolicyValue', 'Restore-WursaPolicyRecord', 'Write-WursaStatusFile', 'Invoke-WursaVerifyRun'
+    $src = ($names | ForEach-Object { Get-WursaFunctionSource -Name $_ }) -join "`r`n"
+    "`$ErrorActionPreference = 'SilentlyContinue'`r`n" + $src + "`r`n" +
+        "exit (Invoke-WursaVerifyRun -StatusFile '$StatusFile' -RestoreFile '$RestoreFile' -VerifyTaskName '$VerifyTaskName' -TargetBuild $TargetBuild)`r`n"
 }
 
 function Get-WursaPowerState {
@@ -956,6 +1010,14 @@ function Register-IPUPostRebootVerifier {
     Write-Output "WARN: post-reboot verifier could not be registered: $verifyOut"
     return $false
 }
+function Set-RebootRequired {
+    # A reboot is needed. Record whether the post-reboot verifier (which restores the temporary policy
+    # changes) is armed. If it could not be registered the state says so, and the final report tells the
+    # technician to run WURSA again after the reboot.
+    param([string]$Detail)
+    if (Register-IPUPostRebootVerifier) { Set-Status "REBOOT_REQUIRED $Detail" }
+    else { Set-Status "REBOOT_REQUIRED_UNARMED $Detail" }
+}
 function Invoke-IPUInstallationAssistant {
     param([string]$Reason)
     Write-Output "Routing to Windows 11 Installation Assistant ($Reason)."
@@ -997,8 +1059,7 @@ function Invoke-IPUInstallationAssistant {
         $iaCode = $iaProc.ExitCode
         Write-Output "Installation Assistant exited with code $iaCode."
         if ($iaCode -eq 0 -or $iaCode -eq 3010) {
-            $null = Register-IPUPostRebootVerifier
-            Set-Status "REBOOT_REQUIRED IA $iaStamp"
+            Set-RebootRequired -Detail "IA $iaStamp"
         } else {
             Write-Output "Installation Assistant could not complete (exit $iaCode); falling back to Windows Update."
             Invoke-IPUWindowsUpdate -Reason "Assistant exit $iaCode"
@@ -1162,16 +1223,14 @@ function Invoke-IPUEnablementPackage {
             "wusa exit code: $ec (0x$('{0:X}' -f $ec))" | Out-File -FilePath $IPU_SetupLog -Encoding ASCII
             # 0 = applied; 3010 = applied, reboot required; 0x240006 (2359302) = already installed
             if ($ec -eq 0 -or $ec -eq 3010) {
-                $null = Register-IPUPostRebootVerifier
-                Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                Set-RebootRequired -Detail "3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                 Write-Output "eKB applied (exit $($codes[-1])). Reboot to finish $LatestVersion."
                 return
             }
             if ($ec -eq 2359302) {
                 $ekPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or (Test-Path "$env:SystemRoot\WinSxS\pending.xml")
                 if ($ekPending) {
-                    $null = Register-IPUPostRebootVerifier
-                    Set-Status "REBOOT_REQUIRED 3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                    Set-RebootRequired -Detail "3010 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                     Write-Output "eKB is already installed and servicing reports a pending reboot. Reboot to finish $LatestVersion."
                     return
                 }
@@ -1365,8 +1424,8 @@ if (-not $cancel) {
 
         $done = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         switch ($IPU_ExitCode) {
-            0           { $null = Register-IPUPostRebootVerifier; Set-Status "REBOOT_REQUIRED 3010 $done" }
-            3010        { $null = Register-IPUPostRebootVerifier; Set-Status "REBOOT_REQUIRED 3010 $done" }
+            0           { Set-RebootRequired -Detail "3010 $done" }
+            3010        { Set-RebootRequired -Detail "3010 $done" }
             -1047526908 { Invoke-IPUInstallationAssistant -Reason "0xC1900204 persists after store repair" }
             -1047527167 { Set-Status "BLOCK_HARD_COMPAT 0xC1900101 $done" }
             -1047526904 { Set-Status "BLOCK_APP_DRIVER 0xC1900208 $done" }
@@ -1446,6 +1505,9 @@ function Resolve-WursaFinalStatus {
     } else {
         & $add "[!] STATUS: FEATURE UPGRADE NOT COMPLETE (still $FinalVersion)" "Red"
         $code = 1
+    }
+    if ($IpuState -match '^REBOOT_REQUIRED_UNARMED') {
+        & $add "      The post-reboot verifier could not be registered: run WURSA again after the reboot to restore the temporary policy changes." $WarnCol
     }
     # Fold in the update pass: reboot first, then failures. Only a clean 0 is ever changed here.
     if ($code -eq 0 -and $RebootPending -and -not $upgradeActive) {
