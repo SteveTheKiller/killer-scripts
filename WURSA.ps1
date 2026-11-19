@@ -694,6 +694,124 @@ function Test-WursaOnBattery {
 }
 #endregion
 
+#region Staging directory
+# The SYSTEM upgrade task and the post-reboot verifier run scripts and media from the staging
+# directory, so a standard user must never own or write to it. C:\Windows\Temp lets any user
+# create a subfolder, and a folder a user creates there is theirs to rewrite.
+$script:WursaTrustedSids = @(
+    'S-1-5-18',        # SYSTEM
+    'S-1-5-32-544',    # Administrators
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'   # TrustedInstaller
+)
+
+function Get-WursaOwnerSid {
+    param([string]$Path)
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+}
+
+function Get-WursaDirectoryProblem {
+    # Returns $null when the directory is safe to run code from, otherwise the reason it is not.
+    param([string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer) { return 'not a directory' }
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return 'reparse point' }
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($script:WursaTrustedSids -notcontains $owner) { return "owner $owner" }
+        if (-not $acl.AreAccessRulesProtected) { return 'inherited permissions' }
+        foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -eq 'Allow' -and $script:WursaTrustedSids -notcontains $rule.IdentityReference.Value) {
+                return "access granted to $($rule.IdentityReference.Value)"
+            }
+        }
+    } catch {
+        return "unreadable ($($_.Exception.Message))"
+    }
+    return $null
+}
+
+function Set-WursaProtectedAcl {
+    # Removes inherited permissions and leaves SYSTEM and Administrators with full control.
+    param([string]$Path)
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $acl.SetAccessRuleProtection($true, $false)
+    # Drop any explicit grant to anyone else as well, in case the directory carried one.
+    foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
+        if ($script:WursaTrustedSids -notcontains $rule.IdentityReference.Value) { $acl.PurgeAccessRules($rule.IdentityReference) }
+    }
+    foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            ([System.Security.Principal.SecurityIdentifier]$sid), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+}
+
+function Initialize-WursaWorkDir {
+    # Returns @{ Ready; Reason; MovedAside }. A usable directory is one we created with a protected
+    # admin-only ACL, or an existing one that already meets that bar. Anything else is renamed aside
+    # (never run from) and replaced. If that is not possible the caller must refuse to continue.
+    param([string]$Path)
+    $res = [pscustomobject]@{ Ready = $false; Reason = ''; MovedAside = $null }
+    $asideTrusted = $false
+    if (Test-Path -LiteralPath $Path) {
+        $problem = Get-WursaDirectoryProblem -Path $Path
+        if (-not $problem) { $res.Ready = $true; return $res }
+        $asideTrusted = ($problem -notmatch '^(owner|reparse|not a directory|unreadable)')
+        $aside = "$Path.untrusted-$(Get-Date -Format 'yyyyMMddHHmmss')"
+        try {
+            Move-Item -LiteralPath $Path -Destination $aside -ErrorAction Stop
+        } catch {
+            $res.Reason = "existing directory is not trusted ($problem) and could not be moved aside: $($_.Exception.Message)"
+            return $res
+        }
+        $res.MovedAside = $aside
+    }
+    try {
+        # No -Force: creation must fail if something else got there first.
+        New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
+        Set-WursaProtectedAcl -Path $Path
+    } catch {
+        $res.Reason = "could not create a protected directory: $($_.Exception.Message)"
+        return $res
+    }
+    $problem = Get-WursaDirectoryProblem -Path $Path
+    if ($problem) { $res.Reason = "new directory failed verification ($problem)"; return $res }
+    if (@(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count -ne 0) {
+        $res.Reason = 'new directory was not empty'
+        return $res
+    }
+    # Carry the policy restore record across, but only if an admin or SYSTEM wrote it.
+    if ($res.MovedAside -and $asideTrusted) {
+        $old = Join-Path $res.MovedAside 'au_restore.txt'
+        try {
+            if ((Test-Path -LiteralPath $old) -and ($script:WursaTrustedSids -contains (Get-WursaOwnerSid -Path $old))) {
+                Copy-Item -LiteralPath $old -Destination (Join-Path $Path 'au_restore.txt') -ErrorAction Stop
+            }
+        } catch {}
+    }
+    $res.Ready = $true
+    $res
+}
+
+function Confirm-WursaWorkDir {
+    # Once per run: make sure the staging directory is safe, tell the technician what happened.
+    param([string]$Path)
+    if ($script:WorkDirChecked -and $script:WorkDirChecked.Path -eq $Path) { return $script:WorkDirChecked.Ready }
+    $r = Initialize-WursaWorkDir -Path $Path
+    if ($r.MovedAside) {
+        Write-Host "      [!] $Path was not trusted and was moved to $($r.MovedAside). Review and delete it." -ForegroundColor $WarnCol
+    }
+    if (-not $r.Ready) {
+        Write-Host "      [!] Staging directory refused: $($r.Reason)" -ForegroundColor Red
+    }
+    $script:WorkDirChecked = [pscustomobject]@{ Path = $Path; Ready = [bool]$r.Ready }
+    [bool]$r.Ready
+}
+#endregion
+
 #region Final status
 function Resolve-WursaFinalStatus {
     # Maps the run state to the exit code and the status lines. The text always agrees with the code.
@@ -775,6 +893,7 @@ $script:StepOpen = $false
 # feature update.
 $script:FeatureUpdateStaged = $false
 $script:FeatureUpgradeState = "UNKNOWN"
+$script:WorkDirChecked = $null
 $ProgressPreference = 'SilentlyContinue'   # suppress console-wide progress overlays (VSS/BITS/Invoke-WebRequest)
 
 #region 0 - Pre-Flight
@@ -851,13 +970,14 @@ $IPU_WorkDir          = "C:\Windows\Temp\25H2IPU"
 $IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
 $IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
 $IPU_ActiveHoursEnd   = 19
-if (-not $NoUpgrade -and $WinBuild -lt $LatestBuild) {
+if (-not $NoUpgrade -and $WinBuild -lt $LatestBuild -and -not (Confirm-WursaWorkDir -Path $IPU_WorkDir)) {
+    Write-Host "      [!] Windows Update policy left untouched; the upgrade will not be dispatched." -ForegroundColor $WarnCol
+} elseif (-not $NoUpgrade -and $WinBuild -lt $LatestBuild) {
     Write-Host "[>] Opening Windows Update policy for the update pass..." -ForegroundColor $LineCol
     $_polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $_auk  = "$_polk\AU"
     if (-not (Test-Path $_polk)) { New-Item -Path $_polk -Force | Out-Null }
     if (-not (Test-Path $_auk))  { New-Item -Path $_auk  -Force | Out-Null }
-    if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
     # Record originals once, in the same format Restore-WUUpgradeOverrides expects.
     if (-not (Test-Path $IPU_AURestoreFile)) {
         $_noAuto = (Get-ItemProperty -Path $_auk  -Name NoAutoUpdate     -ErrorAction SilentlyContinue).NoAutoUpdate
@@ -980,8 +1100,9 @@ if ($NoUpgrade) {
     $script:FeatureUpdateStaged = $true
     $script:FeatureUpgradeState = "REBOOT_REQUIRED"
     Write-Host "      > $LatestVersion is staged by Windows Update and requires a reboot." -ForegroundColor $DimCol
-    if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
-    ('REBOOT_REQUIRED WU ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
+    if (Confirm-WursaWorkDir -Path $IPU_WorkDir) {
+        ('REBOOT_REQUIRED WU ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
+    }
 } elseif ($InstalledBuild -lt $LatestBuild) {
     Write-Host "      > Feature update available." -ForegroundColor $WarnCol
     # Battery safety
@@ -1028,7 +1149,10 @@ if ($NoUpgrade) {
             Write-Host "[>] Dispatching detached feature-upgrade workflow (survives session disconnect)..." -ForegroundColor $LineCol
         }
 
-        if (-not (Test-Path $IPU_WorkDir)) { New-Item -ItemType Directory -Path $IPU_WorkDir -Force | Out-Null }
+        if (-not (Confirm-WursaWorkDir -Path $IPU_WorkDir)) {
+            $script:FeatureUpgradeState = "BLOCKED_WORKDIR"
+            Write-Host "      [!] Upgrade not dispatched: $IPU_WorkDir is not a protected directory." -ForegroundColor Red
+        } else {
 
         # One-shot post-reboot verifier, built by Get-WursaVerifierScript.
         $VerifierBody = Get-WursaVerifierScript -StatusFile $IPU_StatusFile -RestoreFile $IPU_AURestoreFile -VerifyTaskName $IPU_VerifyTaskName -TargetBuild $LatestBuild
@@ -1530,6 +1654,7 @@ schtasks.exe /Delete /TN "$IPU_TaskName" /F | Out-Null
             ('FAILED TASK_CREATE ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
             Write-Host "      [!] Failed to register scheduled task: $createOut" -ForegroundColor Red
         }
+        }   # staging directory trusted
     }
 } else {
     $script:FeatureUpgradeState = "CURRENT"
@@ -1555,7 +1680,8 @@ if (-not $RebootPending) {
 $_finalCV      = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
 $_finalVersion = $_finalCV.DisplayVersion
 $_ipuState     = ""
-if (Test-Path $IPU_StatusFile) {
+# Only read the status file from a directory that is still protected; anything else could be forged.
+if (-not (Get-WursaDirectoryProblem -Path $IPU_WorkDir) -and (Test-Path $IPU_StatusFile)) {
     try { $_ipuState = (Get-Content $IPU_StatusFile -ErrorAction Stop | Select-Object -First 1).Trim() } catch {}
 }
 

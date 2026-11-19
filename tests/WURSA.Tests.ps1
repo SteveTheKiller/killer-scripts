@@ -29,6 +29,47 @@ BeforeAll {
         }
         return $null
     }
+
+    $script:SidSystem = 'S-1-5-18'
+    $script:SidAdmins = 'S-1-5-32-544'
+    $script:SidUsers  = 'S-1-5-32-545'
+    $script:SidUser   = 'S-1-5-21-1000-2000-3000-1001'
+
+    function New-FakeAcl {
+        param([string]$OwnerSid, [string[]]$AllowSids = @(), [bool]$Protected = $true)
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetOwner([System.Security.Principal.SecurityIdentifier]$OwnerSid)
+        $acl.SetAccessRuleProtection($Protected, $false)
+        foreach ($s in $AllowSids) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(([System.Security.Principal.SecurityIdentifier]$s), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            $acl.AddAccessRule($rule)
+        }
+        $acl
+    }
+
+    # Mocks the whole machine for a Main-level run. Build 26100 is a 24H2 box that needs the upgrade.
+    function Set-MainMocks {
+        param([int]$Build = 26100, [string]$Version = '24H2')
+        $script:MainBuild = $Build
+        $script:MainVersion = $Version
+        Mock Test-WursaElevated { $true }
+        Mock Get-CimInstance {
+            if ($ClassName -eq 'Win32_Battery' -or $Class -eq 'Win32_Battery') { return $null }
+            if ($ClassName -eq 'Win32_Processor' -or $Class -eq 'Win32_Processor') { return [pscustomobject]@{ Architecture = 9 } }
+            [pscustomobject]@{ Caption = 'Windows 11 Pro'; BuildNumber = "$script:MainBuild"; OSArchitecture = '64-bit'; LastBootUpTime = (Get-Date).AddDays(-1) }
+        }
+        Mock Get-ItemProperty { [pscustomobject]@{ DisplayVersion = $script:MainVersion; CurrentBuild = "$script:MainBuild"; UBR = 9300; InstallLanguage = '0409'; CompositionEditionID = 'Professional'; EditionID = 'Professional'; ProductName = 'Windows 11 Pro' } }
+        Mock Get-ItemProperty { $null } -ParameterFilter { $Path -like '*Auto Update*RebootRequired' }
+        Mock Test-Path { $false }
+        Mock Invoke-WursaRestorePoint { @{ Result = 'OK'; Message = '' } }
+        Mock Register-WursaProductService { }
+        Mock Invoke-WursaWindowsUpdatePass { [pscustomobject]@{ Status = 'UpToDate'; Found = 0; Succeeded = 0; Failed = 0; RebootRequired = $false; Error = $null; Searcher = $null; FeatureOffered = $false } }
+        Mock Invoke-WursaThirdPartyUpdate { [pscustomobject]@{ Status = 'Skipped'; Succeeded = 0; Failed = 0; RebootRequired = $false } }
+        Mock Restart-Service { }
+        $script:said = New-Object System.Collections.ArrayList
+        Mock Write-Host { [void]$script:said.Add([string]$Object) }
+        Mock Write-HLine { }
+    }
 }
 
 Describe 'Entry point convention' {
@@ -109,5 +150,130 @@ Describe 'UI helpers without a console' {
         Mock Get-WursaCursorTop { -1 }
         Mock Write-Host { }
         { Write-StepUpdate '[1/5] Test...'; Write-StepUpdate -Success -CustomInfo '(ok)'; Write-SubResult '[OK]' 'Green' } | Should -Not -Throw
+    }
+}
+
+Describe 'Staging directory ownership (finding 48)' {
+    BeforeEach {
+        $script:Acls = @{}
+        $script:SetAclCalls = New-Object System.Collections.ArrayList
+        Mock Get-Acl {
+            $p = if ($LiteralPath) { [string]$LiteralPath } else { [string]$Path }
+            if ($script:Acls.ContainsKey($p)) { return $script:Acls[$p] }
+            # A directory created by an elevated admin: owned by Administrators, inherits Users create rights.
+            New-FakeAcl -OwnerSid $SidAdmins -AllowSids @($SidSystem, $SidAdmins, $SidUsers) -Protected $false
+        }
+        Mock Set-Acl {
+            $p = if ($LiteralPath) { [string]$LiteralPath } else { [string]$Path }
+            $script:Acls[$p] = $AclObject
+            [void]$script:SetAclCalls.Add(@{ Path = $p; Acl = $AclObject })
+        }
+        # A move carries the ACLs that were registered for the old path to the new one.
+        Mock Move-Item {
+            $src = [string]$LiteralPath; $dst = [string]$Destination
+            foreach ($k in @($script:Acls.Keys)) {
+                if ($k -eq $src -or $k.StartsWith($src + '')) {
+                    $script:Acls[$dst + $k.Substring($src.Length)] = $script:Acls[$k]
+                    $script:Acls.Remove($k)
+                }
+            }
+            [System.IO.Directory]::Move($src, $dst)
+        }
+        $script:Dir = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+    }
+
+    It 'creates a missing directory with a protected admin-only ACL before anything is written' {
+        $r = Initialize-WursaWorkDir -Path $script:Dir
+        $r.Ready | Should -BeTrue
+        Test-Path -LiteralPath $script:Dir | Should -BeTrue
+        $script:SetAclCalls.Count | Should -Be 1
+        $acl = $script:SetAclCalls[0].Acl
+        $acl.AreAccessRulesProtected | Should -BeTrue
+        $sids = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+        $sids | Should -Be @($SidAdmins, $SidSystem | Sort-Object)
+    }
+
+    It 'reclaims a directory a standard user pre-created by moving it aside and creating a fresh one' {
+        New-Item -ItemType Directory -Path $script:Dir | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:Dir 'Invoke-IPU.ps1') -Value 'planted'
+        $script:Acls[$script:Dir] = New-FakeAcl -OwnerSid $SidUser -AllowSids @($SidUser, $SidSystem) -Protected $false
+        $r = Initialize-WursaWorkDir -Path $script:Dir
+        $r.Ready | Should -BeTrue
+        $r.MovedAside | Should -Not -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $r.MovedAside 'Invoke-IPU.ps1') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:Dir 'Invoke-IPU.ps1') | Should -BeFalse
+    }
+
+    It 'treats an admin-owned directory that still inherits Users permissions as untrusted' {
+        New-Item -ItemType Directory -Path $script:Dir | Out-Null
+        $script:Acls[$script:Dir] = New-FakeAcl -OwnerSid $SidAdmins -AllowSids @($SidSystem, $SidAdmins, $SidUsers) -Protected $false
+        (Get-WursaDirectoryProblem -Path $script:Dir) | Should -Not -BeNullOrEmpty
+    }
+
+    It 'reuses a directory that is already owned by an admin with a protected admin-only ACL' {
+        New-Item -ItemType Directory -Path $script:Dir | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:Dir 'keep.txt') -Value 'x'
+        $script:Acls[$script:Dir] = New-FakeAcl -OwnerSid $SidSystem -AllowSids @($SidSystem, $SidAdmins) -Protected $true
+        $r = Initialize-WursaWorkDir -Path $script:Dir
+        $r.Ready | Should -BeTrue
+        $r.MovedAside | Should -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $script:Dir 'keep.txt') | Should -BeTrue
+        $script:SetAclCalls.Count | Should -Be 0
+    }
+
+    It 'refuses when an untrusted directory cannot be moved aside' {
+        New-Item -ItemType Directory -Path $script:Dir | Out-Null
+        $script:Acls[$script:Dir] = New-FakeAcl -OwnerSid $SidUser -AllowSids @($SidUser) -Protected $false
+        Mock Move-Item { throw 'in use' }
+        $r = Initialize-WursaWorkDir -Path $script:Dir
+        $r.Ready | Should -BeFalse
+        $r.Reason | Should -Match 'move'
+    }
+
+    It 'refuses when the freshly created directory turns out to be owned by someone else (race)' {
+        Mock Set-Acl { }
+        $script:Acls[$script:Dir] = New-FakeAcl -OwnerSid $SidUser -AllowSids @($SidUser) -Protected $false
+        # The directory does not exist yet, so the creation succeeds, but the owner read back is the attacker.
+        $r = Initialize-WursaWorkDir -Path $script:Dir
+        $r.Ready | Should -BeFalse
+    }
+
+    It 'keeps a trusted restore record when it moves an old directory aside' {
+        New-Item -ItemType Directory -Path $script:Dir | Out-Null
+        $rec = Join-Path $script:Dir 'au_restore.txt'
+        Set-Content -LiteralPath $rec -Value 'NoAutoUpdate=1'
+        $script:Acls[$script:Dir] = New-FakeAcl -OwnerSid $SidAdmins -AllowSids @($SidSystem, $SidAdmins, $SidUsers) -Protected $false
+        $script:Acls[$rec] = New-FakeAcl -OwnerSid $SidAdmins -AllowSids @($SidSystem, $SidAdmins) -Protected $false
+        $r = Initialize-WursaWorkDir -Path $script:Dir
+        $r.Ready | Should -BeTrue
+        Get-Content -LiteralPath (Join-Path $script:Dir 'au_restore.txt') | Should -Be 'NoAutoUpdate=1'
+    }
+
+    It 'does not carry over a restore record owned by an untrusted user' {
+        New-Item -ItemType Directory -Path $script:Dir | Out-Null
+        $rec = Join-Path $script:Dir 'au_restore.txt'
+        Set-Content -LiteralPath $rec -Value 'NoAutoUpdate=1'
+        $script:Acls[$script:Dir] = New-FakeAcl -OwnerSid $SidAdmins -AllowSids @($SidSystem, $SidAdmins, $SidUsers) -Protected $false
+        $script:Acls[$rec] = New-FakeAcl -OwnerSid $SidUser -AllowSids @($SidUser) -Protected $false
+        $r = Initialize-WursaWorkDir -Path $script:Dir
+        $r.Ready | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:Dir 'au_restore.txt') | Should -BeFalse
+    }
+}
+
+Describe 'Staging directory ownership in a full run (finding 48)' {
+    It 'does not open Windows Update policy or dispatch when the staging directory cannot be trusted' {
+        $InplaceUpgrade = [switch]$true
+        $No3rdParty = [switch]$true
+        $NoUpgrade = [switch]$false
+        Set-MainMocks
+        $script:writes = New-Object System.Collections.ArrayList
+        Mock Initialize-WursaWorkDir { [pscustomobject]@{ Ready = $false; Reason = 'owner S-1-5-21-1-2-3-1001'; MovedAside = $null } }
+        Mock Set-ItemProperty { [void]$script:writes.Add($Name) } -ParameterFilter { $true }
+        Mock New-Item { throw 'must not create anything' }
+        Mock Invoke-WursaNative { throw 'must not register a task' }
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 1
+        $script:writes.Count | Should -Be 0
+        ($script:said -join "`n") | Should -Match 'BLOCKED_WORKDIR'
     }
 }
