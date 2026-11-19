@@ -9,10 +9,10 @@
     reboot on completion.
     Domain controllers (DomainRole 4 and 5) are refused: renaming a DC
     needs netdom computername, not this tool.
-    URT asks for the name at a console. Without one it exits 2 and
+    URT asks for the name at a console. Without one it exits 1 and
     changes nothing. An unanswered restart question means no restart.
-    Exit codes: 0 done or cancelled, 1 rename failed, 2 not elevated, no
-    console or a domain controller, 3010 renamed and a restart is needed.
+    Exit codes: 0 done or cancelled, 1 rename failed, not elevated, no
+    console or a domain controller.
 #>
 
 function Exit-KillerScript {
