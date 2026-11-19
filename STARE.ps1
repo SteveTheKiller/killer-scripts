@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Scheduled Task Administration & Routine Executor (S.T.A.R.E.) v1.1
-    Developed by SteveTheKiller | Updated: 2026-03-13
+    Scheduled Task Administration & Routine Executor (S.T.A.R.E.) v2.0
+    Developed by SteveTheKiller | Updated: 2026-11-19
 .DESCRIPTION
     A clean, interactive terminal wizard that makes Windows Scheduled
     Task management fast and reliable for technicians. Supports Daily,
@@ -131,7 +131,7 @@ function Get-StareScheduleService {
 $script:Acronym    = "STARE"
 $script:AcronymFmt = ($script:Acronym.ToCharArray() -join '.') + '.'
 $script:ScriptName = "Scheduled Task Administration & Routine Executor"
-$script:Version    = "v1.1"
+$script:Version    = "v2.0"
 
 $script:Width = 85
 
