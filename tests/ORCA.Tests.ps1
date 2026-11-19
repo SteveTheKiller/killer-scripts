@@ -15,6 +15,7 @@ BeforeAll {
     # The real profile reader, kept before any test mocks Get-OrcaProfile.
     $script:RealGetOrcaProfile = ${function:Get-OrcaProfile}
     $script:RealReadOrcaKey = ${function:Read-OrcaKey}
+    $script:RealReadOrcaLine = ${function:Read-OrcaLine}
 
     function New-OrcaKey {
         param([string]$Key = 'Enter', [string]$Char = "`r")
@@ -73,6 +74,7 @@ Describe 'ORCA' {
         Mock Get-ActiveUser { $script:Active }
         Mock Read-OrcaKey { if ($script:Keys.Count -gt 0) { $script:Keys.Dequeue() } else { throw 'no console' } }
         Mock Read-Host { throw 'Read-Host must not be reached in this test' }
+        Mock Read-OrcaLine { throw 'Read-OrcaLine must not be reached in this test' }
         Mock Clear-Host { }
         Mock Write-HLine { }
         Mock Write-Host { }
@@ -419,8 +421,42 @@ Describe 'ORCA' {
         }
     }
 
-    Context 'Get-OrcaProfile' {
+    Context 'Prompt fallbacks without a key reader (70)' {
         BeforeEach {
+            $script:Started = @()
+            $script:OldUser = $env:USERNAME
+            $env:USERNAME = 'alice'
+            $script:Outlook = Join-Path $TestDrive 'OUTLOOK.EXE'
+            Set-Content -LiteralPath $script:Outlook -Value 'synthetic exe'
+            Mock Get-ItemProperty { [pscustomobject]@{ '(default)' = $script:Outlook } } -ParameterFilter { "$Path" -like '*App Paths*' }
+        }
+        AfterEach { $env:USERNAME = $script:OldUser }
+
+        It 'a typed launch choice in the line fallback is honoured and launches Classic Outlook' {
+            # Profile alice, Both types, no OST reset, no extension purge. The launch menu then has no key reader.
+            foreach ($a in @(@('D0', '0'), @('D3', '3'), @('N', 'n'), @('N', 'n'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Mock Read-Host { '1' }
+            Mock Read-OrcaLine { '1' }
+            Invoke-OrcaRun
+            @($script:Started | Where-Object { $_.File -eq $script:Outlook }).Count | Should -Be 1
+        }
+
+        It 'a run with no console and no answers exits 2 instead of failing' {
+            Mock Read-OrcaKey { throw 'no console' }
+            Mock Read-OrcaLine { $null }
+            Invoke-OrcaRun
+            $script:Code | Should -Be 2
+            $script:Text | Should -Match 'ORCA RESULT: exit code 2 '
+            Assert-MockCalled Stop-Process -Times 0 -Exactly
+        }
+
+        It 'Read-OrcaLine returns null when Read-Host has no console' {
+            Mock Read-Host { throw 'no console' }
+            & $script:RealReadOrcaLine | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Get-OrcaProfile' {        BeforeEach {
             New-Item -Path 'TestRegistry:\ProfileList' -Force | Out-Null
             $script:LiveHome = Join-Path $TestDrive 'Users\alice.CONTOSO'
             New-Item -ItemType Directory -Path $script:LiveHome -Force | Out-Null

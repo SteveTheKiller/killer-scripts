@@ -86,6 +86,18 @@ function Read-OrcaKey {
     [Console]::ReadKey($true)
 }
 
+function Read-OrcaLine {
+    # One typed line, or $null when there is no console to ask. Never lets a console error escape.
+    try {
+        $line = Read-Host
+        if ($null -eq $line) { return $null }
+        return ([string]$line).Trim()
+    } catch {
+        if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
+        return $null
+    }
+}
+
 function Get-OrcaTempRoot { $env:TEMP }
 
 function Invoke-OrcaWinget {
@@ -524,7 +536,8 @@ function Invoke-OrcaMain {
                     $userChoice = if ($key.Key -eq [ConsoleKey]::Enter) { $_defaultValue } else { $key.KeyChar.ToString() }
                 } catch {
                     if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
-                    $raw = (Read-Host).Trim()
+                    $raw = Read-OrcaLine
+                    if ($null -eq $raw) { Exit-OrcaRun $EXIT_CANCEL "no console to ask which profile to reset, nothing was changed. Use -Silent for an unattended run." }
                     $userChoice = if ([string]::IsNullOrWhiteSpace($raw)) { $_defaultValue } else { $raw }
                 }
                 $script:AllUsers = ($userChoice -eq 'A' -or $userChoice -eq 'a')
@@ -574,7 +587,8 @@ function Invoke-OrcaMain {
                     else { Write-Host $key.KeyChar; $modeChoice = $key.KeyChar.ToString() }
                 } catch {
                     if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
-                    $raw = (Read-Host).Trim()
+                    $raw = Read-OrcaLine
+                    if ($null -eq $raw) { Exit-OrcaRun $EXIT_CANCEL "no console to ask which Outlook to reset, nothing was changed. Use -Silent for an unattended run." }
                     if ([string]::IsNullOrWhiteSpace($raw)) { $modeChoice = "3" }
                     elseif ($raw -eq 'q' -or $raw -eq 'Q') { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-OrcaRun $EXIT_CANCEL "cancelled by the operator, nothing was changed." }
                     else { $modeChoice = $raw }
@@ -609,7 +623,7 @@ function Invoke-OrcaMain {
                 $script:DeleteOST = ($ostChoice -eq 'Y' -or $ostChoice -eq 'y')
             } catch {
                 if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
-                $raw = (Read-Host).Trim()
+                $raw = Read-OrcaLine
                 if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "N" }
                 $script:DeleteOST = ($raw -eq 'Y' -or $raw -eq 'y')
             }
@@ -632,7 +646,7 @@ function Invoke-OrcaMain {
                 $script:PurgeExtensions = ($extChoice -eq 'Y' -or $extChoice -eq 'y')
             } catch {
                 if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
-                $raw = (Read-Host).Trim()
+                $raw = Read-OrcaLine
                 if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "N" }
                 $script:PurgeExtensions = ($raw -eq 'Y' -or $raw -eq 'y')
             }
@@ -897,7 +911,7 @@ function Invoke-OrcaMain {
                     # This case may not be hit if IsSystem check is unreliable, but keep for robustness
                     Write-Host ""
                     Write-Host "NOTE: Script running as 'SYSTEM', target is '$($TargetUsers[0].Name)'." -ForegroundColor $WarnCol
-                } elseif ($TargetUsers[0].Name -ne $env:USERNAME) {
+                } elseif ($TargetUsers[0].Sid -ne (Get-OrcaCurrentSid)) {
                     Write-Host ""
                     Write-Host "NOTE: Script running as '$env:USERNAME', target is '$($TargetUsers[0].Name)'." -ForegroundColor $WarnCol
                     Write-Host "Please launch Outlook manually as the target user." -ForegroundColor $DimCol
@@ -915,7 +929,7 @@ function Invoke-OrcaMain {
                             if ($yn -eq "Y" -or $yn -eq "y") { $launchChoice = "2" }
                         } catch {
                             if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
-                            $raw = (Read-Host).Trim(); if ($raw -eq "" -or $raw -eq "Y" -or $raw -eq "y") { $launchChoice = "2" }
+                            $raw = Read-OrcaLine; if ($null -ne $raw -and ($raw -eq "" -or $raw -eq "Y" -or $raw -eq "y")) { $launchChoice = "2" }
                         }
                     } elseif ($script:OutlookMode -eq "Classic") {
                         Write-Host "Launch Classic Outlook?" -ForegroundColor $InfoCol
@@ -928,7 +942,7 @@ function Invoke-OrcaMain {
                             if ($yn -eq "Y" -or $yn -eq "y") { $launchChoice = "1" }
                         } catch {
                             if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
-                            $raw = (Read-Host).Trim(); if ($raw -eq "" -or $raw -eq "Y" -or $raw -eq "y") { $launchChoice = "1" }
+                            $raw = Read-OrcaLine; if ($null -ne $raw -and ($raw -eq "" -or $raw -eq "Y" -or $raw -eq "y")) { $launchChoice = "1" }
                         }
                     } else {
                         Write-Host "Launch Outlook?" -ForegroundColor $LineCol
@@ -943,8 +957,8 @@ function Invoke-OrcaMain {
                             $launchChoice = if ($key.Key -eq [ConsoleKey]::Escape -or $key.Key -eq [ConsoleKey]::Enter) { "N" } else { $key.KeyChar.ToString() }
                         } catch {
                             if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw }
-                            $raw = (Read-Host).Trim()
-                            if ([string]::IsNullOrWhiteSpace($raw)) { $launchChoice = "N" } else { $raw }
+                            $raw = Read-OrcaLine
+                            if ([string]::IsNullOrWhiteSpace($raw)) { $launchChoice = "N" } else { $launchChoice = $raw }
                         }
                     }
 
