@@ -762,4 +762,70 @@ Context 'Finding 04: the summary and exit code follow the per-target results' {
         $script:Text | Should -Match 'BEAM RESULT: exit code 1 -'
         (Get-FakeCalls -Method POST -Pattern '/assign$').Count | Should -Be 0
     }
+}
+
+Context 'Finding 62: the installer to be deployed is identified before it is packaged' {
+    BeforeEach {
+        Add-FakeDevice 'PC01'
+        $script:Signature = [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Contoso Software, O=Contoso Ltd' } }
+        Mock Get-AuthenticodeSignature { $script:Signature }
+        $script:Fetched = New-Object System.Collections.ArrayList
+        Mock Invoke-WebRequest {
+            [void]$script:Fetched.Add("$Uri")
+            if ("$Uri" -match 'landing') {
+                [IO.File]::WriteAllText($OutFile, '<html><a href="https://cdn.invalid/real/setup.exe">Download</a></html>')
+            } else {
+                [IO.File]::WriteAllBytes($OutFile, [byte[]](0x4D, 0x5A, 0x90, 0x00, 1, 2, 3, 4))
+            }
+        }
+    }
+
+    It 'shows the source URL, the SHA256 and the Authenticode signer before packaging' {
+        $r = Invoke-Deploy -Url 'https://files.invalid/setup.exe'
+        $r.Published | Should -BeTrue
+        $txt = $script:Log -join "`n"
+        $txt | Should -Match 'https://files\.invalid/setup\.exe'
+        $txt | Should -Match 'SHA256\)? ?[^\n]*[0-9A-Fa-f]{64}'
+        $txt | Should -Match 'Contoso Ltd'
+        $script:PackagerCalls.Count | Should -Be 1
+    }
+
+    It 'warns, but still deploys, when a URL the admin typed serves an unsigned installer' {
+        $script:Signature = [pscustomobject]@{ Status = 'NotSigned'; SignerCertificate = $null }
+        $r = Invoke-Deploy -Url 'https://files.invalid/setup.exe'
+        $r.Published | Should -BeTrue
+        ($script:Log -join "`n") | Should -Match 'NotSigned'
+    }
+
+    It 'refuses to package a link scraped from a page unless the technician confirms it' {
+        $script:Reads.Enqueue('n')
+        $r = Invoke-Deploy -Url 'https://files.invalid/landing'
+        $r.Published | Should -BeFalse
+        $script:PackagerCalls.Count | Should -Be 0
+        $txt = $script:Log -join "`n"
+        $txt | Should -Match 'https://cdn\.invalid/real/setup\.exe'
+        $txt | Should -Match 'Contoso Ltd'
+        (Get-FakeCalls -Method POST -Pattern 'mobileApps$').Count | Should -Be 0
+    }
+
+    It 'treats a blank answer as no for a scraped link' {
+        $r = Invoke-Deploy -Url 'https://files.invalid/landing'
+        $r.Published | Should -BeFalse
+        $script:PackagerCalls.Count | Should -Be 0
+    }
+
+    It 'packages a scraped link after an explicit yes' {
+        $script:Reads.Enqueue('y')
+        $r = Invoke-Deploy -Url 'https://files.invalid/landing'
+        $r.Published | Should -BeTrue
+        $script:PackagerCalls.Count | Should -Be 1
+        $script:Fetched | Should -Contain 'https://cdn.invalid/real/setup.exe'
+    }
+
+    It 'refuses a scraped link when there is no console to ask on' {
+        Mock Read-Host { throw 'Read-Host : Windows PowerShell is in NonInteractive mode.' }
+        $r = Invoke-Deploy -Url 'https://files.invalid/landing'
+        $r.Published | Should -BeFalse
+        $script:PackagerCalls.Count | Should -Be 0
+    }
 }}

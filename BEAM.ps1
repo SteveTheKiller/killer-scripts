@@ -292,6 +292,33 @@ function Read-BeamValue {
     return [string]$v
 }
 
+function Read-BeamConfirm {
+    # A yes/no question that defaults to no. No console, a blank answer or anything but y/yes is no.
+    param([string]$Prompt)
+    try { $a = Read-BeamValue "$Prompt [y/N]" } catch { return $false }
+    return ($a.Trim() -match '^(?i)y(es)?$')
+}
+
+function Show-BeamInstallerIdentity {
+    # Shows what is about to be packaged and deployed as SYSTEM: where it came from, its SHA256 and
+    # its Authenticode signer. Returns the signature status so a caller can react to an unsigned file.
+    param([string]$Path, [string]$SourceUrl)
+    if ($SourceUrl) { Write-Detail "Source URL" $SourceUrl }
+    $hash = ''
+    try { $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash } catch { $hash = "unavailable: $($_.Exception.Message)" }
+    Write-Detail "SHA256" $hash
+    $status = 'Unknown'; $signer = ''
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        $status = "$($sig.Status)"
+        if ($sig.SignerCertificate) { $signer = "$($sig.SignerCertificate.Subject)" }
+    } catch { $status = "unreadable ($($_.Exception.Message))" }
+    if ($status -eq 'Valid') { Write-Detail "Signer" $signer OK }
+    elseif ($signer)         { Write-Detail "Signer" "$signer (signature status: $status)" WARN }
+    else                     { Write-Detail "Signer" "none (signature status: $status)" WARN }
+    return $status
+}
+
 function Show-BeamBanner {
     $_pfx  = "█  "
     $_art1 = "╔╗  ╔═╗ ╔═╗ ╔╦╗ "
@@ -847,18 +874,34 @@ function Invoke-BeamPublish {
 
         # If the URL handed back a page instead of the binary, pull the real download link out of
         # it and fetch that instead. Runs silently, so a resolvable page just downloads normally.
+        $sourceUrl = $Url
+        $scraped = $false
         if (-not (Test-InstallerHeader -Path $localExe -IsMsi:$IsMsi)) {
             $direct = Resolve-DirectDownload -PagePath $localExe -PageUrl $Url
             if ($direct -and $direct -ne $Url) {
-                try { Invoke-WebRequest -Uri ([uri]$direct) -OutFile $localExe -ErrorAction Stop } catch { }
+                Write-StepUpdate "The URL returned a page, not an installer. It links to: $direct" WARN
+                try { Invoke-WebRequest -Uri ([uri]$direct) -OutFile $localExe -ErrorAction Stop; $sourceUrl = $direct; $scraped = $true }
+                catch { Write-StepUpdate "Download of the linked file failed: $_" FAIL; return (New-BeamPublishResult $false) }
             }
         }
         Write-StepUpdate "Downloaded: $localExe ($([math]::Round((Get-Item $localExe).Length/1MB,1)) MB)" OK
+        Write-StepUpdate "Identity of the file that will be deployed as SYSTEM:" INFO
+        $sigStatus = Show-BeamInstallerIdentity -Path $localExe -SourceUrl $sourceUrl
+        if ($scraped) {
+            # The admin typed a different URL. A link pulled out of a web page is not something they
+            # chose, so it is never deployed without an explicit yes.
+            if (-not (Read-BeamConfirm "This file was found in a web page, not typed by you. Deploy it")) {
+                Write-StepUpdate "Not confirmed: nothing was packaged or published." FAIL
+                return (New-BeamPublishResult $false)
+            }
+        }
     } else {
         Write-StepUpdate "Staging local file: $LocalPath" INFO
         try {
             Copy-Item -LiteralPath $LocalPath -Destination $localExe -Force -ErrorAction Stop
             Write-StepUpdate "Staged: $localExe ($([math]::Round((Get-Item $localExe).Length/1MB,1)) MB)" OK
+            Write-StepUpdate "Identity of the file that will be deployed as SYSTEM:" INFO
+            Show-BeamInstallerIdentity -Path $localExe | Out-Null
         } catch { Write-StepUpdate "Staging failed: $_" FAIL; return (New-BeamPublishResult $false) }
     }
 
