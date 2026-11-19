@@ -828,4 +828,87 @@ Context 'Finding 62: the installer to be deployed is identified before it is pac
         $r.Published | Should -BeFalse
         $script:PackagerCalls.Count | Should -Be 0
     }
+}
+
+Context 'Finding 63: IntuneWinAppUtil is pinned to a release and its Microsoft signature is verified' {
+    BeforeAll {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Get-KillerScriptPath BEAM), [ref]$null, [ref]$null)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Initialize-BeamTool' }, $true)
+        Invoke-Expression ($fn.Extent.Text -replace 'function Initialize-BeamTool', 'function Initialize-BeamToolReal')
+    }
+    BeforeEach {
+        $script:Sig = [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' } }
+        Mock Get-AuthenticodeSignature { $script:Sig }
+        $script:Fetches = New-Object System.Collections.ArrayList
+        Mock Invoke-WebRequest {
+            [void]$script:Fetches.Add([pscustomobject]@{ Uri = "$Uri"; OutFile = $OutFile })
+            [IO.File]::WriteAllBytes($OutFile, [byte[]](0x4D, 0x5A, 0x90, 0x00, 9, 9))
+        }
+        $script:ToolPath = Join-Path $script:WorkRoot 'IntuneWinAppUtil.exe'
+    }
+
+    It 'downloads from a pinned release tag, never from master' {
+        $r = Initialize-BeamToolReal
+        $r | Should -Be $script:ToolPath
+        $script:Fetches.Count | Should -Be 1
+        $script:Fetches[0].Uri | Should -Match '/raw/v\d+\.\d+\.\d+/IntuneWinAppUtil\.exe$'
+        $script:Fetches[0].Uri | Should -Not -Match 'master'
+    }
+
+    It 'downloads to a temporary name and only moves it into place after the signature is verified' {
+        Initialize-BeamToolReal | Out-Null
+        $script:Fetches[0].OutFile | Should -Not -Be $script:ToolPath
+        Test-Path -LiteralPath $script:ToolPath | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $script:WorkRoot -Filter '*.download*' -Force -ErrorAction SilentlyContinue).Count | Should -Be 0
+    }
+
+    It 'rejects and removes a download that is not signed' {
+        $script:Sig = [pscustomobject]@{ Status = 'NotSigned'; SignerCertificate = $null }
+        Initialize-BeamToolReal | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $script:ToolPath | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $script:WorkRoot -Force | Where-Object { $_.Name -ne 'IntuneWork' }).Count | Should -Be 0
+    }
+
+    It 'rejects a validly signed file whose signer is not Microsoft Corporation' {
+        $script:Sig = [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Evil Ltd, O=Evil Ltd, C=US' } }
+        Initialize-BeamToolReal | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $script:ToolPath | Should -BeFalse
+    }
+
+    It 'rejects a signer that only mentions Microsoft Corporation in another field' {
+        $script:Sig = [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=O=Microsoft Corporation, O=Evil Ltd, C=US' } }
+        Initialize-BeamToolReal | Should -BeNullOrEmpty
+    }
+
+    It 'reuses a cached copy without downloading when it still verifies' {
+        New-Item -ItemType Directory -Path $script:WorkRoot -Force | Out-Null
+        [IO.File]::WriteAllBytes($script:ToolPath, [byte[]](0x4D, 0x5A, 1, 2))
+        Initialize-BeamToolReal | Should -Be $script:ToolPath
+        $script:Fetches.Count | Should -Be 0
+    }
+
+    It 'replaces a cached copy that no longer verifies by downloading once more' {
+        New-Item -ItemType Directory -Path $script:WorkRoot -Force | Out-Null
+        [IO.File]::WriteAllBytes($script:ToolPath, [byte[]](0x4D, 0x5A, 1, 2))
+        $script:SigCalls = 0
+        Mock Get-AuthenticodeSignature {
+            $script:SigCalls++
+            if ($script:SigCalls -eq 1) { [pscustomobject]@{ Status = 'HashMismatch'; SignerCertificate = $null } } else { $script:Sig }
+        }
+        Initialize-BeamToolReal | Should -Be $script:ToolPath
+        $script:Fetches.Count | Should -Be 1
+    }
+
+    It 'fails closed and leaves no executable behind when the cached copy and the fresh download both fail' {
+        New-Item -ItemType Directory -Path $script:WorkRoot -Force | Out-Null
+        [IO.File]::WriteAllBytes($script:ToolPath, [byte[]](0x4D, 0x5A, 1, 2))
+        $script:Sig = [pscustomobject]@{ Status = 'HashMismatch'; SignerCertificate = $null }
+        Initialize-BeamToolReal | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $script:ToolPath | Should -BeFalse
+    }
+
+    It 'fails when the download itself fails' {
+        Mock Invoke-WebRequest { throw 'The remote server returned an error: (404) Not Found.' }
+        Initialize-BeamToolReal | Should -BeNullOrEmpty
+    }
 }}

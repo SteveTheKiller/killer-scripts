@@ -481,27 +481,60 @@ function Get-BeamWorkRoot {
     Join-Path $base "BEAM"
 }
 
+# IntuneWinAppUtil.exe is fetched from a fixed release tag, never a moving branch, and is only ever
+# executed after its Authenticode signature is valid and names Microsoft Corporation as the signer.
+$script:BeamToolTag = 'v1.8.7'
+
+function Test-BeamToolSignature {
+    # True only for a valid Authenticode signature whose subject has O=Microsoft Corporation.
+    param([string]$Path)
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        if ("$($sig.Status)" -ne 'Valid' -or -not $sig.SignerCertificate) { return $false }
+        return ("$($sig.SignerCertificate.Subject)" -match '(^|,\s*)O=Microsoft Corporation(,|$)')
+    } catch { return $false }
+}
+
 function Initialize-BeamTool {
-    # Returns the path of IntuneWinAppUtil.exe, downloading it when missing, or $null on failure.
+    # Returns the path of a verified IntuneWinAppUtil.exe, downloading it when missing or when the
+    # cached copy no longer verifies, or $null on failure. A file that fails verification is deleted
+    # and never run.
     $workRoot = Get-BeamWorkRoot
     $toolPath = Join-Path $workRoot "IntuneWinAppUtil.exe"
-    if (-not (Test-Path $workRoot)) { New-Item -ItemType Directory -Path $workRoot -Force | Out-Null }
-    if (-not (Test-Path $toolPath)) {
-        Write-StepUpdate "IntuneWinAppUtil not found, downloading..." INFO
-        try {
-            Invoke-WebRequest -Uri "https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe" -OutFile $toolPath -ErrorAction Stop
-            Write-StepUpdate "IntuneWinAppUtil ready at $toolPath" OK
-        } catch {
-            Write-StepUpdate "IntuneWinAppUtil download failed: cannot continue" FAIL
+    try { if (-not (Test-Path -LiteralPath $workRoot)) { New-Item -ItemType Directory -Path $workRoot -Force -ErrorAction Stop | Out-Null } }
+    catch { Write-StepUpdate "Could not create ${workRoot}: $($_.Exception.Message)" FAIL; return $null }
+
+    if (Test-Path -LiteralPath $toolPath) {
+        if (Test-BeamToolSignature $toolPath) {
+            Write-StepUpdate "IntuneWinAppUtil found at $toolPath (Microsoft signature verified)" OK
+            Write-Host ""
+            return $toolPath
+        }
+        Write-StepUpdate "The cached IntuneWinAppUtil does not carry a valid Microsoft signature: removing it." WARN
+        try { Remove-Item -LiteralPath $toolPath -Force -ErrorAction Stop }
+        catch { Write-StepUpdate "Could not remove the unverified copy: $($_.Exception.Message)" FAIL; return $null }
+    }
+
+    $url = "https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/$($script:BeamToolTag)/IntuneWinAppUtil.exe"
+    $tmp = Join-Path $workRoot ("IntuneWinAppUtil-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".download")
+    Write-StepUpdate "Downloading IntuneWinAppUtil $($script:BeamToolTag)..." INFO
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp -ErrorAction Stop
+        if (-not (Test-BeamToolSignature $tmp)) {
+            Write-StepUpdate "The downloaded IntuneWinAppUtil does not carry a valid Microsoft signature: discarded, nothing was run." FAIL
             return $null
         }
-    } else {
-        Write-StepUpdate "IntuneWinAppUtil found at $toolPath" OK
+        Move-Item -LiteralPath $tmp -Destination $toolPath -Force -ErrorAction Stop
+        Write-StepUpdate "IntuneWinAppUtil ready at $toolPath (Microsoft signature verified)" OK
+    } catch {
+        Write-StepUpdate "IntuneWinAppUtil download failed: cannot continue" FAIL
+        return $null
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { try { Remove-Item -LiteralPath $tmp -Force -ErrorAction Stop } catch { } }
     }
     Write-Host ""
     return $toolPath
 }
-
 function Get-BeamUtcNow { [DateTime]::UtcNow }
 
 function Invoke-BeamPackager {
