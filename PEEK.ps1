@@ -25,16 +25,25 @@ param(
 #region [0] - PRE-FLIGHT & CONFIGURATION
 # ============================================================================
 
+# Exit codes: 0 success, 1 failure, 2 not elevated, 3 partial, 3010 reboot required.
+# PEEK is read-only and never reboots, so it only ever returns 0, 1 or 2.
 $EXIT_SUCCESS = 0
-$EXIT_DENIED  = 3
+$EXIT_FAILURE = 1
+$EXIT_DENIED  = 2
 
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Warning "P.E.E.K. requires elevated privileges. Please run as Administrator or SYSTEM."
-    exit $EXIT_DENIED
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
 }
 
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding            = [System.Text.Encoding]::UTF8
+function Test-PEEKElevated {
+    try {
+        return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
 
 $script:Acronym    = "PEEK"
 $script:AcronymFmt = "P.E.E.K."
@@ -123,6 +132,11 @@ function Format-Age {
 function Format-Uptime {
     param([timespan]$Uptime)
     return "{0}d {1}h {2}m" -f $Uptime.Days, $Uptime.Hours, $Uptime.Minutes
+}
+
+function Clear-PEEKScreen {
+    # Clear-Host throws when there is no console, as in an RMM output pane.
+    try { Clear-Host } catch {}
 }
 
 function Write-HLine {
@@ -1047,7 +1061,7 @@ function Show-PEEKSnapshot {
     $readiness     = Get-PEEKReadiness
     $state         = Get-PEEKSystemState -OS $os -UpdateContext $updateContext -Processes $processes -Setup $setup -Compat $compat -Reboot $reboot
 
-    Clear-Host
+    Clear-PEEKScreen
     Write-Banner
 
     Write-Detail -Label "Device Name" -Value $env:COMPUTERNAME -ValueColor $script:ValueFG
@@ -1130,37 +1144,61 @@ function Show-PEEKSnapshot {
     Write-Host ("  " + (Get-TruncatedText -Text $liveText -MaxLength ($script:Width - 2))) -ForegroundColor $AccentCol
 }
 
-$script:BitLockerState = Get-PEEKBitLockerState
-$quit = $false
-
-while (-not $quit) {
-    Show-PEEKSnapshot
-
-    if ($Once) { break }
-
-    $deadline = (Get-Date).AddSeconds($RefreshSeconds)
-    while ((Get-Date) -lt $deadline -and -not $quit) {
-        try {
-            if ([Console]::KeyAvailable) {
-                $key = [Console]::ReadKey($true)
-                if ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) {
-                    $quit = $true
-                    break
-                }
-            }
-        } catch {}
-        Start-Sleep -Milliseconds 100
+function Invoke-PEEKMain {
+    if (-not (Test-PEEKElevated)) {
+        Write-Warning "P.E.E.K. requires elevated privileges. Please run as Administrator or SYSTEM."
+        Write-Output "[FAIL] P.E.E.K. not run: elevation required (exit $EXIT_DENIED)."
+        Exit-KillerScript $EXIT_DENIED
     }
-}
 
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+
+    $exitCode = $EXIT_SUCCESS
+    $finalLine = ""
+    try {
+        $script:BitLockerState = Get-PEEKBitLockerState
+        $quit = $false
+
+        while (-not $quit) {
+            Show-PEEKSnapshot
+
+            if ($Once) { break }
+
+            $deadline = (Get-Date).AddSeconds($RefreshSeconds)
+            while ((Get-Date) -lt $deadline -and -not $quit) {
+                try {
+                    if ([Console]::KeyAvailable) {
+                        $key = [Console]::ReadKey($true)
+                        if ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) {
+                            $quit = $true
+                            break
+                        }
+                    }
+                } catch {}
+                Start-Sleep -Milliseconds 100
+            }
+        }
+
+        if ($Once) { $finalLine = "[OK] P.E.E.K. snapshot complete. Read-only, nothing was changed (exit $EXIT_SUCCESS)." }
+        else       { $finalLine = "[OK] P.E.E.K. monitor stopped. Read-only, nothing was changed (exit $EXIT_SUCCESS)." }
+    } catch {
+        $exitCode = $EXIT_FAILURE
+        $finalLine = "[FAIL] P.E.E.K. stopped on an error: $($_.Exception.Message) (exit $EXIT_FAILURE)."
+    }
+
+    try {
+        Write-Footer -Text "READ-ONLY LIVE SERVICING MONITOR"
+    } catch {}
+
+    Write-Output $finalLine
+    Exit-KillerScript $exitCode
+}
 #endregion
 
-#region [5] - EXIT
+#region [5] - ENTRY POINT
 # ============================================================================
 
-try {
-    Write-Footer -Text "READ-ONLY LIVE SERVICING MONITOR"
-} catch {}
+if (-not $global:KillerScriptsTestMode) { Invoke-PEEKMain }
 
-exit $EXIT_SUCCESS
 #endregion
