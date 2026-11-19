@@ -812,385 +812,46 @@ function Confirm-WursaWorkDir {
 }
 #endregion
 
-#region Final status
-function Resolve-WursaFinalStatus {
-    # Maps the run state to the exit code and the status lines. The text always agrees with the code.
-    param(
-        [bool]$NoUpgrade, [int]$FinalBuild, [string]$FinalVersion, [string]$FeatureUpgradeState,
-        [string]$IpuState, [bool]$RebootPending
-    )
-    $lines = New-Object System.Collections.ArrayList
-    $code = 0
-    $add = { param($t, $c) [void]$lines.Add(@{ Text = $t; Color = $c }) }
-    if (-not $NoUpgrade -and $FinalBuild -ge $LatestBuild) {
-        & $add "STATUS: SYSTEM CURRENT ($FinalVersion)" $OkCol
-        $code = 0
-    } elseif ($NoUpgrade) {
-        if ($RebootPending) {
-            & $add "[!] STATUS: REBOOT REQUIRED" "Red"
-            $code = 3010
-        } else {
-            & $add "STATUS: UPDATE PASS COMPLETE" $OkCol
-            $code = 0
+#region Trust checks and the generated runner
+function Test-WursaSignedBinary {
+    # True only for an existing file with a valid Authenticode signature from the expected publisher.
+    # A pinned SHA-256 is optional, but when given it must match as well. This function is embedded
+    # in the generated SYSTEM runner, so keep it self-contained and ASCII.
+    param([string]$Path, [string]$PublisherPattern, [string]$Sha256)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        if ([string]$sig.Status -ne 'Valid') { return $false }
+        if (-not $sig.SignerCertificate) { return $false }
+        if ($sig.SignerCertificate.Subject -notmatch $PublisherPattern) { return $false }
+        if ($Sha256) {
+            if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Sha256) { return $false }
         }
-    } elseif ($FeatureUpgradeState -eq "REBOOT_REQUIRED") {
-        & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
-        $code = 3010
-    } elseif ($FeatureUpgradeState -match '^(FAILED|BLOCKED|NOT_STARTED)') {
-        & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
-        & $add "      Upgrade state: $FeatureUpgradeState" $WarnCol
-        $code = 1
-    } elseif ($FeatureUpgradeState -eq "DISPATCHED") {
-        if ($IpuState -match '^REBOOT_REQUIRED') {
-            & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
-            & $add "      Upgrade state: $IpuState" $DimCol
-            $code = 3010
-        } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
-            & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
-            & $add "      Upgrade state: $IpuState" $WarnCol
-            $code = 1
-        } else {
-            & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
-            if ($IpuState) { & $add "      Upgrade state: $IpuState" $DimCol }
-            $code = 0
-        }
-    } elseif ($IpuState -match '^REBOOT_REQUIRED') {
-        & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
-        & $add "      Upgrade state: $IpuState" $DimCol
-        $code = 3010
-    } elseif ($IpuState -match '^(DISPATCHED|RUNNING|DOWNLOADING|REPAIRING|VERIFY_PENDING|WU_HANDOFF)') {
-        & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
-        & $add "      Upgrade state: $IpuState" $DimCol
-        $code = 0
-    } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
-        & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
-        & $add "      Upgrade state: $IpuState" $WarnCol
-        $code = 1
-    } else {
-        & $add "[!] STATUS: FEATURE UPGRADE NOT COMPLETE (still $FinalVersion)" "Red"
-        $code = 1
+        return $true
+    } catch {
+        return $false
     }
-    [pscustomobject]@{ Code = $code; Lines = @($lines) }
 }
-#endregion
 
-function Invoke-WursaMain {
-# The body below is deliberately not indented: it keeps the diff small and keeps the
-# here-string terminators in the generated scripts at column 0.
-trap {
-    if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw $_ }
-    Write-Host "[!] Fatal: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "[!] STATUS: FAILED" -ForegroundColor Red
-    Exit-KillerScript 1
+function Get-WursaFunctionSource {
+    # Source text of a function defined in this script, ready to paste into a generated script.
+    param([string]$Name)
+    $sb = (Get-Command -Name $Name -CommandType Function).ScriptBlock
+    "function $Name {" + [Environment]::NewLine + $sb.ToString() + [Environment]::NewLine + "}"
 }
-$script:ExitCode = 0
-$script:StepRow  = -1
-$script:StepMsg  = ""
-$script:StepOpen = $false
-# Feature-upgrade state is tracked separately from ordinary Windows Update.
-# A surfaced/downloaded feature update is NOT considered staged. Region 5 owns
-# the deterministic feature upgrade path unless Windows reports a real reboot-ready
-# feature update.
-$script:FeatureUpdateStaged = $false
-$script:FeatureUpgradeState = "UNKNOWN"
-$script:WorkDirChecked = $null
-$ProgressPreference = 'SilentlyContinue'   # suppress console-wide progress overlays (VSS/BITS/Invoke-WebRequest)
 
-#region 0 - Pre-Flight
-if (-not (Test-WursaElevated)) {
-    Write-Warning "Elevation Required: Please run as Administrator."
-    Write-Host "[!] STATUS: NOT ELEVATED (run as Administrator)" -ForegroundColor Red
-    Exit-KillerScript 2
+function New-WursaRunnerScript {
+    # Config preamble (values injected by the caller), the shared functions, then the runner body.
+    param([string]$Config)
+    $shared = (Get-WursaFunctionSource -Name 'Test-WursaSignedBinary')
+    $Config + "`r`n" + $shared + "`r`n" + (Get-WursaRunnerBody)
 }
-# 1. Force session bypass to clear environment hurdles
-try { Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force -ErrorAction Stop } catch {}
-# 2. Re-register core paths to bypass the LiveConnect temp-path bug
-$env:PSModulePath = [Environment]::GetEnvironmentVariable("PSModulePath","Machine") + ";" + [Environment]::GetEnvironmentVariable("PSModulePath","User")
 
-# Baseline Data for UI
-$OS = Get-CimInstance Win32_OperatingSystem
-try { Clear-Host } catch {}
-
-# Header
-$_pfx  = "█  "
-$_art1 = "╦ ╦ ╦ ╦ ╦═╗ ╔═╗ ╔═╗ "
-$_art2 = "║║║ ║ ║ ╠╦╝ ╚═╗ ╠═╣ "
-$_art3 = "╚╩╝ ╚═╝ ╩╚═ ╚═╝ ╩ ╩ "
-$_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
-$_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
-$_fillW = $script:Width - $_pfx.Length - $_artW
-$_title = "WINDOWS UPDATE, REPAIR, & SYSTEM ALIGNMENT"
-$_tpad  = " " * ($_fillW - $_title.Length)
-Write-Host $_pfx -ForegroundColor $BorderCol -NoNewline; Write-Host $_art1 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
-Write-Host $_pfx -ForegroundColor $BorderCol -NoNewline; Write-Host $_art2 -ForegroundColor $ArtCol -NoNewline; Write-Host "$_title$_tpad" -ForegroundColor $MainCol
-Write-Host $_pfx -ForegroundColor $BorderCol -NoNewline; Write-Host $_art3 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
-
-Write-Host "[>] Device Name      : " -NoNewline -ForegroundColor $LineCol
-Write-Host "$($env:COMPUTERNAME)" -ForegroundColor $AccentCol
-Write-Host "[>] Operating System : " -NoNewline -ForegroundColor $LineCol
-$WinVer = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
-$WinBuild = [int](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuild
-Write-Host "$($OS.Caption) $WinVer (Build $($OS.BuildNumber))" -ForegroundColor $AccentCol
-Write-HLine -Style dashed
-
-#region 0.5 - System Restore Point
-# ============================================================================
-Write-StepUpdate "[1/5] Creating System Restore Point..."
-$_rp = Invoke-WursaRestorePoint -TimeoutSeconds 90
-if ($_rp.Result -eq 'OK') {
-    Write-StepUpdate -Success
-} elseif ($_rp.Result -eq 'TIMEOUT') {
-    Write-Host "      [!] Restore point $($_rp.Message); continuing." -ForegroundColor $WarnCol
-} else {
-    Write-Host "      [!] Restore point failed: $($_rp.Message)" -ForegroundColor $WarnCol
-}
-#endregion
-
-#region 1 - Service Registration
-# ============================================================================
-Write-StepUpdate "[2/5] Opting-in to Microsoft Product Updates..."
-try {
-    Register-WursaProductService
-    Write-StepUpdate -Success
-    Start-Sleep -Seconds 3
-} catch {
-    Write-Host "      [!] Failed: $($_.Exception.Message)" -ForegroundColor Red
-}
-#endregion
-
-#region 1.4 - Open Windows Update policy for the update pass
-# ============================================================================
-# Some managed endpoints carry NoAutoUpdate=1, which can prevent the direct Windows
-# Update API from servicing ordinary updates. Open the policy here, but DO NOT kick
-# a USO feature-update scan. Region 5 owns the feature upgrade path. Starting USO here
-# can pre-download the feature update in parallel and race the deterministic ISO/eKB path. Enterprise
-# and ARM64 fallback paths explicitly start USO later only when Windows Update is the
-# selected upgrade mechanism. Original policy values are recorded for restoration.
-$IPU_WorkDir          = "C:\Windows\Temp\25H2IPU"
-$IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
-$IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
-$IPU_ActiveHoursEnd   = 19
-if (-not $NoUpgrade -and $WinBuild -lt $LatestBuild -and -not (Confirm-WursaWorkDir -Path $IPU_WorkDir)) {
-    Write-Host "      [!] Windows Update policy left untouched; the upgrade will not be dispatched." -ForegroundColor $WarnCol
-} elseif (-not $NoUpgrade -and $WinBuild -lt $LatestBuild) {
-    Write-Host "[>] Opening Windows Update policy for the update pass..." -ForegroundColor $LineCol
-    $_polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $_auk  = "$_polk\AU"
-    if (-not (Test-Path $_polk)) { New-Item -Path $_polk -Force | Out-Null }
-    if (-not (Test-Path $_auk))  { New-Item -Path $_auk  -Force | Out-Null }
-    # Record originals once, in the same format Restore-WUUpgradeOverrides expects.
-    if (-not (Test-Path $IPU_AURestoreFile)) {
-        $_noAuto = (Get-ItemProperty -Path $_auk  -Name NoAutoUpdate     -ErrorAction SilentlyContinue).NoAutoUpdate
-        $_auOpt  = (Get-ItemProperty -Path $_auk  -Name AUOptions        -ErrorAction SilentlyContinue).AUOptions
-        $_setAH  = (Get-ItemProperty -Path $_polk -Name SetActiveHours   -ErrorAction SilentlyContinue).SetActiveHours
-        $_ahS    = (Get-ItemProperty -Path $_polk -Name ActiveHoursStart -ErrorAction SilentlyContinue).ActiveHoursStart
-        $_ahE    = (Get-ItemProperty -Path $_polk -Name ActiveHoursEnd   -ErrorAction SilentlyContinue).ActiveHoursEnd
-        @(
-            "NoAutoUpdate=$(if ($null -eq $_noAuto) {'ABSENT'} else {$_noAuto})"
-            "AUOptions=$(if ($null -eq $_auOpt) {'ABSENT'} else {$_auOpt})"
-            "SetActiveHours=$(if ($null -eq $_setAH) {'ABSENT'} else {$_setAH})"
-            "ActiveHoursStart=$(if ($null -eq $_ahS) {'ABSENT'} else {$_ahS})"
-            "ActiveHoursEnd=$(if ($null -eq $_ahE) {'ABSENT'} else {$_ahE})"
-        ) | Set-Content -Path $IPU_AURestoreFile -Encoding ASCII -Force
-    }
-    # NoAutoUpdate=0 alone does not release a pending feature update on the re-keyed
-    # Enterprise-composition boxes; AUOptions=4 (auto download + schedule install) is
-    # what actually moves it. Pin active hours so any WU-driven reboot lands out of hours.
-    Set-ItemProperty -Path $_auk  -Name NoAutoUpdate     -Value 0 -Type DWord -Force
-    Set-ItemProperty -Path $_auk  -Name AUOptions        -Value 4 -Type DWord -Force
-    Set-ItemProperty -Path $_polk -Name SetActiveHours   -Value 1 -Type DWord -Force
-    Set-ItemProperty -Path $_polk -Name ActiveHoursStart -Value $IPU_ActiveHoursStart -Type DWord -Force
-    Set-ItemProperty -Path $_polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
-    Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-    Write-Host "      WU opened (NoAutoUpdate=0, AUOptions=4); direct API scan follows." -ForegroundColor $DimCol
-}
-#endregion
-
-#region 2 and 3 - Windows Update discovery and installation
-# ============================================================================
-$passRes = Invoke-WursaWindowsUpdatePass
-$UpdateSearcher = $passRes.Searcher
-#endregion
-
-#region 4 - Third-Party Software Updates
-# ============================================================================
-$_tpFlag = if ($Update3rdParty) { "-Update3rdParty" } else { "-InplaceUpgrade" }
-$tpRes = Invoke-WursaThirdPartyUpdate -Skip ([bool]$No3rdParty) -AutoConfirm ([bool]($Update3rdParty -or $InplaceUpgrade)) -AutoFlag $_tpFlag
-#endregion
-
-#region 5 - Post-Update Version Check & Optional In-Place Upgrade
-# ============================================================================
-# ISO config - hosted on Cloudflare R2 behind a stable custom domain
-# (iso.killertools.net) so the link does not expire. To target a different
-# feature build, swap the object in the killer-isos bucket and update the URL.
-#
-# Language-aware: the in-place upgrade requires the ISO language to match the
-# running OS UI language, or setup.exe returns 0xC1900204 and the keep files
-# path is silently blocked. Read the base install language from the NLS registry
-# (reliable under SYSTEM) and pick the matching image: en-GB (0809) gets the
-# International ISO, everything else defaults to en-US for the US fleet.
-$IPU_InstallLang = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction SilentlyContinue).InstallLanguage
-switch ($IPU_InstallLang) {
-    '0809'  { $IPU_IsoName = "Win11_26H2_x64_en-GB.iso"; $IPU_IsoSha256 = "7E3F373BD3C2321B5D5125DFCF718DFBF1A0ABC50A267118669951890DF98A5D" }
-    default { $IPU_IsoName = "Win11_26H2_x64_en-US.iso"; $IPU_IsoSha256 = "BD4307DF32BC8AF33B39CCECB1174AEB345386630F89A2B86C7A4E36B55EA650" }
-}
-$IPU_IsoUrl     = "https://iso.killertools.net/$IPU_IsoName"
-$IPU_IsoSizeGB  = 6.0
-# $IPU_WorkDir, $IPU_AURestoreFile, and $IPU_ActiveHoursStart/End are defined earlier
-# (region 1.4 WU ungag, which runs before the scan); reused here.
-$IPU_IsoPath    = Join-Path $IPU_WorkDir $IPU_IsoName
-$IPU_LogDir     = Join-Path $IPU_WorkDir "SetupLogs"
-$IPU_SetupLog   = Join-Path $IPU_WorkDir "setup_exit.log"
-$IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
-$IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
-$IPU_TaskName   = "WURSA-25H2-IPU"
-$IPU_VerifierPath  = Join-Path $IPU_WorkDir "Verify-25H2.ps1"
-$IPU_VerifyTaskName = "WURSA-25H2-Verify"
-
-# 24H2 (26100) or 25H2 (26200) -> 26H2 enablement package (KB5121794), x64 and ARM64.
-# Host both MSUs in the killer-isos bucket. Prerequisite: servicing baseline
-# 26100.9278 / 26200.9278 (KB5120998) or later; below that, Windows Update takes over.
-$IPU_EkbName    = "Win11_26H2_eKB_KB5121794_x64.msu"
-$IPU_EkbUrl     = "https://iso.killertools.net/$IPU_EkbName"
-$IPU_EkbSha256  = "BF43EB13B7EBDE920C2201473BFD5C531B45E0F46ACD8E0843F27F9744FB4B43"
-$IPU_EkbPath    = Join-Path $IPU_WorkDir $IPU_EkbName
-$IPU_EkbArmName   = "Win11_26H2_eKB_KB5121794_arm64.msu"
-$IPU_EkbArmUrl    = "https://iso.killertools.net/$IPU_EkbArmName"
-$IPU_EkbArmSha256 = "367E77739B3B09DC8C48553F9853BF53042F052DDAADC07ED025B83BB1D53A9D"
-$IPU_EkbArmPath   = Join-Path $IPU_WorkDir $IPU_EkbArmName
-$IPU_EkbMinUBR    = 9278
-
-# Installation Assistant fallback (online, edition-correct). The local ISO is a
-# consumer image with no Enterprise SKU, so an Enterprise-composition box fails the
-# ISO match with 0xC1900204. The Assistant pulls the matching edition straight from
-# Microsoft. Host the exe alongside the ISO in the killer-isos bucket; the hash pin
-# is optional (leave empty to skip).
-$IPU_IAUrl      = "https://iso.killertools.net/Windows11InstallationAssistant.exe"
-$IPU_IASha256   = ""
-
-
-Write-HLine -Style dashed
-Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
-$InstalledVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
-$InstalledBuild   = [int](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuild
-# Detect the native machine architecture from CIM instead of the PowerShell process
-# environment. Snapdragon/ARM64 devices can run x64-emulated management processes,
-# where PROCESSOR_ARCHITECTURE may report AMD64 and incorrectly route to x64 media.
-$IPU_ProcArch = $null
-$IPU_OSArch   = $null
-try { $IPU_ProcArch = [int](Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Architecture) } catch {}
-try { $IPU_OSArch   = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture } catch {}
-$IPU_IsArm64 = ($IPU_ProcArch -in @(5,12)) -or ($IPU_OSArch -match 'ARM')
-if (-not $IPU_IsArm64 -and $null -eq $IPU_ProcArch -and -not $IPU_OSArch) {
-    # Last-resort fallback only when CIM is unavailable.
-    $IPU_IsArm64 = ($env:PROCESSOR_ARCHITECTURE -match 'ARM') -or ($env:PROCESSOR_ARCHITEW6432 -match 'ARM')
-}
-Write-Host "      Installed Version : $InstalledVersion" -ForegroundColor Yellow
-Write-Host "      Latest Version    : $LatestVersion"    -ForegroundColor Yellow
-if ($IPU_IsArm64) { Write-Host "      Architecture      : ARM64" -ForegroundColor $AccentCol }
-# ARM64 24H2/25H2 takes the ARM64 eKB; older ARM64 builds can only upgrade through Windows Update.
-$IPU_ArmWUOnly = $IPU_IsArm64 -and $InstalledBuild -notin @(26100, 26200)
-if ($NoUpgrade) {
-    $script:FeatureUpgradeState = "SKIPPED"
-    Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
-} elseif ($InstalledBuild -lt $LatestBuild -and (Test-WUFeatureUpdateStaged -Searcher $UpdateSearcher)) {
-    # This is the only Windows Update state that suppresses the dedicated upgrade path.
-    # Windows has actually staged the feature update and is asking for a reboot.
-    $script:FeatureUpdateStaged = $true
-    $script:FeatureUpgradeState = "REBOOT_REQUIRED"
-    Write-Host "      > $LatestVersion is staged by Windows Update and requires a reboot." -ForegroundColor $DimCol
-    if (Confirm-WursaWorkDir -Path $IPU_WorkDir) {
-        ('REBOOT_REQUIRED WU ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
-    }
-} elseif ($InstalledBuild -lt $LatestBuild) {
-    Write-Host "      > Feature update available." -ForegroundColor $WarnCol
-    # Battery safety
-    $OnBattery = Test-WursaOnBattery
-
-    $proceed = $false
-    if ($OnBattery) {
-        $script:FeatureUpgradeState = "BLOCKED_BATTERY"
-        Write-Host "      [!] Upgrade skipped: device is running on battery power." -ForegroundColor Yellow
-    } elseif ($InplaceUpgrade) {
-        if ($IPU_ArmWUOnly) {
-            Write-Host "      [-InplaceUpgrade] ARM64 detected; auto-dispatching Windows Update feature-upgrade handoff." -ForegroundColor $DimCol
-        } else {
-            Write-Host "      [-InplaceUpgrade] Auto-dispatching detached feature-upgrade workflow." -ForegroundColor $DimCol
-        }
-        $proceed = $true
-    } else {
-        # Flush buffered keystrokes; guarded so redirected (RMM) consoles do not throw
-        try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
-        try {
-            if ($IPU_ArmWUOnly) {
-                Write-Host "Would you like to hand off the $($LatestVersion) upgrade to Windows Update? (Y/N): " -NoNewline -ForegroundColor $WarnCol
-            } else {
-                Write-Host "Would you like to perform an in-place upgrade to $($LatestVersion)? (Y/N): " -NoNewline -ForegroundColor $WarnCol
-            }
-            $key    = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-            $choice = $key.Character
-            if ($choice -ne "`n" -and $choice -ne "`r") { Write-Host $choice -NoNewline }
-            Write-Host ""
-            if ($choice -in @('Y','y')) { $proceed = $true }
-        } catch {
-            Write-Host "      [i] Non-interactive - defaulting to NO. Use -InplaceUpgrade for unattended runs." -ForegroundColor $DimCol
-        }
-    }
-
-    if (-not $OnBattery -and -not $proceed) {
-        $script:FeatureUpgradeState = "NOT_STARTED"
-    }
-
-    if (-not $OnBattery -and $proceed) {
-        if ($IPU_ArmWUOnly) {
-            Write-Host "[>] Dispatching detached ARM64 Windows Update handoff (survives session disconnect)..." -ForegroundColor $LineCol
-        } else {
-            Write-Host "[>] Dispatching detached feature-upgrade workflow (survives session disconnect)..." -ForegroundColor $LineCol
-        }
-
-        if (-not (Confirm-WursaWorkDir -Path $IPU_WorkDir)) {
-            $script:FeatureUpgradeState = "BLOCKED_WORKDIR"
-            Write-Host "      [!] Upgrade not dispatched: $IPU_WorkDir is not a protected directory." -ForegroundColor Red
-        } else {
-
-        # One-shot post-reboot verifier, built by Get-WursaVerifierScript.
-        $VerifierBody = Get-WursaVerifierScript -StatusFile $IPU_StatusFile -RestoreFile $IPU_AURestoreFile -VerifyTaskName $IPU_VerifyTaskName -TargetBuild $LatestBuild
-        $VerifierBody | Out-File -FilePath $IPU_VerifierPath -Encoding ASCII -Force
-
-        # --- Build the standalone runner the scheduled task executes as SYSTEM ---
-        # Config preamble (double-quoted here-string: values are injected now).
-        $RunnerConfig = @"
-`$IPU_IsoUrl     = '$IPU_IsoUrl'
-`$IPU_IsoSizeGB  = $IPU_IsoSizeGB
-`$IPU_WorkDir    = '$IPU_WorkDir'
-`$IPU_IsoPath    = '$IPU_IsoPath'
-`$IPU_LogDir     = '$IPU_LogDir'
-`$IPU_SetupLog   = '$IPU_SetupLog'
-`$IPU_StatusFile = '$IPU_StatusFile'
-`$IPU_TaskName   = '$IPU_TaskName'
-`$IPU_VerifierPath  = '$IPU_VerifierPath'
-`$IPU_VerifyTaskName = '$IPU_VerifyTaskName'
-`$IPU_IsoSha256  = '$IPU_IsoSha256'
-`$IPU_IAUrl     = '$IPU_IAUrl'
-`$IPU_IASha256  = '$IPU_IASha256'
-`$IPU_AURestoreFile    = '$IPU_AURestoreFile'
-`$IPU_ActiveHoursStart = $IPU_ActiveHoursStart
-`$IPU_ActiveHoursEnd   = $IPU_ActiveHoursEnd
-`$IPU_EkbUrl     = '$IPU_EkbUrl'
-`$IPU_EkbSha256  = '$IPU_EkbSha256'
-`$IPU_EkbPath    = '$IPU_EkbPath'
-`$IPU_EkbArmUrl    = '$IPU_EkbArmUrl'
-`$IPU_EkbArmSha256 = '$IPU_EkbArmSha256'
-`$IPU_EkbArmPath   = '$IPU_EkbArmPath'
-`$IPU_EkbMinUBR    = $IPU_EkbMinUBR
-`$LatestVersion    = '$LatestVersion'
-"@
-
-        # Runner body (single-quoted here-string: written verbatim, runs later).
-        $RunnerBody = @'
+function Get-WursaRunnerBody {
+    # Runner body (single-quoted here-string: written verbatim, runs later).
+    @'
 $ErrorActionPreference = "Continue"
-function Set-Status { param([string]$Text) try { $Text | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force } catch {} }
+function Set-Status { param([string]$Text) try { [System.IO.File]::WriteAllText($IPU_StatusFile, ($Text + "`r`n"), [System.Text.Encoding]::ASCII) } catch {} }
 $IPU_IAExe  = Join-Path $IPU_WorkDir "Windows11InstallationAssistant.exe"
 $IPU_IAArgs = "/QuietInstall /SkipEULA /auto upgrade /NoReboot"
 function Register-IPUPostRebootVerifier {
@@ -1227,16 +888,14 @@ function Invoke-IPUInstallationAssistant {
             return
         }
     }
-    if ($IPU_IASha256) {
-        $iaHash = (Get-FileHash $IPU_IAExe -Algorithm SHA256).Hash
-        if ($iaHash -ne $IPU_IASha256) {
-            Write-Output "Installation Assistant hash mismatch. Expected $IPU_IASha256 got $iaHash"
-            Remove-Item $IPU_IAExe -Force -ErrorAction SilentlyContinue
-            Set-Status "FAILED IA_HASH $iaStamp"
-            return
-        }
-        Write-Output "Installation Assistant hash verified."
+    # Verify every copy, downloaded now or already present, before it runs as SYSTEM.
+    if (-not (Test-WursaSignedBinary -Path $IPU_IAExe -PublisherPattern $IPU_IAPublisher -Sha256 $IPU_IASha256)) {
+        Write-Output "Installation Assistant failed verification (valid Microsoft signature and any pinned digest required); not launching it."
+        Remove-Item $IPU_IAExe -Force -ErrorAction SilentlyContinue
+        Set-Status "FAILED IA_SIGNATURE $iaStamp"
+        return
     }
+    Write-Output "Installation Assistant signature verified."
     # Run to completion and wait. /NoReboot stages the upgrade without restarting,
     # so the reboot is deferred to the caller exactly like the ISO path. We never
     # auto-reboot here. ( /NoRestartUI is deliberately NOT used: as SYSTEM it forces
@@ -1629,8 +1288,389 @@ Stop-Transcript | Out-Null
 # Remove the one-shot task so it does not linger
 schtasks.exe /Delete /TN "$IPU_TaskName" /F | Out-Null
 '@
+}
+#endregion
 
-        $RunnerConfig + "`r`n" + $RunnerBody | Out-File -FilePath $IPU_RunnerPath -Encoding ASCII -Force
+#region Final status
+function Resolve-WursaFinalStatus {
+    # Maps the run state to the exit code and the status lines. The text always agrees with the code.
+    param(
+        [bool]$NoUpgrade, [int]$FinalBuild, [string]$FinalVersion, [string]$FeatureUpgradeState,
+        [string]$IpuState, [bool]$RebootPending
+    )
+    $lines = New-Object System.Collections.ArrayList
+    $code = 0
+    $add = { param($t, $c) [void]$lines.Add(@{ Text = $t; Color = $c }) }
+    if (-not $NoUpgrade -and $FinalBuild -ge $LatestBuild) {
+        & $add "STATUS: SYSTEM CURRENT ($FinalVersion)" $OkCol
+        $code = 0
+    } elseif ($NoUpgrade) {
+        if ($RebootPending) {
+            & $add "[!] STATUS: REBOOT REQUIRED" "Red"
+            $code = 3010
+        } else {
+            & $add "STATUS: UPDATE PASS COMPLETE" $OkCol
+            $code = 0
+        }
+    } elseif ($FeatureUpgradeState -eq "REBOOT_REQUIRED") {
+        & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
+        $code = 3010
+    } elseif ($FeatureUpgradeState -match '^(FAILED|BLOCKED|NOT_STARTED)') {
+        & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
+        & $add "      Upgrade state: $FeatureUpgradeState" $WarnCol
+        $code = 1
+    } elseif ($FeatureUpgradeState -eq "DISPATCHED") {
+        if ($IpuState -match '^REBOOT_REQUIRED') {
+            & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
+            & $add "      Upgrade state: $IpuState" $DimCol
+            $code = 3010
+        } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
+            & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
+            & $add "      Upgrade state: $IpuState" $WarnCol
+            $code = 1
+        } else {
+            & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
+            if ($IpuState) { & $add "      Upgrade state: $IpuState" $DimCol }
+            $code = 0
+        }
+    } elseif ($IpuState -match '^REBOOT_REQUIRED') {
+        & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
+        & $add "      Upgrade state: $IpuState" $DimCol
+        $code = 3010
+    } elseif ($IpuState -match '^(DISPATCHED|RUNNING|DOWNLOADING|REPAIRING|VERIFY_PENDING|WU_HANDOFF)') {
+        & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS" $WarnCol
+        & $add "      Upgrade state: $IpuState" $DimCol
+        $code = 0
+    } elseif ($IpuState -match '^(FAILED|BLOCK_|UNEXPECTED)') {
+        & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
+        & $add "      Upgrade state: $IpuState" $WarnCol
+        $code = 1
+    } else {
+        & $add "[!] STATUS: FEATURE UPGRADE NOT COMPLETE (still $FinalVersion)" "Red"
+        $code = 1
+    }
+    [pscustomobject]@{ Code = $code; Lines = @($lines) }
+}
+#endregion
+
+function Invoke-WursaMain {
+# The body below is deliberately not indented: it keeps the diff small and keeps the
+# here-string terminators in the generated scripts at column 0.
+trap {
+    if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw $_ }
+    Write-Host "[!] Fatal: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "[!] STATUS: FAILED" -ForegroundColor Red
+    Exit-KillerScript 1
+}
+$script:ExitCode = 0
+$script:StepRow  = -1
+$script:StepMsg  = ""
+$script:StepOpen = $false
+# Feature-upgrade state is tracked separately from ordinary Windows Update.
+# A surfaced/downloaded feature update is NOT considered staged. Region 5 owns
+# the deterministic feature upgrade path unless Windows reports a real reboot-ready
+# feature update.
+$script:FeatureUpdateStaged = $false
+$script:FeatureUpgradeState = "UNKNOWN"
+$script:WorkDirChecked = $null
+$ProgressPreference = 'SilentlyContinue'   # suppress console-wide progress overlays (VSS/BITS/Invoke-WebRequest)
+
+#region 0 - Pre-Flight
+if (-not (Test-WursaElevated)) {
+    Write-Warning "Elevation Required: Please run as Administrator."
+    Write-Host "[!] STATUS: NOT ELEVATED (run as Administrator)" -ForegroundColor Red
+    Exit-KillerScript 2
+}
+# 1. Force session bypass to clear environment hurdles
+try { Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force -ErrorAction Stop } catch {}
+# 2. Re-register core paths to bypass the LiveConnect temp-path bug
+$env:PSModulePath = [Environment]::GetEnvironmentVariable("PSModulePath","Machine") + ";" + [Environment]::GetEnvironmentVariable("PSModulePath","User")
+
+# Baseline Data for UI
+$OS = Get-CimInstance Win32_OperatingSystem
+try { Clear-Host } catch {}
+
+# Header
+$_pfx  = "█  "
+$_art1 = "╦ ╦ ╦ ╦ ╦═╗ ╔═╗ ╔═╗ "
+$_art2 = "║║║ ║ ║ ╠╦╝ ╚═╗ ╠═╣ "
+$_art3 = "╚╩╝ ╚═╝ ╩╚═ ╚═╝ ╩ ╩ "
+$_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
+$_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
+$_fillW = $script:Width - $_pfx.Length - $_artW
+$_title = "WINDOWS UPDATE, REPAIR, & SYSTEM ALIGNMENT"
+$_tpad  = " " * ($_fillW - $_title.Length)
+Write-Host $_pfx -ForegroundColor $BorderCol -NoNewline; Write-Host $_art1 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
+Write-Host $_pfx -ForegroundColor $BorderCol -NoNewline; Write-Host $_art2 -ForegroundColor $ArtCol -NoNewline; Write-Host "$_title$_tpad" -ForegroundColor $MainCol
+Write-Host $_pfx -ForegroundColor $BorderCol -NoNewline; Write-Host $_art3 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
+
+Write-Host "[>] Device Name      : " -NoNewline -ForegroundColor $LineCol
+Write-Host "$($env:COMPUTERNAME)" -ForegroundColor $AccentCol
+Write-Host "[>] Operating System : " -NoNewline -ForegroundColor $LineCol
+$WinVer = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
+$WinBuild = [int](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuild
+Write-Host "$($OS.Caption) $WinVer (Build $($OS.BuildNumber))" -ForegroundColor $AccentCol
+Write-HLine -Style dashed
+
+#region 0.5 - System Restore Point
+# ============================================================================
+Write-StepUpdate "[1/5] Creating System Restore Point..."
+$_rp = Invoke-WursaRestorePoint -TimeoutSeconds 90
+if ($_rp.Result -eq 'OK') {
+    Write-StepUpdate -Success
+} elseif ($_rp.Result -eq 'TIMEOUT') {
+    Write-Host "      [!] Restore point $($_rp.Message); continuing." -ForegroundColor $WarnCol
+} else {
+    Write-Host "      [!] Restore point failed: $($_rp.Message)" -ForegroundColor $WarnCol
+}
+#endregion
+
+#region 1 - Service Registration
+# ============================================================================
+Write-StepUpdate "[2/5] Opting-in to Microsoft Product Updates..."
+try {
+    Register-WursaProductService
+    Write-StepUpdate -Success
+    Start-Sleep -Seconds 3
+} catch {
+    Write-Host "      [!] Failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+#endregion
+
+#region 1.4 - Open Windows Update policy for the update pass
+# ============================================================================
+# Some managed endpoints carry NoAutoUpdate=1, which can prevent the direct Windows
+# Update API from servicing ordinary updates. Open the policy here, but DO NOT kick
+# a USO feature-update scan. Region 5 owns the feature upgrade path. Starting USO here
+# can pre-download the feature update in parallel and race the deterministic ISO/eKB path. Enterprise
+# and ARM64 fallback paths explicitly start USO later only when Windows Update is the
+# selected upgrade mechanism. Original policy values are recorded for restoration.
+$IPU_WorkDir          = "C:\Windows\Temp\25H2IPU"
+$IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
+$IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
+$IPU_ActiveHoursEnd   = 19
+if (-not $NoUpgrade -and $WinBuild -lt $LatestBuild -and -not (Confirm-WursaWorkDir -Path $IPU_WorkDir)) {
+    Write-Host "      [!] Windows Update policy left untouched; the upgrade will not be dispatched." -ForegroundColor $WarnCol
+} elseif (-not $NoUpgrade -and $WinBuild -lt $LatestBuild) {
+    Write-Host "[>] Opening Windows Update policy for the update pass..." -ForegroundColor $LineCol
+    $_polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $_auk  = "$_polk\AU"
+    if (-not (Test-Path $_polk)) { New-Item -Path $_polk -Force | Out-Null }
+    if (-not (Test-Path $_auk))  { New-Item -Path $_auk  -Force | Out-Null }
+    # Record originals once, in the same format Restore-WUUpgradeOverrides expects.
+    if (-not (Test-Path $IPU_AURestoreFile)) {
+        $_noAuto = (Get-ItemProperty -Path $_auk  -Name NoAutoUpdate     -ErrorAction SilentlyContinue).NoAutoUpdate
+        $_auOpt  = (Get-ItemProperty -Path $_auk  -Name AUOptions        -ErrorAction SilentlyContinue).AUOptions
+        $_setAH  = (Get-ItemProperty -Path $_polk -Name SetActiveHours   -ErrorAction SilentlyContinue).SetActiveHours
+        $_ahS    = (Get-ItemProperty -Path $_polk -Name ActiveHoursStart -ErrorAction SilentlyContinue).ActiveHoursStart
+        $_ahE    = (Get-ItemProperty -Path $_polk -Name ActiveHoursEnd   -ErrorAction SilentlyContinue).ActiveHoursEnd
+        @(
+            "NoAutoUpdate=$(if ($null -eq $_noAuto) {'ABSENT'} else {$_noAuto})"
+            "AUOptions=$(if ($null -eq $_auOpt) {'ABSENT'} else {$_auOpt})"
+            "SetActiveHours=$(if ($null -eq $_setAH) {'ABSENT'} else {$_setAH})"
+            "ActiveHoursStart=$(if ($null -eq $_ahS) {'ABSENT'} else {$_ahS})"
+            "ActiveHoursEnd=$(if ($null -eq $_ahE) {'ABSENT'} else {$_ahE})"
+        ) | Set-Content -Path $IPU_AURestoreFile -Encoding ASCII -Force
+    }
+    # NoAutoUpdate=0 alone does not release a pending feature update on the re-keyed
+    # Enterprise-composition boxes; AUOptions=4 (auto download + schedule install) is
+    # what actually moves it. Pin active hours so any WU-driven reboot lands out of hours.
+    Set-ItemProperty -Path $_auk  -Name NoAutoUpdate     -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $_auk  -Name AUOptions        -Value 4 -Type DWord -Force
+    Set-ItemProperty -Path $_polk -Name SetActiveHours   -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $_polk -Name ActiveHoursStart -Value $IPU_ActiveHoursStart -Type DWord -Force
+    Set-ItemProperty -Path $_polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
+    Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Write-Host "      WU opened (NoAutoUpdate=0, AUOptions=4); direct API scan follows." -ForegroundColor $DimCol
+}
+#endregion
+
+#region 2 and 3 - Windows Update discovery and installation
+# ============================================================================
+$passRes = Invoke-WursaWindowsUpdatePass
+$UpdateSearcher = $passRes.Searcher
+#endregion
+
+#region 4 - Third-Party Software Updates
+# ============================================================================
+$_tpFlag = if ($Update3rdParty) { "-Update3rdParty" } else { "-InplaceUpgrade" }
+$tpRes = Invoke-WursaThirdPartyUpdate -Skip ([bool]$No3rdParty) -AutoConfirm ([bool]($Update3rdParty -or $InplaceUpgrade)) -AutoFlag $_tpFlag
+#endregion
+
+#region 5 - Post-Update Version Check & Optional In-Place Upgrade
+# ============================================================================
+# ISO config - hosted on Cloudflare R2 behind a stable custom domain
+# (iso.killertools.net) so the link does not expire. To target a different
+# feature build, swap the object in the killer-isos bucket and update the URL.
+#
+# Language-aware: the in-place upgrade requires the ISO language to match the
+# running OS UI language, or setup.exe returns 0xC1900204 and the keep files
+# path is silently blocked. Read the base install language from the NLS registry
+# (reliable under SYSTEM) and pick the matching image: en-GB (0809) gets the
+# International ISO, everything else defaults to en-US for the US fleet.
+$IPU_InstallLang = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -ErrorAction SilentlyContinue).InstallLanguage
+switch ($IPU_InstallLang) {
+    '0809'  { $IPU_IsoName = "Win11_26H2_x64_en-GB.iso"; $IPU_IsoSha256 = "7E3F373BD3C2321B5D5125DFCF718DFBF1A0ABC50A267118669951890DF98A5D" }
+    default { $IPU_IsoName = "Win11_26H2_x64_en-US.iso"; $IPU_IsoSha256 = "BD4307DF32BC8AF33B39CCECB1174AEB345386630F89A2B86C7A4E36B55EA650" }
+}
+$IPU_IsoUrl     = "https://iso.killertools.net/$IPU_IsoName"
+$IPU_IsoSizeGB  = 6.0
+# $IPU_WorkDir, $IPU_AURestoreFile, and $IPU_ActiveHoursStart/End are defined earlier
+# (region 1.4 WU ungag, which runs before the scan); reused here.
+$IPU_IsoPath    = Join-Path $IPU_WorkDir $IPU_IsoName
+$IPU_LogDir     = Join-Path $IPU_WorkDir "SetupLogs"
+$IPU_SetupLog   = Join-Path $IPU_WorkDir "setup_exit.log"
+$IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
+$IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
+$IPU_TaskName   = "WURSA-25H2-IPU"
+$IPU_VerifierPath  = Join-Path $IPU_WorkDir "Verify-25H2.ps1"
+$IPU_VerifyTaskName = "WURSA-25H2-Verify"
+
+# 24H2 (26100) or 25H2 (26200) -> 26H2 enablement package (KB5121794), x64 and ARM64.
+# Host both MSUs in the killer-isos bucket. Prerequisite: servicing baseline
+# 26100.9278 / 26200.9278 (KB5120998) or later; below that, Windows Update takes over.
+$IPU_EkbName    = "Win11_26H2_eKB_KB5121794_x64.msu"
+$IPU_EkbUrl     = "https://iso.killertools.net/$IPU_EkbName"
+$IPU_EkbSha256  = "BF43EB13B7EBDE920C2201473BFD5C531B45E0F46ACD8E0843F27F9744FB4B43"
+$IPU_EkbPath    = Join-Path $IPU_WorkDir $IPU_EkbName
+$IPU_EkbArmName   = "Win11_26H2_eKB_KB5121794_arm64.msu"
+$IPU_EkbArmUrl    = "https://iso.killertools.net/$IPU_EkbArmName"
+$IPU_EkbArmSha256 = "367E77739B3B09DC8C48553F9853BF53042F052DDAADC07ED025B83BB1D53A9D"
+$IPU_EkbArmPath   = Join-Path $IPU_WorkDir $IPU_EkbArmName
+$IPU_EkbMinUBR    = 9278
+
+# Installation Assistant fallback (online, edition-correct). The local ISO is a
+# consumer image with no Enterprise SKU, so an Enterprise-composition box fails the
+# ISO match with 0xC1900204. The Assistant pulls the matching edition straight from
+# Microsoft. Host the exe alongside the ISO in the killer-isos bucket; the hash pin
+# is optional (leave empty to skip).
+$IPU_IAUrl      = "https://iso.killertools.net/Windows11InstallationAssistant.exe"
+$IPU_IASha256   = ""
+# Whatever the source, the Assistant only runs as SYSTEM when it carries a valid Microsoft signature.
+$IPU_IAPublisher = '^CN=Microsoft Corporation(,|$)'
+
+
+Write-HLine -Style dashed
+Write-Host "[>] Checking Windows Feature Update Level..." -ForegroundColor $LineCol
+$InstalledVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").DisplayVersion
+$InstalledBuild   = [int](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuild
+# Detect the native machine architecture from CIM instead of the PowerShell process
+# environment. Snapdragon/ARM64 devices can run x64-emulated management processes,
+# where PROCESSOR_ARCHITECTURE may report AMD64 and incorrectly route to x64 media.
+$IPU_ProcArch = $null
+$IPU_OSArch   = $null
+try { $IPU_ProcArch = [int](Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Architecture) } catch {}
+try { $IPU_OSArch   = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture } catch {}
+$IPU_IsArm64 = ($IPU_ProcArch -in @(5,12)) -or ($IPU_OSArch -match 'ARM')
+if (-not $IPU_IsArm64 -and $null -eq $IPU_ProcArch -and -not $IPU_OSArch) {
+    # Last-resort fallback only when CIM is unavailable.
+    $IPU_IsArm64 = ($env:PROCESSOR_ARCHITECTURE -match 'ARM') -or ($env:PROCESSOR_ARCHITEW6432 -match 'ARM')
+}
+Write-Host "      Installed Version : $InstalledVersion" -ForegroundColor Yellow
+Write-Host "      Latest Version    : $LatestVersion"    -ForegroundColor Yellow
+if ($IPU_IsArm64) { Write-Host "      Architecture      : ARM64" -ForegroundColor $AccentCol }
+# ARM64 24H2/25H2 takes the ARM64 eKB; older ARM64 builds can only upgrade through Windows Update.
+$IPU_ArmWUOnly = $IPU_IsArm64 -and $InstalledBuild -notin @(26100, 26200)
+if ($NoUpgrade) {
+    $script:FeatureUpgradeState = "SKIPPED"
+    Write-Host "      [-NoUpgrade] Feature upgrade check skipped." -ForegroundColor $DimCol
+} elseif ($InstalledBuild -lt $LatestBuild -and (Test-WUFeatureUpdateStaged -Searcher $UpdateSearcher)) {
+    # This is the only Windows Update state that suppresses the dedicated upgrade path.
+    # Windows has actually staged the feature update and is asking for a reboot.
+    $script:FeatureUpdateStaged = $true
+    $script:FeatureUpgradeState = "REBOOT_REQUIRED"
+    Write-Host "      > $LatestVersion is staged by Windows Update and requires a reboot." -ForegroundColor $DimCol
+    if (Confirm-WursaWorkDir -Path $IPU_WorkDir) {
+        ('REBOOT_REQUIRED WU ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
+    }
+} elseif ($InstalledBuild -lt $LatestBuild) {
+    Write-Host "      > Feature update available." -ForegroundColor $WarnCol
+    # Battery safety
+    $OnBattery = Test-WursaOnBattery
+
+    $proceed = $false
+    if ($OnBattery) {
+        $script:FeatureUpgradeState = "BLOCKED_BATTERY"
+        Write-Host "      [!] Upgrade skipped: device is running on battery power." -ForegroundColor Yellow
+    } elseif ($InplaceUpgrade) {
+        if ($IPU_ArmWUOnly) {
+            Write-Host "      [-InplaceUpgrade] ARM64 detected; auto-dispatching Windows Update feature-upgrade handoff." -ForegroundColor $DimCol
+        } else {
+            Write-Host "      [-InplaceUpgrade] Auto-dispatching detached feature-upgrade workflow." -ForegroundColor $DimCol
+        }
+        $proceed = $true
+    } else {
+        # Flush buffered keystrokes; guarded so redirected (RMM) consoles do not throw
+        try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
+        try {
+            if ($IPU_ArmWUOnly) {
+                Write-Host "Would you like to hand off the $($LatestVersion) upgrade to Windows Update? (Y/N): " -NoNewline -ForegroundColor $WarnCol
+            } else {
+                Write-Host "Would you like to perform an in-place upgrade to $($LatestVersion)? (Y/N): " -NoNewline -ForegroundColor $WarnCol
+            }
+            $key    = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $choice = $key.Character
+            if ($choice -ne "`n" -and $choice -ne "`r") { Write-Host $choice -NoNewline }
+            Write-Host ""
+            if ($choice -in @('Y','y')) { $proceed = $true }
+        } catch {
+            Write-Host "      [i] Non-interactive - defaulting to NO. Use -InplaceUpgrade for unattended runs." -ForegroundColor $DimCol
+        }
+    }
+
+    if (-not $OnBattery -and -not $proceed) {
+        $script:FeatureUpgradeState = "NOT_STARTED"
+    }
+
+    if (-not $OnBattery -and $proceed) {
+        if ($IPU_ArmWUOnly) {
+            Write-Host "[>] Dispatching detached ARM64 Windows Update handoff (survives session disconnect)..." -ForegroundColor $LineCol
+        } else {
+            Write-Host "[>] Dispatching detached feature-upgrade workflow (survives session disconnect)..." -ForegroundColor $LineCol
+        }
+
+        if (-not (Confirm-WursaWorkDir -Path $IPU_WorkDir)) {
+            $script:FeatureUpgradeState = "BLOCKED_WORKDIR"
+            Write-Host "      [!] Upgrade not dispatched: $IPU_WorkDir is not a protected directory." -ForegroundColor Red
+        } else {
+
+        # One-shot post-reboot verifier, built by Get-WursaVerifierScript.
+        $VerifierBody = Get-WursaVerifierScript -StatusFile $IPU_StatusFile -RestoreFile $IPU_AURestoreFile -VerifyTaskName $IPU_VerifyTaskName -TargetBuild $LatestBuild
+        $VerifierBody | Out-File -FilePath $IPU_VerifierPath -Encoding ASCII -Force
+
+        # --- Build the standalone runner the scheduled task executes as SYSTEM ---
+        # Config preamble (double-quoted here-string: values are injected now).
+        $RunnerConfig = @"
+`$IPU_IsoUrl     = '$IPU_IsoUrl'
+`$IPU_IsoSizeGB  = $IPU_IsoSizeGB
+`$IPU_WorkDir    = '$IPU_WorkDir'
+`$IPU_IsoPath    = '$IPU_IsoPath'
+`$IPU_LogDir     = '$IPU_LogDir'
+`$IPU_SetupLog   = '$IPU_SetupLog'
+`$IPU_StatusFile = '$IPU_StatusFile'
+`$IPU_TaskName   = '$IPU_TaskName'
+`$IPU_VerifierPath  = '$IPU_VerifierPath'
+`$IPU_VerifyTaskName = '$IPU_VerifyTaskName'
+`$IPU_IsoSha256  = '$IPU_IsoSha256'
+`$IPU_IAUrl     = '$IPU_IAUrl'
+`$IPU_IASha256  = '$IPU_IASha256'
+`$IPU_IAPublisher = '$IPU_IAPublisher'
+`$IPU_AURestoreFile    = '$IPU_AURestoreFile'
+`$IPU_ActiveHoursStart = $IPU_ActiveHoursStart
+`$IPU_ActiveHoursEnd   = $IPU_ActiveHoursEnd
+`$IPU_EkbUrl     = '$IPU_EkbUrl'
+`$IPU_EkbSha256  = '$IPU_EkbSha256'
+`$IPU_EkbPath    = '$IPU_EkbPath'
+`$IPU_EkbArmUrl    = '$IPU_EkbArmUrl'
+`$IPU_EkbArmSha256 = '$IPU_EkbArmSha256'
+`$IPU_EkbArmPath   = '$IPU_EkbArmPath'
+`$IPU_EkbMinUBR    = $IPU_EkbMinUBR
+`$LatestVersion    = '$LatestVersion'
+"@
+
+
+        New-WursaRunnerScript -Config $RunnerConfig | Out-File -FilePath $IPU_RunnerPath -Encoding ASCII -Force
 
         # --- Register + start the detached SYSTEM task ---
         $null = ('DISPATCHED ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force

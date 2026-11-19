@@ -70,6 +70,18 @@ BeforeAll {
         Mock Write-Host { [void]$script:said.Add([string]$Object) }
         Mock Write-HLine { }
     }
+
+    # The runner is a script the SYSTEM task executes later. These helpers pull one of its functions
+    # out so a test can dot-source it, and dot-sourcing must happen in the test's own scope.
+    function Get-RunnerFunctionText {
+        param([string]$Name)
+        $text = Get-WursaRunnerBody
+        $errs = $null; $toks = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$toks, [ref]$errs)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name }, $true)
+        if (-not $fn) { throw "runner has no function $Name" }
+        $fn.Extent.Text
+    }
 }
 
 Describe 'Entry point convention' {
@@ -275,5 +287,93 @@ Describe 'Staging directory ownership in a full run (finding 48)' {
         Get-ExitCode { Invoke-WursaMain } | Should -Be 1
         $script:writes.Count | Should -Be 0
         ($script:said -join "`n") | Should -Match 'BLOCKED_WORKDIR'
+    }
+}
+
+Describe 'Installation Assistant verification (finding 36)' {
+    BeforeEach {
+        $script:Pub = '^CN=Microsoft Corporation(,|$)'
+        $script:Exe = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '.exe')
+    }
+
+    It 'accepts a valid Microsoft signature' {
+        Set-Content -LiteralPath $script:Exe -Value 'x'
+        Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' } } }
+        Test-WursaSignedBinary -Path $script:Exe -PublisherPattern $script:Pub | Should -BeTrue
+    }
+
+    It 'rejects <Why>' -ForEach @(
+        @{ Why = 'an unsigned file';           Status = 'NotSigned';    Subject = '' }
+        @{ Why = 'a tampered signature';       Status = 'HashMismatch'; Subject = 'CN=Microsoft Corporation' }
+        @{ Why = 'a valid but foreign signer'; Status = 'Valid';        Subject = 'CN=Evil Corp, O=Evil Corp' }
+        @{ Why = 'a lookalike publisher';      Status = 'Valid';        Subject = 'CN=Microsoft Corporation Support Ltd' }
+    ) {
+        Set-Content -LiteralPath $script:Exe -Value 'x'
+        $sub = $Subject; $st = $Status
+        Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = $st; SignerCertificate = [pscustomobject]@{ Subject = $sub } } }.GetNewClosure()
+        Test-WursaSignedBinary -Path $script:Exe -PublisherPattern $script:Pub | Should -BeFalse
+    }
+
+    It 'rejects a missing file and a pinned digest that does not match' {
+        Test-WursaSignedBinary -Path (Join-Path $TestDrive 'nope.exe') -PublisherPattern $script:Pub | Should -BeFalse
+        Set-Content -LiteralPath $script:Exe -Value 'x'
+        Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Corporation' } } }
+        Test-WursaSignedBinary -Path $script:Exe -PublisherPattern $script:Pub -Sha256 ('0' * 64) | Should -BeFalse
+    }
+
+    Context 'the runner function' {
+        BeforeEach {
+            $script:Work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $script:Work | Out-Null
+            $IPU_WorkDir = $script:Work
+            $IPU_StatusFile = Join-Path $script:Work 'ipu_status.txt'
+            $IPU_IAExe = Join-Path $script:Work 'Windows11InstallationAssistant.exe'
+            $IPU_IAArgs = '/QuietInstall'
+            $IPU_IAUrl = 'https://example.invalid/ia.exe'
+            $IPU_IASha256 = ''
+            $IPU_IAPublisher = '^CN=Microsoft Corporation(,|$)'
+            . ([scriptblock]::Create((Get-RunnerFunctionText 'Set-Status')))
+            . ([scriptblock]::Create((Get-RunnerFunctionText 'Invoke-IPUInstallationAssistant')))
+            function Register-IPUPostRebootVerifier { $true }
+            function Invoke-IPUWindowsUpdate { param($Reason) 'WU' }
+            $script:Launched = 0
+            Mock Get-BitLockerVolume { $null }
+            Mock Get-Process { $null }
+            Mock Start-Process { $script:Launched++; [pscustomobject]@{ ExitCode = 0 } }
+            Mock Invoke-WebRequest { Set-Content -LiteralPath $OutFile -Value 'downloaded' }
+        }
+
+        It 'does not launch an existing copy whose signature is not valid' {
+            Set-Content -LiteralPath $IPU_IAExe -Value 'planted'
+            Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'NotSigned'; SignerCertificate = $null } }
+            Invoke-IPUInstallationAssistant -Reason 'test' | Out-Null
+            $script:Launched | Should -Be 0
+            (Get-Content -LiteralPath $IPU_StatusFile) | Should -Match '^FAILED IA_SIGNATURE'
+        }
+
+        It 'does not launch a fresh download whose signer is not Microsoft' {
+            Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Somebody Else' } } }
+            Invoke-IPUInstallationAssistant -Reason 'test' | Out-Null
+            $script:Launched | Should -Be 0
+            (Get-Content -LiteralPath $IPU_StatusFile) | Should -Match '^FAILED IA_SIGNATURE'
+        }
+
+        It 'launches a copy with a valid Microsoft signature' {
+            Set-Content -LiteralPath $IPU_IAExe -Value 'real'
+            Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation' } } }
+            Invoke-IPUInstallationAssistant -Reason 'test' | Out-Null
+            $script:Launched | Should -Be 1
+        }
+    }
+
+    It 'embeds the verifier into the generated runner so the shipped code is the tested code' {
+        $text = New-WursaRunnerScript -Config '$IPU_WorkDir = 1'
+        $errs = $null; $toks = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$toks, [ref]$errs)
+        $errs.Count | Should -Be 0
+        $names = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
+        $names | Should -Contain 'Test-WursaSignedBinary'
+        $names | Should -Contain 'Invoke-IPUInstallationAssistant'
+        @($text.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count | Should -Be 0
     }
 }
