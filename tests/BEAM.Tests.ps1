@@ -414,7 +414,7 @@ Context 'Finding 50: a failed Graph call is a failure, not an OK' {
     It 'reports failure and never prints OK when committing the app version fails' {
         Add-FakeFailure -Method PATCH -Pattern 'mobileApps/app-\d+$'
         $r = Invoke-Deploy
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         ($script:Log -join "`n") | Should -Not -Match 'OK\] App version committed'
         $script:G.Apps[0].PSObject.Properties.Name | Should -Not -Contain 'committedContentVersion'
     }
@@ -422,14 +422,14 @@ Context 'Finding 50: a failed Graph call is a failure, not an OK' {
     It 'reports failure and never marks anything assigned when the assignment call fails' {
         Add-FakeFailure -Method POST -Pattern '/assign$'
         $r = Invoke-Deploy
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         ($script:Log -join "`n") | Should -Not -Match 'OK\] App assigned'
     }
 
     It 'reports failure when the file commit call fails' {
         Add-FakeFailure -Method POST -Pattern '/commit$'
         $r = Invoke-Deploy
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         ($script:Log -join "`n") | Should -Not -Match 'OK\] File committed'
     }
 
@@ -454,21 +454,21 @@ Context 'Finding 64: a failed or timed-out Graph wait is reported, not fatal' {
         $script:G.NextFileState = 'azureStorageUriRequestFailed'
         $r = $null
         { $script:r = Invoke-Deploy } | Should -Not -Throw
-        ($script:r | Select-Object -Last 1) | Should -BeFalse
+        $script:r.Published | Should -BeFalse
         ($script:Log -join "`n") | Should -Match 'FAIL\].*azureStorageUriRequestFailed'
     }
 
     It 'returns failure instead of throwing when the commit never completes before the deadline' {
         $script:G.CommitState = 'commitFilePending'
         { $script:r = Invoke-Deploy } | Should -Not -Throw
-        ($script:r | Select-Object -Last 1) | Should -BeFalse
+        $script:r.Published | Should -BeFalse
         ($script:Log -join "`n") | Should -Match 'FAIL\].*Timeout'
     }
 
     It 'returns failure instead of throwing when polling the file state gets an HTTP error' {
         Add-FakeFailure -Method GET -Pattern '/files/file-\d+$' -Mode throw -Message 'The remote server returned an error: (503)'
         { $script:r = Invoke-Deploy } | Should -Not -Throw
-        ($script:r | Select-Object -Last 1) | Should -BeFalse
+        $script:r.Published | Should -BeFalse
         ($script:Log -join "`n") | Should -Match 'FAIL\].*503'
     }
 
@@ -513,7 +513,7 @@ Context 'Finding 46: every run packages from its own staging folder' {
         $taken = Join-Path $script:WorkRoot 'IntuneWork\run-RUN-TAKEN'
         New-Item -ItemType Directory -Path $taken -Force | Out-Null
         $r = Invoke-Deploy -RunId 'RUN-TAKEN' -KeepWork
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         $script:PackagerCalls.Count | Should -Be 0
         Test-Path -LiteralPath $taken | Should -BeTrue
     }
@@ -542,7 +542,7 @@ Context 'Finding 46: every run packages from its own staging folder' {
         Mock Invoke-BeamPackager { Set-Content -LiteralPath (Join-Path $OutDir 'bad.intunewin') -Value 'not a zip' }
         $r = $null
         { $script:r = Invoke-Deploy } | Should -Not -Throw
-        ($script:r | Select-Object -Last 1) | Should -BeFalse
+        $script:r.Published | Should -BeFalse
         ($script:Log -join "`n") | Should -Match 'FAIL\].*Unexpected error'
     }
 }
@@ -565,7 +565,7 @@ Context 'Finding 05: a rerun keeps the live deployment coherent until the new co
     It 'leaves the live command, detection and content untouched when the upload fails' {
         Mock Send-AzureStorageBlock { throw 'storage unreachable' }
         $r = Invoke-Deploy -RunId 'RUN-2'
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         $script:Live.installCommandLine | Should -Be $script:Before.Cmd
         ($script:Live.rules | ConvertTo-Json -Depth 5 -Compress) | Should -Be $script:Before.Rules
         $script:Live.committedContentVersion | Should -Be $script:Before.Version
@@ -575,7 +575,7 @@ Context 'Finding 05: a rerun keeps the live deployment coherent until the new co
     It 'leaves the live deployment untouched when the file commit fails' {
         $script:G.CommitState = 'commitFileFailed'
         $r = Invoke-Deploy -RunId 'RUN-2'
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         $script:Live.installCommandLine | Should -Be $script:Before.Cmd
         ($script:Live.rules | ConvertTo-Json -Depth 5 -Compress) | Should -Be $script:Before.Rules
     }
@@ -583,7 +583,7 @@ Context 'Finding 05: a rerun keeps the live deployment coherent until the new co
     It 'leaves the live deployment untouched and reports failure when the publishing patch is rejected' {
         Add-FakeFailure -Method PATCH -Pattern 'mobileApps/app-\d+$'
         $r = Invoke-Deploy -RunId 'RUN-2'
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         $script:Live.installCommandLine | Should -Be $script:Before.Cmd
         ($script:Live.rules | ConvertTo-Json -Depth 5 -Compress) | Should -Be $script:Before.Rules
         $script:Live.committedContentVersion | Should -Be $script:Before.Version
@@ -592,13 +592,13 @@ Context 'Finding 05: a rerun keeps the live deployment coherent until the new co
     It 'does not report published when the patch is accepted but did not take effect' {
         Add-FakeFailure -Method PATCH -Pattern 'mobileApps/app-\d+$' -Mode noop
         $r = Invoke-Deploy -RunId 'RUN-2'
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         ($script:Log -join "`n") | Should -Not -Match 'OK\] App version committed'
     }
 
     It 'publishes command, detection and content together in one patch after the file is committed' {
         $r = Invoke-Deploy -RunId 'RUN-2'
-        ($r | Select-Object -Last 1) | Should -BeTrue
+        $r.Published | Should -BeTrue
         $patches = @(Get-FakeCalls -Method PATCH -Pattern 'mobileApps/app-\d+$')
         $patches.Count | Should -Be 1
         $commitIdx = [array]::IndexOf(@($script:G.Calls | ForEach-Object { $_.Uri }), (Get-FakeCalls -Method POST -Pattern '/commit$')[0].Uri)
@@ -618,9 +618,148 @@ Context 'Finding 05: a rerun keeps the live deployment coherent until the new co
     It 'stops instead of creating a duplicate app when the existing-app lookup fails' {
         Add-FakeFailure -Method GET -Pattern 'mobileApps\?\$filter' -Mode throw -Message 'HTTP 429 Too Many Requests'
         $r = Invoke-Deploy -RunId 'RUN-2'
-        ($r | Select-Object -Last 1) | Should -BeFalse
+        $r.Published | Should -BeFalse
         $script:G.Apps.Count | Should -Be 1
         ($script:Log -join "`n") | Should -Match 'FAIL\].*429'
     }
 }
+
+Context 'Finding 04: each run targets its own group and only verified devices are queued' {
+    BeforeEach { $script:Log.Clear() }
+
+    It 'never inherits the members of an older group that has the same base name' {
+        Add-FakeDevice 'PC01'
+        $old = [pscustomobject]@{ id = 'grp-old'; displayName = 'BEAM-Contoso Agent' }
+        [void]$script:G.Groups.Add($old)
+        $script:G.Members['grp-old'] = New-Object System.Collections.ArrayList
+        [void]$script:G.Members['grp-old'].Add('ent-STALE')
+        $r = Invoke-Deploy
+        $r.Published | Should -BeTrue
+        $assign = Get-FakeCalls -Method POST -Pattern '/assign$'
+        $gid = $assign[0].Body.mobileAppAssignments[0].target.groupId
+        $gid | Should -Not -Be 'grp-old'
+        @($script:G.Members[$gid]) | Should -Be @('ent-PC01')
+        @($script:G.Members['grp-old']) | Should -Be @('ent-STALE')
+    }
+
+    It 'creates a different group for each run, named with its run ID' {
+        Add-FakeDevice 'PC01'
+        Invoke-Deploy -RunId 'RUN-1' | Out-Null
+        Invoke-Deploy -RunId 'RUN-2' | Out-Null
+        $script:G.Groups.Count | Should -Be 2
+        ($script:G.Groups | ForEach-Object displayName) | Should -Contain 'BEAM-Contoso Agent-RUN-1'
+        ($script:G.Groups | ForEach-Object displayName) | Should -Contain 'BEAM-Contoso Agent-RUN-2'
+    }
+
+    It 'keeps the group mailNickname within 64 ASCII characters even for a long run ID' {
+        Add-FakeDevice 'PC01'
+        Invoke-Deploy -AppName ('A' * 120) -RunId '20261118120000-aaaa1111' | Out-Null
+        $g = $script:G.Groups[0]
+        $g.mailNickname.Length | Should -BeLessOrEqual 64
+        $g.mailNickname | Should -Match '^[\x21-\x7E]+$'
+        $g.mailNickname | Should -Match '20261118120000-aaaa1111$'
+    }
+
+    It 'matches the Entra device by the managed device azureADDeviceId, not by the first name match' {
+        [void]$script:G.Entra.Add([pscustomobject]@{ id = 'ent-STALE'; displayName = 'PC01'; deviceId = [guid]::NewGuid().ToString() })
+        Add-FakeDevice 'PC01'
+        $r = Invoke-Deploy
+        $r.Published | Should -BeTrue
+        $gid = (Get-FakeCalls -Method POST -Pattern '/assign$')[0].Body.mobileAppAssignments[0].target.groupId
+        @($script:G.Members[$gid]) | Should -Be @('ent-PC01')
+    }
+
+    It 'marks a target FAIL as ambiguous when two Intune devices share its name' {
+        Add-FakeDevice 'PC01'
+        [void]$script:G.Managed.Add([pscustomobject]@{ id = 'md-dup'; deviceName = 'PC01'; operatingSystem = 'Windows'; osVersion = '1'; azureADDeviceId = [guid]::NewGuid().ToString() })
+        $r = Invoke-Deploy
+        $r.Targets['PC01'] | Should -Be 'FAIL'
+        ($script:Log -join "`n") | Should -Match 'ambiguous'
+        (Get-FakeCalls -Method POST -Pattern 'members/\$ref').Count | Should -Be 0
+    }
+
+    It 'marks a target FAIL when its device cannot be found anywhere' {
+        $r = Invoke-Deploy -Targets @('GHOST')
+        $r.Targets['GHOST'] | Should -Be 'FAIL'
+        $r.Published | Should -BeFalse
+        (Get-FakeCalls -Method POST -Pattern '/assign$').Count | Should -Be 0
+    }
+
+    It 'marks a target FAIL, not queued, when adding it to the group fails' {
+        Add-FakeDevice 'PC01'
+        Add-FakeFailure -Method POST -Pattern 'members/\$ref' -Mode throw -Message 'HTTP 403 Forbidden'
+        $r = Invoke-Deploy
+        $r.Targets['PC01'] | Should -Be 'FAIL'
+        $r.Published | Should -BeFalse
+        (Get-FakeCalls -Method POST -Pattern '/assign$').Count | Should -Be 0
+        ($script:Log -join "`n") | Should -Match '403'
+    }
+
+    It 'marks a target FAIL when the add is accepted but the group read-back does not list the device' {
+        Add-FakeDevice 'PC01'
+        Add-FakeFailure -Method POST -Pattern 'members/\$ref' -Mode noop
+        $r = Invoke-Deploy
+        $r.Targets['PC01'] | Should -Be 'FAIL'
+        ($script:Log -join "`n") | Should -Match 'not listed|not a member'
+    }
+
+    It 'marks a target FAIL when the Entra device lookup is denied' {
+        Add-FakeDevice 'PC01'
+        Add-FakeFailure -Method GET -Pattern '/devices\?' -Mode throw -Message 'HTTP 403 Insufficient privileges'
+        $r = Invoke-Deploy
+        $r.Targets['PC01'] | Should -Be 'FAIL'
+    }
+
+    It 'reports each target on its own: one queued, one missing' {
+        Add-FakeDevice 'PC01'
+        $r = Invoke-Deploy -Targets @('PC01', 'GHOST')
+        $r.Published | Should -BeTrue
+        $r.Targets['PC01'] | Should -Be 'Intune queued'
+        $r.Targets['GHOST'] | Should -Be 'FAIL'
+        $gid = (Get-FakeCalls -Method POST -Pattern '/assign$')[0].Body.mobileAppAssignments[0].target.groupId
+        @($script:G.Members[$gid]) | Should -Be @('ent-PC01')
+    }
+
+    It 'still queues a verified target when only the sync trigger fails' {
+        Add-FakeDevice 'PC01'
+        Add-FakeFailure -Method POST -Pattern 'syncDevice' -Mode throw -Message 'HTTP 500'
+        $r = Invoke-Deploy
+        $r.Targets['PC01'] | Should -Be 'Intune queued'
+        ($script:Log -join "`n") | Should -Match 'Sync.*WARN'
+    }
+
+    It 'marks every target FAIL when the assignment itself fails' {
+        Add-FakeDevice 'PC01'
+        Add-FakeFailure -Method POST -Pattern '/assign$'
+        $r = Invoke-Deploy
+        $r.Targets['PC01'] | Should -Be 'FAIL'
+        $r.Published | Should -BeFalse
+    }
 }
+
+Context 'Finding 04: the summary and exit code follow the per-target results' {
+    BeforeEach {
+        Mock Invoke-WebRequest { [IO.File]::WriteAllBytes($OutFile, [byte[]](0x4D, 0x5A, 0x90, 0x00, 1, 2, 3, 4)) }
+        Mock Invoke-RestMethod {
+            if ("$Uri" -match 'openid-configuration') { return [pscustomobject]@{ issuer = 'https://sts.windows.net/11111111-2222-3333-4444-555555555555/' } }
+            Invoke-FakeGraph -Uri $Uri -Method $Method -Body $Body
+        }
+    }
+    It 'exits 3 and lists the failed target when only some targets were queued' {
+        Add-FakeDevice 'PC01'
+        foreach ($r in 'https://files.invalid/setup.exe', '', '', '/S', 'PC01,GHOST', 'admin@contoso.invalid') { $script:Reads.Enqueue($r) }
+        Invoke-BeamRun
+        $script:Code | Should -Be 3
+        $script:Text | Should -Match 'BEAM RESULT: exit code 3 -'
+        $script:Text | Should -Match 'queued for 1 of 2'
+        (@($script:Log) -join "`n") | Should -Match '\[FAIL\] GHOST'
+        (@($script:Log) -join "`n") | Should -Not -Match '\[FAIL\] PC01'
+    }
+    It 'exits 1 and queues nothing when no target could be added to the group' {
+        foreach ($r in 'https://files.invalid/setup.exe', '', '', '/S', 'GHOST', 'admin@contoso.invalid') { $script:Reads.Enqueue($r) }
+        Invoke-BeamRun
+        $script:Code | Should -Be 1
+        $script:Text | Should -Match 'BEAM RESULT: exit code 1 -'
+        (Get-FakeCalls -Method POST -Pattern '/assign$').Count | Should -Be 0
+    }
+}}

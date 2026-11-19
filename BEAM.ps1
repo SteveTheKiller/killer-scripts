@@ -770,6 +770,13 @@ exit `$c
 "@
 }
 
+function New-BeamPublishResult {
+    # What a publish returns: whether the app is published and assigned, and each target's outcome
+    # ("Intune queued" or "FAIL"). Targets not listed here are failed by the caller.
+    param([bool]$Published, $Targets)
+    if ($null -eq $Targets) { $Targets = [ordered]@{} }
+    [pscustomobject]@{ Published = $Published; Targets = $Targets }
+}
 function Invoke-BeamPublish {
     param(
         [string[]]$Targets,
@@ -792,11 +799,11 @@ function Invoke-BeamPublish {
     Write-StepUpdate "Targets: $($Targets -join ', ')" INFO
     Write-Host ""
 
-    if (-not $script:BeamToolPath) { Write-StepUpdate "IntuneWinAppUtil unavailable: aborted" FAIL; return $false }
+    if (-not $script:BeamToolPath) { Write-StepUpdate "IntuneWinAppUtil unavailable: aborted" FAIL; return (New-BeamPublishResult $false) }
 
     Write-StepUpdate "Authenticating to Graph (tenant: $TenantId)..." INFO
     $token = Get-GraphToken -TenantId $TenantId
-    if (-not $token) { return $false }
+    if (-not $token) { return (New-BeamPublishResult $false) }
     $h = @{ Authorization = "Bearer $token" }
 
     # Fast capability check: a tenant without Intune returns "not applicable to target tenant"
@@ -807,7 +814,7 @@ function Invoke-BeamPublish {
         if ("$_" -match "not applicable to target tenant|not licensed|Tenant is not") {
             Write-StepUpdate "This tenant isn't provisioned/licensed for Intune: Win32 deployment unavailable." FAIL
             Write-Host ""
-            return $false
+            return (New-BeamPublishResult $false)
         }
     }
 
@@ -818,14 +825,14 @@ function Invoke-BeamPublish {
     if (-not $RunRoot) { $RunRoot = Join-Path $intuneWorkDir ("run-" + ($RunId -replace '[^A-Za-z0-9._-]', '_')) }
     if (Test-Path -LiteralPath $RunRoot) {
         Write-StepUpdate "Staging folder $RunRoot already exists, so it is not this run's: refusing to reuse it." FAIL
-        return $false
+        return (New-BeamPublishResult $false)
     }
     $srcDir = Join-Path $RunRoot "src"
     $outDir = Join-Path $RunRoot "out"
     try {
         New-Item -ItemType Directory -Path $srcDir -Force -ErrorAction Stop | Out-Null
         New-Item -ItemType Directory -Path $outDir -Force -ErrorAction Stop | Out-Null
-    } catch { Write-StepUpdate "Could not create the staging folder: $_" FAIL; return $false }
+    } catch { Write-StepUpdate "Could not create the staging folder: $_" FAIL; return (New-BeamPublishResult $false) }
 
     $localExe = Join-Path $srcDir $SetupFile
 
@@ -836,7 +843,7 @@ function Invoke-BeamPublish {
         Write-StepUpdate "Downloading $SetupFile..." INFO
         try {
             Invoke-WebRequest -Uri ([uri]$Url) -OutFile $localExe -ErrorAction Stop
-        } catch { Write-StepUpdate "Download failed: $_" FAIL; return $false }
+        } catch { Write-StepUpdate "Download failed: $_" FAIL; return (New-BeamPublishResult $false) }
 
         # If the URL handed back a page instead of the binary, pull the real download link out of
         # it and fetch that instead. Runs silently, so a resolvable page just downloads normally.
@@ -852,7 +859,7 @@ function Invoke-BeamPublish {
         try {
             Copy-Item -LiteralPath $LocalPath -Destination $localExe -Force -ErrorAction Stop
             Write-StepUpdate "Staged: $localExe ($([math]::Round((Get-Item $localExe).Length/1MB,1)) MB)" OK
-        } catch { Write-StepUpdate "Staging failed: $_" FAIL; return $false }
+        } catch { Write-StepUpdate "Staging failed: $_" FAIL; return (New-BeamPublishResult $false) }
     }
 
     # Verify the staged file header matches its type. EXE is a PE (MZ). MSI is an OLE compound
@@ -868,7 +875,7 @@ function Invoke-BeamPublish {
         if (-not $okHdr) {
             Write-StepUpdate "Staged file is not a valid .msi (bad OLE header, $([math]::Round((Get-Item $localExe).Length/1KB,0)) KB)." FAIL
             Write-StepUpdate "If this came from a URL, it likely returned a page. Use a direct-download link." FAIL
-            return $false
+            return (New-BeamPublishResult $false)
         }
     } else {
         $mz = ""
@@ -876,20 +883,20 @@ function Invoke-BeamPublish {
         if ($mz -ne "MZ") {
             Write-StepUpdate "Staged file is not a valid .exe (header '$mz', $([math]::Round((Get-Item $localExe).Length/1KB,0)) KB)." FAIL
             Write-StepUpdate "If this came from a URL, it likely returned a page. Use a direct-download link." FAIL
-            return $false
+            return (New-BeamPublishResult $false)
         }
     }
 
     # The package source must hold exactly the one installer BEAM staged and nothing else.
     if (-not (Test-BeamStagingManifest -Dir $srcDir -SetupFile $SetupFile)) {
         Write-StepUpdate "The staging folder does not contain exactly ${SetupFile}: refusing to package it." FAIL
-        return $false
+        return (New-BeamPublishResult $false)
     }
 
     Write-StepUpdate "Packaging with IntuneWinAppUtil..." INFO
     Invoke-BeamPackager -Tool $script:BeamToolPath -SourceDir $srcDir -SetupFile $SetupFile -OutDir $outDir
     $intunewinFiles = @(Get-ChildItem -LiteralPath $outDir -Filter "*.intunewin")
-    if ($intunewinFiles.Count -ne 1) { Write-StepUpdate "Packaging failed: expected one .intunewin output, found $($intunewinFiles.Count)" FAIL; return $false }
+    if ($intunewinFiles.Count -ne 1) { Write-StepUpdate "Packaging failed: expected one .intunewin output, found $($intunewinFiles.Count)" FAIL; return (New-BeamPublishResult $false) }
     $intunewinFile = $intunewinFiles[0]
     Write-StepUpdate "Packaged: $($intunewinFile.Name) ($([math]::Round($intunewinFile.Length/1MB,1)) MB)" OK
 
@@ -955,7 +962,7 @@ exit 1
     } catch {
         # Carrying on would create a second app with the same name, so stop instead.
         Write-StepUpdate "Could not look up an existing app named '$appDisplayName': $_" FAIL
-        return $false
+        return (New-BeamPublishResult $false)
     }
 
     if ($app) {
@@ -1002,7 +1009,7 @@ exit 1
     } catch {
         if ("$_" -match "not applicable to target tenant|not licensed") { Write-StepUpdate "This tenant isn't provisioned for Intune: Win32 deployment unavailable." FAIL }
         else { Write-StepUpdate "App creation failed: $_" FAIL }
-        return $false
+        return (New-BeamPublishResult $false)
     }
     }
 
@@ -1018,19 +1025,19 @@ exit 1
         $cv = Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions" $h POST "{}"
         Write-StepUpdate "Content version: $($cv.id)" INFO
         $fileEntry = Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions/$($cv.id)/files" $h POST $fileBody
-    } catch { Write-StepUpdate "Creating the content version failed: $_" FAIL; return $false }
+    } catch { Write-StepUpdate "Creating the content version failed: $_" FAIL; return (New-BeamPublishResult $false) }
     $baseFileUri = "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/microsoft.graph.win32LobApp/contentVersions/$($cv.id)/files/$($fileEntry.id)"
 
     Write-StepUpdate "Waiting for Azure Storage URI..." INFO
     try { $fileReady = Wait-GraphState $baseFileUri $h "uploadState" @("azureStorageUriRequestSuccess") @("azureStorageUriRequestFailed") }
-    catch { Write-StepUpdate "Waiting for the Azure Storage URI failed: $_" FAIL; return $false }
+    catch { Write-StepUpdate "Waiting for the Azure Storage URI failed: $_" FAIL; return (New-BeamPublishResult $false) }
     Write-StepUpdate "Azure Storage URI ready" OK
 
     Write-StepUpdate "Uploading encrypted content to Azure Storage..." INFO
     try {
         Send-AzureStorageBlock -SasUri $fileReady.azureStorageUri -FilePath $encPath
         Write-StepUpdate "Upload complete" OK
-    } catch { Write-StepUpdate "Upload failed: $_" FAIL; return $false }
+    } catch { Write-StepUpdate "Upload failed: $_" FAIL; return (New-BeamPublishResult $false) }
 
     Write-StepUpdate "Committing file with encryption info..." INFO
     $commitBody = @{
@@ -1045,9 +1052,9 @@ exit 1
         }
     } | ConvertTo-Json -Depth 5
     try { Invoke-BeamGraph "$baseFileUri/commit" $h POST $commitBody | Out-Null }
-    catch { Write-StepUpdate "Committing the file failed: $_" FAIL; return $false }
+    catch { Write-StepUpdate "Committing the file failed: $_" FAIL; return (New-BeamPublishResult $false) }
     try { Wait-GraphState $baseFileUri $h "uploadState" @("commitFileSuccess") @("commitFileFailed") | Out-Null }
-    catch { Write-StepUpdate "Waiting for the file commit failed: $_" FAIL; return $false }
+    catch { Write-StepUpdate "Waiting for the file commit failed: $_" FAIL; return (New-BeamPublishResult $false) }
     Write-StepUpdate "File committed" OK
 
     # One patch publishes the new install command, uninstall command, detection rule and committed
@@ -1065,76 +1072,131 @@ exit 1
     try {
         Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)" $h PATCH $patchBody | Out-Null
         $live = Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)" $h
-    } catch { Write-StepUpdate "Committing the app version failed: $_" FAIL; return $false }
+    } catch { Write-StepUpdate "Committing the app version failed: $_" FAIL; return (New-BeamPublishResult $false) }
     if ("$($live.committedContentVersion)" -ne "$($cv.id)" -or $live.installCommandLine -ne $installCmd) {
         Write-StepUpdate "Committing the app version failed: Intune did not apply the new content version and install command." FAIL
-        return $false
+        return (New-BeamPublishResult $false)
     }
     Write-StepUpdate "App version committed" OK
 
-    $groupName = "BEAM-$safeName"
+    # Every run gets its own group, named with the run ID. A group reused by name would carry the
+    # members of earlier runs, and the assignment would then install the app on machines this run
+    # never chose. The mailNickname is ASCII, free of characters Graph rejects, and at most 64 long.
+    $groupName = "BEAM-$safeName-$RunId"
+    $runTag = ($RunId -replace '[^A-Za-z0-9-]', '')
+    if ($runTag.Length -gt 40) { $runTag = $runTag.Substring($runTag.Length - 40) }
+    $nickBase = ("BEAM-$safeName" -replace '[^\x21-\x7E]', '-') -replace '[@()\\\[\]";:<>,\s]', ''
+    $room = 64 - $runTag.Length - 1
+    if ($nickBase.Length -gt $room) { $nickBase = $nickBase.Substring(0, $room) }
+    $mailNick = "$nickBase-$runTag"
+    Write-StepUpdate "Creating security group: $groupName" INFO
+    $groupBody = @{ displayName = $groupName; mailEnabled = $false; mailNickname = $mailNick; securityEnabled = $true } | ConvertTo-Json
     $group = $null
-    try {
-        $existingGroup = Invoke-RestMethod "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$groupName'" -Headers $h -ErrorAction Stop
-        $group = $existingGroup.value | Select-Object -First 1
-    } catch { }
-
-    if ($group) {
-        Write-StepUpdate "Reusing existing group: $groupName ($($group.id))" OK
-    }
-    if (-not $group) {
-        Write-StepUpdate "Creating security group: $groupName" INFO
-        # mailNickname must be ASCII with no special chars: map non-ASCII to hyphens and strip
-        # anything else Graph rejects. displayName keeps the real name.
-        $mailNick = ($groupName -replace '[^\x00-\x7F]', '-') -replace '[@()\\\[\]";:<>,\s]', ''
-        if ($mailNick.Length -gt 64) { $mailNick = $mailNick.Substring(0, 64) }
-        $groupBody = @{ displayName = $groupName; mailEnabled = $false; mailNickname = $mailNick; securityEnabled = $true } | ConvertTo-Json
-        $group = Invoke-RestMethod "https://graph.microsoft.com/v1.0/groups" -Method POST -Headers $h -Body ([System.Text.Encoding]::UTF8.GetBytes($groupBody)) -ContentType "application/json; charset=utf-8"
-        Write-StepUpdate "Group created: $($group.id)" OK
-    }
+    try { $group = Invoke-BeamGraph "https://graph.microsoft.com/v1.0/groups" $h POST $groupBody }
+    catch { Write-StepUpdate "Creating the group failed: $_" FAIL; return (New-BeamPublishResult $false) }
+    if (-not $group -or -not $group.id) { Write-StepUpdate "Creating the group failed: Graph returned no group ID" FAIL; return (New-BeamPublishResult $false) }
+    Write-StepUpdate "Group created: $($group.id)" OK
     Write-Host ""
 
+    # Resolve each target to exactly one device and add it to the group. A target is only queued
+    # after the group read-back lists its device and the assignment succeeds.
+    $tres = [ordered]@{}
+    foreach ($target in $Targets) { $tres[$target] = 'FAIL' }
+    $pending = New-Object System.Collections.ArrayList
     foreach ($target in $Targets) {
         Write-StepUpdate "--- $target ---" INFO
-        $entraDevice = $null; $entraErr = $false
+        $esc = $target -replace "'", "''"
+
+        $md = $null; $mdErr = $false; $mdAmbiguous = $false
         try {
-            $entraResp   = Invoke-RestMethod "https://graph.microsoft.com/v1.0/devices?`$filter=displayName eq '$target'" -Headers $h -ErrorAction Stop
-            $entraDevice = $entraResp.value | Select-Object -First 1
-        } catch { $entraErr = $true }
-        if ($entraErr) {
-            Write-Detail "Entra device ID" "lookup denied: needs Device.Read.All consent" WARN
-        } elseif ($entraDevice) {
-            Write-Detail "Entra device ID" $entraDevice.id
-            $memberBody = @{ "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$($entraDevice.id)" } | ConvertTo-Json
-            try {
-                Invoke-RestMethod "https://graph.microsoft.com/v1.0/groups/$($group.id)/members/`$ref" -Method POST -Headers $h -Body $memberBody -ContentType "application/json" | Out-Null
-                Write-Detail "Group" "added to $groupName" OK
-            } catch {
-                if ("$_" -match "already exist") { Write-Detail "Group" "already a member of $groupName" }
-                else { Write-Detail "Group" "add failed: $_" WARN }
-            }
-        } else {
-            Write-Detail "Entra device ID" "not found by displayName: skipping group add" WARN
-        }
-        $md = $null; $mdErr = $false
-        try {
-            $mdResp = Invoke-RestMethod "https://graph.microsoft.com/beta/deviceManagement/managedDevices?`$filter=deviceName eq '$target'" -Headers $h -ErrorAction Stop
-            $md     = $mdResp.value | Select-Object -First 1
+            $mdList = @((Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceManagement/managedDevices?`$filter=deviceName eq '$esc'" $h).value | Where-Object { $_.deviceName -ieq $target })
+            if ($mdList.Count -gt 1) { $mdAmbiguous = $true }
+            elseif ($mdList.Count -eq 1) { $md = $mdList[0] }
         } catch { $mdErr = $true }
+        if ($mdAmbiguous) {
+            Write-Detail "Intune device ID" "ambiguous: $($mdList.Count) managed devices are named $target" FAIL
+            continue
+        }
         if ($mdErr) {
             Write-Detail "Intune device ID" "lookup failed: sync skipped" WARN
         } elseif ($md) {
             Write-Detail "Intune device ID" $md.id
             Write-Detail "OS" "$($md.operatingSystem) $($md.osVersion)"
-            try {
-                Invoke-RestMethod "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($md.id)/syncDevice" -Method POST -Headers $h | Out-Null
-                Write-Detail "Sync" "triggered" OK
-            } catch { Write-Detail "Sync" "trigger failed: $_" WARN }
         } else {
             Write-Detail "Intune device ID" "not found: sync skipped" WARN
         }
+
+        # Prefer the Entra device that the managed device points at; fall back to an exact name that
+        # matches exactly one Entra device.
+        $entra = $null; $entraErr = $null; $entraCount = 0
+        try {
+            if ($md -and $md.azureADDeviceId) {
+                $byId = @((Invoke-BeamGraph "https://graph.microsoft.com/v1.0/devices?`$filter=deviceId eq '$($md.azureADDeviceId)'" $h).value)
+                $entraCount = $byId.Count
+                if ($byId.Count -eq 1) { $entra = $byId[0] }
+            }
+            if (-not $entra -and $entraCount -eq 0) {
+                $byName = @((Invoke-BeamGraph "https://graph.microsoft.com/v1.0/devices?`$filter=displayName eq '$esc'" $h).value | Where-Object { $_.displayName -ieq $target })
+                $entraCount = $byName.Count
+                if ($byName.Count -eq 1) { $entra = $byName[0] }
+            }
+        } catch { $entraErr = $_ }
+        if ($entraErr) { Write-Detail "Entra device ID" "lookup failed (needs Device.Read.All consent?): $entraErr" FAIL; continue }
+        if ($entraCount -gt 1) { Write-Detail "Entra device ID" "ambiguous: $entraCount Entra devices match $target" FAIL; continue }
+        if (-not $entra) { Write-Detail "Entra device ID" "not found: $target cannot be added to the group" FAIL; continue }
+        Write-Detail "Entra device ID" $entra.id
+
+        $memberBody = @{ "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$($entra.id)" } | ConvertTo-Json
+        $added = $true
+        try { Invoke-BeamGraph "https://graph.microsoft.com/v1.0/groups/$($group.id)/members/`$ref" $h POST $memberBody | Out-Null }
+        catch {
+            if ("$_" -notmatch 'already exist') { Write-Detail "Group" "add failed: $_" FAIL; $added = $false }
+        }
+        if (-not $added) { continue }
+        [void]$pending.Add([pscustomobject]@{ Target = $target; EntraId = "$($entra.id)"; Md = $md })
         Write-Host ""
     }
+
+    # Read the group back and keep only the targets that are really in it.
+    $verified = New-Object System.Collections.ArrayList
+    if ($pending.Count -gt 0) {
+        $memberIds = New-Object System.Collections.ArrayList
+        $readOk = $true
+        try {
+            $next = "https://graph.microsoft.com/v1.0/groups/$($group.id)/members?`$select=id&`$top=999"
+            $pages = 0
+            while ($next -and $pages -lt 100) {
+                $page = Invoke-BeamGraph $next $h
+                foreach ($m in @($page.value)) { [void]$memberIds.Add("$($m.id)") }
+                $next = $page.'@odata.nextLink'
+                $pages++
+            }
+        } catch { $readOk = $false; Write-StepUpdate "Reading the group back failed: $_" FAIL }
+        foreach ($pnd in $pending) {
+            if ($readOk -and $memberIds -contains $pnd.EntraId) {
+                Write-Detail $pnd.Target "verified in $groupName" OK
+                [void]$verified.Add($pnd)
+            } else {
+                Write-Detail $pnd.Target "not listed as a member of $groupName after the add" FAIL
+            }
+        }
+    }
+    if ($verified.Count -eq 0) {
+        Write-StepUpdate "No target could be verified in the group. The app was published but not assigned to anything." FAIL
+        return (New-BeamPublishResult $false $tres)
+    }
+
+    # Nudge each verified device to check in. A failed sync only delays the install: the device
+    # still picks the app up on its normal check-in.
+    foreach ($v in $verified) {
+        if ($v.Md) {
+            try {
+                Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($v.Md.id)/syncDevice" $h POST | Out-Null
+                Write-Detail "Sync $($v.Target)" "triggered" OK
+            } catch { Write-Detail "Sync $($v.Target)" "trigger failed: $_" WARN }
+        }
+    }
+    Write-Host ""
 
     Write-StepUpdate "Assigning app to group $groupName..." INFO
     $assignBody = @{
@@ -1157,15 +1219,15 @@ exit 1
         )
     } | ConvertTo-Json -Depth 10
     try { Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)/assign" $h POST $assignBody | Out-Null }
-    catch { Write-StepUpdate "Assigning the app failed: $_" FAIL; return $false }
+    catch { Write-StepUpdate "Assigning the app failed: $_" FAIL; return (New-BeamPublishResult $false $tres) }
+    foreach ($v in $verified) { $tres[$v.Target] = 'Intune queued' }
     Write-StepUpdate "App assigned. Devices will install on next Intune check-in (15-60 min)." OK
     Write-Host ""
     Write-StepUpdate "App ID: $($app.id)" INFO
     Write-StepUpdate "Group: $groupName ($($group.id))" INFO
     Write-Host ""
-    return $true
+    return (New-BeamPublishResult $true $tres)
 }
-
 function Test-BeamStagingManifest {
     # True only when the folder holds exactly one file and it is the expected installer.
     param([string]$Dir, [string]$SetupFile)
@@ -1174,7 +1236,8 @@ function Test-BeamStagingManifest {
 }
 
 function Invoke-IntuneInstall {
-    # Publishes the app and returns $true or $false. The run's own staging folder is removed when the
+    # Publishes the app and returns an object: Published (bool) and Targets (target -> "Intune queued"
+    # or "FAIL"). The run's own staging folder is removed when the
     # run ends, success or not. A folder that already existed is never ours, so it is left alone.
     # Any unexpected error is a failed run with a message, never an unhandled throw.
     param(
@@ -1191,14 +1254,15 @@ function Invoke-IntuneInstall {
     )
     $runRoot = Join-Path (Join-Path (Get-BeamWorkRoot) "IntuneWork") ("run-" + ($RunId -replace '[^A-Za-z0-9._-]', '_'))
     $existed = Test-Path -LiteralPath $runRoot
-    $res = $false
+    $res = New-BeamPublishResult $false
     try {
         $out = @(Invoke-BeamPublish -Targets $Targets -Url $Url -LocalPath $LocalPath -SetupFile $SetupFile -IsMsi $IsMsi -InstallArgs $InstallArgs `
             -AppName $AppName -Publisher $Publisher -TenantId $TenantId -RunId $RunId -RunRoot $runRoot)
-        $res = [bool]($out | Select-Object -Last 1)
+        $got = @($out | Where-Object { $_ -is [pscustomobject] -and $_.PSObject.Properties['Published'] }) | Select-Object -Last 1
+        if ($got) { $res = $got }
     } catch {
         Write-StepUpdate "Unexpected error: $($_.Exception.Message)" FAIL
-        $res = $false
+        $res = New-BeamPublishResult $false
     } finally {
         if (-not $existed -and (Test-Path -LiteralPath $runRoot)) {
             try { Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction Stop } catch { }
@@ -1239,13 +1303,16 @@ function Invoke-BeamMain {
     Write-StepUpdate "Run ID: $runId" INFO
     Write-Host ""
 
-    $intuneOk = Invoke-IntuneInstall -Targets $targets -Url $in.InstallerUrl -LocalPath $in.LocalInstaller -SetupFile $in.SetupFile -IsMsi $in.IsMsi -InstallArgs $in.InstallArgs -AppName $in.AppName -Publisher $in.Publisher -TenantId $in.TenantId -RunId $runId
-    if ($intuneOk) {
-        $targets | ForEach-Object { $results[$_] = "Intune queued" }
-    } else {
-        $targets | ForEach-Object { $results[$_] = "FAIL" }
+    $pub = Invoke-IntuneInstall -Targets $targets -Url $in.InstallerUrl -LocalPath $in.LocalInstaller -SetupFile $in.SetupFile -IsMsi $in.IsMsi -InstallArgs $in.InstallArgs -AppName $in.AppName -Publisher $in.Publisher -TenantId $in.TenantId -RunId $runId
+    # Each target is queued only if the publish verified it. Anything not reported is a failure.
+    foreach ($tg in $targets) {
+        $results[$tg] = "FAIL"
+        if ($pub.Published -and $pub.Targets -and $pub.Targets.Contains($tg) -and $pub.Targets[$tg] -eq "Intune queued") { $results[$tg] = "Intune queued" }
+    }
+    $nFail = @($results.Values | Where-Object { $_ -eq "FAIL" }).Count
+    if ($nFail -gt 0) {
         Write-Host ""
-        Write-StepUpdate "Intune deployment did not complete (see error above): $($targets.Count) target(s) marked FAILED." FAIL
+        Write-StepUpdate "Intune deployment did not complete for $nFail of $($targets.Count) target(s) (see above)." FAIL
     }
 
     Write-HLine
