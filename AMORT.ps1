@@ -297,16 +297,50 @@ function Complete-Step {
 # the cutoff. Locked files are skipped. Returns the byte total in dry run.
 function Remove-OldFiles {
     param([string[]]$Path, [int]$Days)
+    # .NET walk instead of the pipeline, which crawled on a Temp folder with hundreds of
+    # thousands of entries. Links are never followed; unreadable folders and locked files are skipped.
     $Cutoff = (Get-Date).AddDays(-$Days)
     $Sum = [int64]0
+    $Reparse = [IO.FileAttributes]::ReparsePoint
     foreach ($P in $Path) {
-        if (-not (Test-Path $P)) { continue }
-        Get-ChildItem -Path $P -Recurse -Force -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt $Cutoff } |
-            ForEach-Object {
-                if ($script:DryRun) { $Sum += $_.Length }
-                else { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        if ([string]::IsNullOrEmpty($P)) { continue }
+        if ([IO.File]::Exists($P)) {
+            $F = New-Object IO.FileInfo $P
+            if ($F.LastWriteTime -lt $Cutoff) {
+                if ($script:DryRun) { $Sum += $F.Length } else { try { $F.Delete() } catch { } }
             }
+            continue
+        }
+        if (-not [IO.Directory]::Exists($P)) { continue }
+        $Stack = New-Object System.Collections.Generic.Stack[string]
+        $Stack.Push($P)
+        $SubDirs = New-Object System.Collections.Generic.List[string]
+        while ($Stack.Count -gt 0) {
+            $Dir = New-Object IO.DirectoryInfo $Stack.Pop()
+            try { $Entries = $Dir.GetFileSystemInfos() } catch { continue }
+            foreach ($E in $Entries) {
+                if ($E.Attributes -band [IO.FileAttributes]::Directory) {
+                    if (-not ($E.Attributes -band $Reparse)) {
+                        $Stack.Push($E.FullName)
+                        if ($E.LastWriteTime -lt $Cutoff) { $SubDirs.Add($E.FullName) }
+                    }
+                    continue
+                }
+                if ($E.LastWriteTime -ge $Cutoff) { continue }
+                if ($script:DryRun) { $Sum += $E.Length; continue }
+                try {
+                    if ($E.Attributes -band [IO.FileAttributes]::ReadOnly) { $E.Attributes = [IO.FileAttributes]::Normal }
+                    $E.Delete()
+                } catch { }
+            }
+        }
+        # Old folders left empty are removed deepest first. A non-recursive delete fails on
+        # anything still holding files, so only truly empty folders go, never the root itself.
+        if (-not $script:DryRun) {
+            for ($i = $SubDirs.Count - 1; $i -ge 0; $i--) {
+                try { [IO.Directory]::Delete($SubDirs[$i], $false) } catch { }
+            }
+        }
     }
     return $Sum
 }
@@ -544,7 +578,7 @@ $script:RegionHistory = @()
 if ($TotalSize -le 0) { throw "PRECONDITION: the C: volume size could not be read." }
 
 $StartUsagePct = [Math]::Round(((($TotalSize - $StartSpace) / $TotalSize) * 100), 2)
-$LastRegionSpace = $Drive.FreeSpace # Rolling baseline for step-by-step reporting
+$script:LastRegionSpace = $Drive.FreeSpace # Rolling baseline for step-by-step reporting
 $CS = Get-CimInstance Win32_ComputerSystem
 $Vendor = $CS.Manufacturer
 $IsVM = ($Vendor -match "QEMU|VMware|Virtual|Hyper-V")
@@ -1128,9 +1162,9 @@ if (-not $SkipRepair -and -not $DryRun) {
 # Component cleanup can free real space, so report it instead of folding it in silently.
 if (-not $DryRun) {
     $CurrentSpace = Get-FreeBytes
-    $RepairSaved = [int64]($CurrentSpace - $LastRegionSpace)
+    $RepairSaved = [int64]($CurrentSpace - $script:LastRegionSpace)
     if ($RepairSaved -ge 1MB) { Write-Host "        Component store cleanup freed $(Format-Size $RepairSaved)." -ForegroundColor Gray }
-    $LastRegionSpace = $CurrentSpace
+    $script:LastRegionSpace = $CurrentSpace
 }
 #endregion
 #region 8. Final Optimization

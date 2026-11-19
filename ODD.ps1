@@ -183,13 +183,13 @@ function Format-DriverString([string]$DevName, [string]$DevId, [int]$ColWidth = 
     $driverString = Get-DriverString $DevName $DevId
     if ($driverString -eq "N/A") { return "N/A".PadLeft($ColWidth) }
     $parts   = $driverString -split "  ", 2
-    $version = $parts[0].Trim()
+    $drvVersion = $parts[0].Trim()
     $date    = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
     if ($date) {
-        $gap = [Math]::Max(1, $ColWidth - $version.Length - $date.Length)
-        return $version + (" " * $gap) + $date
+        $gap = [Math]::Max(1, $ColWidth - $drvVersion.Length - $date.Length)
+        return $drvVersion + (" " * $gap) + $date
     } else {
-        return $version.PadRight($ColWidth)
+        return $drvVersion.PadRight($ColWidth)
     }
 }
 
