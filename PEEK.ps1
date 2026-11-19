@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Patch & Event Examination Kit (P.E.E.K.) v1.0
-    Created by Steve the Killer | Updated: 2026-08-27   
+    Patch & Event Examination Kit (P.E.E.K.) v2.0
+    Created by Steve the Killer | Updated: 2026-11-19
 .DESCRIPTION
     Read-only live Windows Update and Windows Setup servicing monitor for
     remote support. Correlates WindowsUpdateClient events, servicing processes,
@@ -13,6 +13,7 @@
     Safe for Kaseya LiveConnect and SYSTEM execution.
     Makes no registry changes, starts no updates, opens no UI, and never reboots.
     Press Q or ESC to exit cleanly. Ctrl+C also stops the monitor.
+    Exit codes: 0 finished, 1 stopped on an error, 2 not elevated.
 #>
 
 param(
@@ -25,21 +26,30 @@ param(
 #region [0] - PRE-FLIGHT & CONFIGURATION
 # ============================================================================
 
+# Exit codes: 0 success, 1 failure, 2 not elevated, 3 partial, 3010 reboot required.
+# PEEK is read-only and never reboots, so it only ever returns 0, 1 or 2.
 $EXIT_SUCCESS = 0
-$EXIT_DENIED  = 3
+$EXIT_FAILURE = 1
+$EXIT_DENIED  = 2
 
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Warning "P.E.E.K. requires elevated privileges. Please run as Administrator or SYSTEM."
-    exit $EXIT_DENIED
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
 }
 
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding            = [System.Text.Encoding]::UTF8
+function Test-PEEKElevated {
+    try {
+        return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
 
 $script:Acronym    = "PEEK"
 $script:AcronymFmt = "P.E.E.K."
 $script:ScriptName = "Patch & Event Examination Kit"
-$script:Version    = "v1.0"
+$script:Version    = "v2.0"
 
 $LineCol   = "Blue"
 $MainCol   = "Magenta"
@@ -68,10 +78,13 @@ $script:PreviousCpu        = @{}
 $script:PreviousSampleTime = $null
 $script:CompatCacheKey       = $null
 $script:CompatCacheValue     = $null
+$script:CompatRetryAfter     = [datetime]::MinValue
 $script:BitLockerState       = "Unknown"
 $script:SetupCommandLinePath = ""
 $script:SetupCommandLine     = ""
 $script:SetupDeepScanTime    = [datetime]::MinValue
+$script:SetupDeepScanPath    = $null
+$script:SetupDeepScanKey     = $null
 
 #endregion
 
@@ -123,6 +136,11 @@ function Format-Age {
 function Format-Uptime {
     param([timespan]$Uptime)
     return "{0}d {1}h {2}m" -f $Uptime.Days, $Uptime.Hours, $Uptime.Minutes
+}
+
+function Clear-PEEKScreen {
+    # Clear-Host throws when there is no console, as in an RMM output pane.
+    try { Clear-Host } catch {}
 }
 
 function Write-HLine {
@@ -488,6 +506,10 @@ function Get-PEEKProcessSnapshot {
         $start = $null
         try { $start = [datetime]$process.StartTime } catch {}
 
+        # Path is unreadable for some protected processes and from a 32-bit host. Blank means unknown.
+        $exePath = ""
+        try { if ($process.Path) { $exePath = [string]$process.Path } } catch {}
+
         $rank = 99
         if ($priority.ContainsKey($process.ProcessName)) { $rank = [int]$priority[$process.ProcessName] }
 
@@ -498,6 +520,7 @@ function Get-PEEKProcessSnapshot {
             RAMMB    = [Math]::Round($process.WorkingSet64 / 1MB, 1)
             Start    = $start
             Priority = $rank
+            Path     = $exePath
         }
     }
 
@@ -553,9 +576,14 @@ function Get-PEEKSetupState {
             }
         } catch {}
 
-        $deepScanDue = ($script:SetupCommandLinePath -ne $act.FullName) -or
-                       (-not $script:SetupCommandLine) -or
-                       (((Get-Date) - $script:SetupDeepScanTime).TotalSeconds -ge 15)
+        # The 50,000 line scan is cached by source identity (path, write time, length), so a log
+        # that has not changed is never reread, whether or not it held a command line. A log that
+        # keeps growing is rescanned at most every 15 seconds, and any log at least every 5 minutes.
+        $deepScanKey   = "$($act.FullName)|$($act.LastWriteTime.Ticks)|$($act.Length)"
+        $sinceDeepScan = ((Get-Date) - $script:SetupDeepScanTime).TotalSeconds
+        $deepScanDue = ($script:SetupDeepScanPath -ne $act.FullName) -or
+                       (($script:SetupDeepScanKey -ne $deepScanKey) -and ($sinceDeepScan -ge 15)) -or
+                       ($sinceDeepScan -ge 300)
 
         if ($deepScanDue) {
             try {
@@ -571,8 +599,15 @@ function Get-PEEKSetupState {
                     $script:SetupCommandLine = $foundCommandLine
                     $script:SetupCommandLinePath = $act.FullName
                 }
+                $script:SetupDeepScanPath = $act.FullName
+                $script:SetupDeepScanKey  = $deepScanKey
                 $script:SetupDeepScanTime = Get-Date
-            } catch {}
+            } catch {
+                # A failed read is retried on the normal 15 second interval.
+                $script:SetupDeepScanPath = $act.FullName
+                $script:SetupDeepScanKey  = $null
+                $script:SetupDeepScanTime = Get-Date
+            }
         }
 
         if ($script:SetupCommandLinePath -eq $act.FullName) {
@@ -664,15 +699,21 @@ function Get-PEEKCompatState {
             BlockCount    = 0
             Summary       = "No compatibility report"
             HasReport     = $false
+            ParseFailed   = $false
         }
     }
 
     $cacheKey = "$($file.FullName)|$($file.LastWriteTime.Ticks)|$($file.Length)"
     if ($script:CompatCacheKey -eq $cacheKey -and $script:CompatCacheValue) {
-        return $script:CompatCacheValue
+        # A failed read is only remembered for a short window. The producer may still be writing,
+        # or the read may have hit a sharing violation, so the same file is tried again.
+        if (-not $script:CompatCacheValue.ParseFailed -or (Get-Date) -lt $script:CompatRetryAfter) {
+            return $script:CompatCacheValue
+        }
     }
 
     $blocks = @()
+    $parseFailed = $false
     try {
         [xml]$xml = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
 
@@ -695,11 +736,15 @@ function Get-PEEKCompatState {
             $blocks += "DRIVER: $inf"
         }
     } catch {
-        $blocks += "Compatibility report could not be parsed"
+        # Unreadable is not the same as blocked. Report it separately and never as a block.
+        $parseFailed = $true
+        $blocks = @()
     }
 
     $blocks = @($blocks | Select-Object -Unique)
-    $summary = if ($blocks.Count -gt 0) { $blocks -join '; ' } else { "None detected" }
+    $summary = if ($parseFailed) { "Compatibility report could not be parsed (retrying)" }
+               elseif ($blocks.Count -gt 0) { $blocks -join '; ' }
+               else { "None detected" }
 
     $value = [PSCustomObject]@{
         File          = $file
@@ -707,10 +752,12 @@ function Get-PEEKCompatState {
         BlockCount    = $blocks.Count
         Summary       = $summary
         HasReport     = $true
+        ParseFailed   = $parseFailed
     }
 
     $script:CompatCacheKey   = $cacheKey
     $script:CompatCacheValue = $value
+    if ($parseFailed) { $script:CompatRetryAfter = (Get-Date).AddSeconds(10) }
     return $value
 }
 
@@ -848,8 +895,26 @@ function Get-PEEKSystemState {
     $now = Get-Date
     $processNames = @($Processes | ForEach-Object { $_.Name })
     $strongInstallProcess = @($processNames | Where-Object {
-        $_ -match '^(Windows11InstallationAssistant|setup|setuphost|setupprep|wuaulcore|TiWorker)$'
+        $_ -match '^(Windows11InstallationAssistant|setuphost|setupprep|wuaulcore|TiWorker)$'
     }).Count -gt 0
+
+    # "setup" is a generic name that any installer uses. It only counts as Windows servicing when
+    # it runs from the Windows Setup staging folder or the Panther setup log is being written.
+    if (-not $strongInstallProcess) {
+        $setupProcesses = @($Processes | Where-Object { $_.Name -eq 'setup' })
+        if ($setupProcesses.Count -gt 0) {
+            if ($Setup.Active) {
+                $strongInstallProcess = $true
+            } else {
+                foreach ($candidate in $setupProcesses) {
+                    if ($candidate.Path -and ([string]$candidate.Path) -like '*\$WINDOWS.~BT\*') {
+                        $strongInstallProcess = $true
+                        break
+                    }
+                }
+            }
+        }
+    }
     $trustedInstallerProcess = @($processNames | Where-Object { $_ -eq 'TrustedInstaller' }).Count -gt 0
     $orchestratorProcess = @($processNames | Where-Object { $_ -match '^(MoUsoCoreWorker|UsoClient)$' }).Count -gt 0
 
@@ -878,7 +943,9 @@ function Get-PEEKSystemState {
     $rebootAction = "NO REBOOT REQUIRED"
     $rebootColor = $script:DoneFG
 
-    if ($targetInstalled) {
+    $liveServicing = ($installProcess -or $Setup.Active)
+
+    if ($targetInstalled -and -not $liveServicing) {
         $state = "FEATURE UPDATE COMPLETE - $($UpdateContext.FeatureTarget) INSTALLED"
         $stateColor = $script:DoneFG
     }
@@ -929,7 +996,7 @@ function Get-PEEKSystemState {
         $stateColor = $AccentCol
     }
 
-    if ($activeStart -or $installProcess -or $Setup.Active) {
+    if (($activeStart -and -not $targetInstalled) -or $liveServicing) {
         $rebootAction = "DO NOT REBOOT - SERVICING ACTIVE OR INCOMPLETE"
         $rebootColor = $script:FailFG
     }
@@ -1000,6 +1067,7 @@ function Write-RebootFlags {
         @{ Label = 'CBS';        Value = $Reboot.CBS },
         @{ Label = 'MoSetup';    Value = $Reboot.MoSetup },
         @{ Label = 'FileRename'; Value = $Reboot.FileRename },
+        @{ Label = 'UpdateExe';  Value = $Reboot.UpdateExe },
         @{ Label = 'pending.xml';Value = $Reboot.PendingXml }
     )
 
@@ -1009,7 +1077,12 @@ function Write-RebootFlags {
         Write-Host "$($flag.Label)=" -ForegroundColor $DimCol -NoNewline
         if ($flag.Value) { Write-Host "YES" -ForegroundColor $script:WarnFG -NoNewline }
         else { Write-Host "no" -ForegroundColor $script:MutedFG -NoNewline }
-        if ($i -lt ($flags.Count - 1)) { Write-Host "  |  " -ForegroundColor $script:MutedFG -NoNewline }
+        if ($i -eq 2) {
+            # Six flags do not fit one 76 column line, so continue on a second aligned row.
+            Write-Host ""
+            Write-Host (" " * 22) -NoNewline
+        }
+        elseif ($i -lt ($flags.Count - 1)) { Write-Host "  |  " -ForegroundColor $script:MutedFG -NoNewline }
     }
     Write-Host ""
 }
@@ -1047,7 +1120,7 @@ function Show-PEEKSnapshot {
     $readiness     = Get-PEEKReadiness
     $state         = Get-PEEKSystemState -OS $os -UpdateContext $updateContext -Processes $processes -Setup $setup -Compat $compat -Reboot $reboot
 
-    Clear-Host
+    Clear-PEEKScreen
     Write-Banner
 
     Write-Detail -Label "Device Name" -Value $env:COMPUTERNAME -ValueColor $script:ValueFG
@@ -1091,7 +1164,7 @@ function Show-PEEKSnapshot {
     if ($compat.HasReport) {
         $compatAge = Format-Age -Time $compat.LastWriteTime
         $compatValue = "$($compat.Summary)  [report age $compatAge]"
-        $compatColor = if ($compat.BlockCount -gt 0) { $script:FailFG } else { $script:DoneFG }
+        $compatColor = if ($compat.ParseFailed) { $script:WarnFG } elseif ($compat.BlockCount -gt 0) { $script:FailFG } else { $script:DoneFG }
         Write-Detail -Label "Compatibility" -Value $compatValue -ValueColor $compatColor
     } else {
         Write-Detail -Label "Compatibility" -Value $compat.Summary -ValueColor $script:MutedFG
@@ -1130,37 +1203,61 @@ function Show-PEEKSnapshot {
     Write-Host ("  " + (Get-TruncatedText -Text $liveText -MaxLength ($script:Width - 2))) -ForegroundColor $AccentCol
 }
 
-$script:BitLockerState = Get-PEEKBitLockerState
-$quit = $false
-
-while (-not $quit) {
-    Show-PEEKSnapshot
-
-    if ($Once) { break }
-
-    $deadline = (Get-Date).AddSeconds($RefreshSeconds)
-    while ((Get-Date) -lt $deadline -and -not $quit) {
-        try {
-            if ([Console]::KeyAvailable) {
-                $key = [Console]::ReadKey($true)
-                if ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) {
-                    $quit = $true
-                    break
-                }
-            }
-        } catch {}
-        Start-Sleep -Milliseconds 100
+function Invoke-PEEKMain {
+    if (-not (Test-PEEKElevated)) {
+        Write-Warning "P.E.E.K. requires elevated privileges. Please run as Administrator or SYSTEM."
+        Write-Output "[FAIL] P.E.E.K. not run: elevation required (exit $EXIT_DENIED)."
+        Exit-KillerScript $EXIT_DENIED
     }
-}
 
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+
+    $exitCode = $EXIT_SUCCESS
+    $finalLine = ""
+    try {
+        $script:BitLockerState = Get-PEEKBitLockerState
+        $quit = $false
+
+        while (-not $quit) {
+            Show-PEEKSnapshot
+
+            if ($Once) { break }
+
+            $deadline = (Get-Date).AddSeconds($RefreshSeconds)
+            while ((Get-Date) -lt $deadline -and -not $quit) {
+                try {
+                    if ([Console]::KeyAvailable) {
+                        $key = [Console]::ReadKey($true)
+                        if ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) {
+                            $quit = $true
+                            break
+                        }
+                    }
+                } catch {}
+                Start-Sleep -Milliseconds 100
+            }
+        }
+
+        if ($Once) { $finalLine = "[OK] P.E.E.K. snapshot complete. Read-only, nothing was changed (exit $EXIT_SUCCESS)." }
+        else       { $finalLine = "[OK] P.E.E.K. monitor stopped. Read-only, nothing was changed (exit $EXIT_SUCCESS)." }
+    } catch {
+        $exitCode = $EXIT_FAILURE
+        $finalLine = "[FAIL] P.E.E.K. stopped on an error: $($_.Exception.Message) (exit $EXIT_FAILURE)."
+    }
+
+    try {
+        Write-Footer -Text "READ-ONLY LIVE SERVICING MONITOR"
+    } catch {}
+
+    Write-Output $finalLine
+    Exit-KillerScript $exitCode
+}
 #endregion
 
-#region [5] - EXIT
+#region [5] - ENTRY POINT
 # ============================================================================
 
-try {
-    Write-Footer -Text "READ-ONLY LIVE SERVICING MONITOR"
-} catch {}
+if (-not $global:KillerScriptsTestMode) { Invoke-PEEKMain }
 
-exit $EXIT_SUCCESS
 #endregion

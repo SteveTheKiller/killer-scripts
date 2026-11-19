@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CompatReport Version="1" Synthetic="true">
+  <Programs>
+    <Program Name="Contoso Legacy VPN">
+      <Item BlockingType="Hard" Title="Contoso Legacy VPN is not compatible with this version of Windows" />
+    </Program>
+  </Programs>
+  <Drivers>
+    <DriverPackage Inf="oem42.inf" BlockMigration="True" />
+    <DriverPackage Inf="oem43.inf" BlockMigration="False" />
+  </Drivers>
+</CompatReport>
