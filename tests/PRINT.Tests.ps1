@@ -223,4 +223,48 @@ Describe 'PRINT' {
             }
         }
     }
+
+    Context 'finding 41: protocol and port' {
+        BeforeEach {
+            Mock Test-PrintIppSupported { $true }
+            $script:Keys.Enqueue((New-Key '2'))      # add menu: manual IP
+            $script:Keys.Enqueue((New-Key 'a'))      # accept suggested driver
+            foreach ($i in @('10.0.0.5', '')) { $script:Inputs.Enqueue($i) }
+        }
+        It 'creates a RAW port on 9100 named for the protocol' {
+            $script:Keys.Enqueue((New-Key '1'))
+            Invoke-AddPrinterWizard
+            Should -Invoke Add-PrinterPort -Times 1 -Exactly -ParameterFilter { $PortNumber -eq 9100 -and $PrinterHostAddress -eq '10.0.0.5' }
+            Should -Invoke Add-Printer -Times 1 -Exactly -ParameterFilter { $PortName -like 'IP_10.0.0.5*' }
+        }
+        It 'never builds a raw TCP port on 631 for IPP, and uses the native IPP URL instead' {
+            $script:Keys.Enqueue((New-Key '2'))
+            Invoke-AddPrinterWizard
+            Should -Invoke Add-PrinterPort -Times 0 -Exactly
+            Should -Invoke Add-Printer -Times 1 -Exactly -ParameterFilter { $IppURL -eq 'http://10.0.0.5:631/ipp/print' }
+        }
+        It 'fails honestly when this Windows build cannot add IPP printers' {
+            Mock Test-PrintIppSupported { $false }
+            $script:Keys.Enqueue((New-Key '2'))
+            Invoke-AddPrinterWizard
+            Should -Invoke Add-PrinterPort -Times 0 -Exactly
+            Should -Invoke Add-Printer -Times 0 -Exactly
+            ($script:HostLines -join "`n") | Should -Match 'IPP'
+            $script:PrintFailures | Should -Be 1
+        }
+        It 'does not reuse a same-IP port that was made for another protocol' {
+            Mock Get-PrinterPort { [pscustomobject]@{ Name = 'IP_10.0.0.5'; PrinterHostAddress = '10.0.0.5'; PortNumber = 631 } } -ParameterFilter { $Name -eq 'IP_10.0.0.5' }
+            $script:Keys.Enqueue((New-Key '1'))
+            Invoke-AddPrinterWizard
+            Should -Invoke Add-PrinterPort -Times 1 -Exactly -ParameterFilter { $PortNumber -eq 9100 -and $Name -ne 'IP_10.0.0.5' }
+            Should -Invoke Add-Printer -Times 1 -Exactly -ParameterFilter { $PortName -ne 'IP_10.0.0.5' }
+        }
+        It 'reuses a same-IP port that already matches RAW 9100' {
+            Mock Get-PrinterPort { [pscustomobject]@{ Name = 'IP_10.0.0.5'; PrinterHostAddress = '10.0.0.5'; PortNumber = 9100 } } -ParameterFilter { $Name -eq 'IP_10.0.0.5' }
+            $script:Keys.Enqueue((New-Key '1'))
+            Invoke-AddPrinterWizard
+            Should -Invoke Add-PrinterPort -Times 0 -Exactly
+            Should -Invoke Add-Printer -Times 1 -Exactly -ParameterFilter { $PortName -eq 'IP_10.0.0.5' }
+        }
+    }
 }

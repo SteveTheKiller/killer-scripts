@@ -39,6 +39,10 @@ function Read-PrintKey {
     # Returns $null when there is no console, so callers treat it as ESC and never spin.
     try { [Console]::ReadKey($true) } catch { $null }
 }
+function Test-PrintIppSupported {
+    # Add-Printer -IppURL exists on newer Windows 10/11 and Server builds only.
+    try { (Get-Command Add-Printer -ErrorAction Stop).Parameters.ContainsKey('IppURL') } catch { $false }
+}
 function Get-PrintCursorTop { try { [Console]::CursorTop } catch { -1 } }
 function Set-PrintCursor {
     param([int]$Left, [int]$Top)
@@ -528,9 +532,33 @@ function Invoke-AddPrinterWizard {
 
                     # --- Install ---
                     Write-Host ""
-                    $portName   = "IP_$targetIP"
-                    $portExists = Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue
+                    $portName = $null
                     try {
+                        if ($useIPP) {
+                            # IPP is HTTP, so a raw TCP/IP port on 631 cannot print. Use the native IPP queue.
+                            if (-not (Test-PrintIppSupported)) {
+                                throw "This Windows build cannot add IPP printers natively (Add-Printer has no -IppURL). Choose RAW (port 9100) or update Windows."
+                            }
+                            $ippUrl = "http://${targetIP}:631/ipp/print"
+                            Write-Host "      > Adding IPP printer '$fname' ($ippUrl, Microsoft IPP Class Driver)..." -ForegroundColor $DimCol
+                            Add-Printer -Name $fname -IppURL $ippUrl -ErrorAction Stop
+                            Write-Host "      > '$fname' installed successfully." -ForegroundColor $OkCol
+                            $script:PrintSuccesses++
+                            Write-Host ""; Write-Host "  Press any key to continue..." -ForegroundColor $DimCol
+                            Read-PrintKey | Out-Null
+                            return
+                        }
+                        # RAW: reuse a same-IP port only when it is a TCP/IP port to this host on 9100.
+                        $portName   = "IP_$targetIP"
+                        $portExists = Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue
+                        if ($portExists -and -not ($portExists.PortNumber -eq $portNum -and $portExists.PrinterHostAddress -eq $targetIP)) {
+                            Write-Host "      > Port $portName exists with different settings, using a separate RAW port." -ForegroundColor $DimCol
+                            $portName   = "IP_${targetIP}_$portNum"
+                            $portExists = Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue
+                            if ($portExists -and -not ($portExists.PortNumber -eq $portNum -and $portExists.PrinterHostAddress -eq $targetIP)) {
+                                throw "Port $portName already exists with different settings. Remove it in Print Server Properties and try again."
+                            }
+                        }
                         if (-not $portExists) {
                             Write-Host "      > Creating port $portName (port $portNum)..." -ForegroundColor $DimCol
                             Add-PrinterPort -Name $portName -PrinterHostAddress $targetIP -PortNumber $portNum -ErrorAction Stop
