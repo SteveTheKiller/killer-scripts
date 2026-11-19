@@ -310,14 +310,14 @@ Describe 'Staging directory ownership in a full run (finding 48)' {
 
 Describe 'Installation Assistant verification (finding 36)' {
     BeforeEach {
-        $script:Pub = '^CN=Microsoft Corporation(,|$)'
+        $script:Pub = 'Microsoft Corporation'
         $script:Exe = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '.exe')
     }
 
     It 'accepts a valid Microsoft signature' {
         Set-Content -LiteralPath $script:Exe -Value 'x'
         Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' } } }
-        Test-WursaSignedBinary -Path $script:Exe -PublisherPattern $script:Pub | Should -BeTrue
+        Test-WursaSignedBinary -Path $script:Exe -Organization $script:Pub | Should -BeTrue
     }
 
     It 'rejects <Why>' -ForEach @(
@@ -329,14 +329,14 @@ Describe 'Installation Assistant verification (finding 36)' {
         Set-Content -LiteralPath $script:Exe -Value 'x'
         $sub = $Subject; $st = $Status
         Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = $st; SignerCertificate = [pscustomobject]@{ Subject = $sub } } }.GetNewClosure()
-        Test-WursaSignedBinary -Path $script:Exe -PublisherPattern $script:Pub | Should -BeFalse
+        Test-WursaSignedBinary -Path $script:Exe -Organization $script:Pub | Should -BeFalse
     }
 
     It 'rejects a missing file and a pinned digest that does not match' {
-        Test-WursaSignedBinary -Path (Join-Path $TestDrive 'nope.exe') -PublisherPattern $script:Pub | Should -BeFalse
+        Test-WursaSignedBinary -Path (Join-Path $TestDrive 'nope.exe') -Organization $script:Pub | Should -BeFalse
         Set-Content -LiteralPath $script:Exe -Value 'x'
         Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Corporation' } } }
-        Test-WursaSignedBinary -Path $script:Exe -PublisherPattern $script:Pub -Sha256 ('0' * 64) | Should -BeFalse
+        Test-WursaSignedBinary -Path $script:Exe -Organization $script:Pub -Sha256 ('0' * 64) | Should -BeFalse
     }
 
     Context 'the runner function' {
@@ -349,7 +349,7 @@ Describe 'Installation Assistant verification (finding 36)' {
             $IPU_IAArgs = '/QuietInstall'
             $IPU_IAUrl = 'https://example.invalid/ia.exe'
             $IPU_IASha256 = ''
-            $IPU_IAPublisher = '^CN=Microsoft Corporation(,|$)'
+            $IPU_IAPublisher = 'Microsoft Corporation'
             . ([scriptblock]::Create((Get-RunnerFunctionText 'Set-Status')))
             . ([scriptblock]::Create((Get-RunnerFunctionText 'Invoke-IPUInstallationAssistant')))
             function Register-IPUPostRebootVerifier { $true }
@@ -555,7 +555,7 @@ Describe 'Chocolatey bootstrap (finding 66)' {
         Mock Test-WursaSignedBinary { $true }
         Install-WursaChocolatey | Should -BeTrue
         $script:ScriptRan | Should -BeTrue
-        Should -Invoke Test-WursaSignedBinary -ParameterFilter { $PublisherPattern -match 'Chocolatey Software' }
+        Should -Invoke Test-WursaSignedBinary -ParameterFilter { $Organization -eq 'Chocolatey Software, Inc' }
     }
 
     It 'does not download anything when a private directory cannot be created' {
@@ -1148,5 +1148,40 @@ Describe 'Policy rollback in a full run (finding 29)' {
         Get-ExitCode { Invoke-WursaMain } | Should -Be 0
         [System.IO.File]::Exists($script:Rec) | Should -BeTrue
         ($script:said -join "`n") | Should -Match 'IN PROGRESS'
+    }
+}
+
+Describe 'Signer organization matching (real subject strings)' {
+    BeforeEach {
+        $script:Exe = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '.exe')
+        Set-Content -LiteralPath $script:Exe -Value 'x'
+    }
+
+    It 'accepts <Why>' -ForEach @(
+        @{ Why = 'the real Chocolatey subject'; Org = 'Chocolatey Software, Inc'; Subject = 'CN="Chocolatey Software, Inc", O="Chocolatey Software, Inc", L=Topeka, S=Kansas, C=US' }
+        @{ Why = 'a Microsoft Windows CN with the Microsoft organization'; Org = 'Microsoft Corporation'; Subject = 'CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' }
+        @{ Why = 'a Microsoft Corporation CN'; Org = 'Microsoft Corporation'; Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' }
+    ) {
+        $subj = $Subject
+        Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = $subj } } }.GetNewClosure()
+        Test-WursaSignedBinary -Path $script:Exe -Organization $Org | Should -BeTrue
+    }
+
+    It 'rejects <Why>' -ForEach @(
+        @{ Why = 'a longer organization that merely starts the same'; Org = 'Chocolatey Software, Inc'; Subject = 'CN="Chocolatey Software, Inc", O="Chocolatey Software, Inc Evil", L=Topeka, S=Kansas, C=US'; Status = 'Valid' }
+        @{ Why = 'a CN-only match with a different organization'; Org = 'Chocolatey Software, Inc'; Subject = 'CN="Chocolatey Software, Inc", O=Somebody Else, C=US'; Status = 'Valid' }
+        @{ Why = 'the organization hidden inside another value'; Org = 'Microsoft Corporation'; Subject = 'CN=Evil, OU=O=Microsoft Corporation, O=Evil Co, C=US'; Status = 'Valid' }
+        @{ Why = 'a Microsoft CN with another organization'; Org = 'Microsoft Corporation'; Subject = 'CN=Microsoft Corporation, O=Not Microsoft, C=US'; Status = 'Valid' }
+        @{ Why = 'a right subject whose signature is not Valid'; Org = 'Chocolatey Software, Inc'; Subject = 'CN="Chocolatey Software, Inc", O="Chocolatey Software, Inc", L=Topeka, S=Kansas, C=US'; Status = 'HashMismatch' }
+    ) {
+        $subj = $Subject; $st = $Status
+        Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = $st; SignerCertificate = [pscustomobject]@{ Subject = $subj } } }.GetNewClosure()
+        Test-WursaSignedBinary -Path $script:Exe -Organization $Org | Should -BeFalse
+    }
+
+    It 'uses the real organizations for the Chocolatey and Installation Assistant checks' {
+        $script:WursaChocoPublisher | Should -Be 'Chocolatey Software, Inc'
+        $text = Get-Content -LiteralPath (Get-KillerScriptPath 'WURSA') -Raw
+        $text | Should -Match "\`$IPU_IAPublisher = 'Microsoft Corporation'"
     }
 }

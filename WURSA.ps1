@@ -419,7 +419,7 @@ function Invoke-WursaWindowsUpdatePass {
 #endregion
 
 #region Third-party software updates
-$script:WursaChocoPublisher = '^CN=Chocolatey Software(,|$)'
+$script:WursaChocoPublisher = 'Chocolatey Software, Inc'
 function Get-WursaThirdPartyCatalog {
     # Install detection uses Chocolatey's own local package DB rather than probing
     # filesystem paths. Id is the bare package id. Args are extra choco arguments, one
@@ -478,7 +478,7 @@ function Install-WursaChocolatey {
         # Extract using pure .NET - bypasses Microsoft.PowerShell.Archive entirely
         Expand-WursaZip -ZipPath $ZipPath -Destination $ExtractPath
         $exe = Get-ChildItem -LiteralPath $ExtractPath -Recurse -Filter 'choco.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $exe -or -not (Test-WursaSignedBinary -Path $exe.FullName -PublisherPattern $script:WursaChocoPublisher)) {
+        if (-not $exe -or -not (Test-WursaSignedBinary -Path $exe.FullName -Organization $script:WursaChocoPublisher)) {
             Write-Host "      [!] The downloaded Chocolatey package is not signed by Chocolatey Software - not running its installer." -ForegroundColor Red
             return $false
         }
@@ -1110,13 +1110,41 @@ function Test-WursaSignedBinary {
     # True only for an existing file with a valid Authenticode signature from the expected publisher.
     # A pinned SHA-256 is optional, but when given it must match as well. This function is embedded
     # in the generated SYSTEM runner, so keep it self-contained and ASCII.
-    param([string]$Path, [string]$PublisherPattern, [string]$Sha256)
+    param([string]$Path, [string]$Organization, [string]$Sha256)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     try {
         $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
         if ([string]$sig.Status -ne 'Valid') { return $false }
         if (-not $sig.SignerCertificate) { return $false }
-        if ($sig.SignerCertificate.Subject -notmatch $PublisherPattern) { return $false }
+        # Match the O= (organization) field exactly. The value can be quoted and contain commas, e.g.
+        # O="Chocolatey Software, Inc", so the subject is parsed rather than pattern matched.
+        $subj = [string]$sig.SignerCertificate.Subject
+        $org = $null
+        $i = 0
+        while ($i -lt $subj.Length -and $null -eq $org) {
+            $eq = $subj.IndexOf('=', $i)
+            if ($eq -lt 0) { break }
+            $key = $subj.Substring($i, $eq - $i).Trim()
+            $i = $eq + 1
+            $val = New-Object System.Text.StringBuilder
+            if ($i -lt $subj.Length -and $subj[$i] -eq '"') {
+                $i++
+                while ($i -lt $subj.Length) {
+                    if ($subj[$i] -eq '"') {
+                        if (($i + 1) -lt $subj.Length -and $subj[$i + 1] -eq '"') { [void]$val.Append('"'); $i += 2; continue }
+                        $i++
+                        break
+                    }
+                    [void]$val.Append($subj[$i]); $i++
+                }
+                while ($i -lt $subj.Length -and $subj[$i] -ne ',') { $i++ }
+            } else {
+                while ($i -lt $subj.Length -and $subj[$i] -ne ',') { [void]$val.Append($subj[$i]); $i++ }
+            }
+            $i++
+            if ($key -eq 'O') { $org = $val.ToString().Trim() }
+        }
+        if ($null -eq $org -or $org -ne $Organization) { return $false }
         if ($Sha256) {
             if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Sha256) { return $false }
         }
@@ -1190,7 +1218,7 @@ function Invoke-IPUInstallationAssistant {
         }
     }
     # Verify every copy, downloaded now or already present, before it runs as SYSTEM.
-    if (-not (Test-WursaSignedBinary -Path $IPU_IAExe -PublisherPattern $IPU_IAPublisher -Sha256 $IPU_IASha256)) {
+    if (-not (Test-WursaSignedBinary -Path $IPU_IAExe -Organization $IPU_IAPublisher -Sha256 $IPU_IASha256)) {
         Write-Output "Installation Assistant failed verification (valid Microsoft signature and any pinned digest required); not launching it."
         Remove-Item $IPU_IAExe -Force -ErrorAction SilentlyContinue
         Set-Status "FAILED IA_SIGNATURE $iaStamp"
@@ -1853,7 +1881,7 @@ $IPU_EkbMinUBR    = 9278
 $IPU_IAUrl      = "https://iso.killertools.net/Windows11InstallationAssistant.exe"
 $IPU_IASha256   = ""
 # Whatever the source, the Assistant only runs as SYSTEM when it carries a valid Microsoft signature.
-$IPU_IAPublisher = '^CN=Microsoft Corporation(,|$)'
+$IPU_IAPublisher = 'Microsoft Corporation'
 
 
 Write-HLine -Style dashed
