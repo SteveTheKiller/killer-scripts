@@ -322,3 +322,245 @@ Describe 'Finding 68: Unresolved is reported apart from Orphaned' {
         Should -Invoke Remove-CimInstance -Times 0 -Exactly
     }
 }
+
+Describe 'Finding 23: removal rechecks the live record and surfaces partial results' {
+    BeforeAll {
+        function New-Selected {
+            param([string]$Sid = 'S-1-5-21-1-2-3-1002', [string]$Path = 'C:\Users\bob', [string]$Name = 'bob', [bool]$FolderExists = $true)
+            [pscustomobject]@{ SID = $Sid; LocalPath = $Path; DisplayName = "$env:COMPUTERNAME\$Name"; AccountName = "$env:COMPUTERNAME\$Name"; FolderExists = $FolderExists; Loaded = $false }
+        }
+    }
+
+    BeforeEach {
+        $script:Fresh = New-FakeProfile -Sid 'S-1-5-21-1-2-3-1002' -Path 'C:\Users\bob'
+        $script:AllRecords = @()
+        $script:Unloads = 0
+        $script:ReloadedAfterUnload = $false
+        $script:Active = 'someoneelse'
+        $script:Removed = New-Object System.Collections.ArrayList
+        $script:Deleted = New-Object System.Collections.ArrayList
+
+        Mock Get-CimInstance {
+            if ($ClassName -eq 'Win32_UserProfile') {
+                if ($Filter -match "SID='([^']+)'") { if ($script:Fresh -and $script:Fresh.SID -eq $Matches[1]) { return $script:Fresh } else { return $null } }
+                return @($script:AllRecords)
+            }
+        }
+        Mock Remove-CimInstance { [void]$script:Removed.Add($InputObject.SID) } -RemoveParameterType InputObject
+        Mock Remove-Item { [void]$script:Deleted.Add([string]$LiteralPath) } -ParameterFilter { $LiteralPath -like 'C:\Users\*' }
+        Mock Test-Path { $true }
+        Mock Get-PruneProfilesRoot { 'C:\Users' }
+        Mock Test-PruneReparsePoint { $false }
+        Mock Start-Sleep { }
+        Mock Get-ActiveUser { $script:Active }
+        Mock Invoke-PruneRegUnload { $script:Unloads++; if (-not $script:ReloadedAfterUnload) { $script:Fresh.Loaded = $false } }
+    }
+
+    It 'removes a profile that is still eligible' {
+        $r = Remove-PruneProfile -Profile (New-Selected)
+        $r.Removed | Should -BeTrue
+        $script:Removed | Should -Contain 'S-1-5-21-1-2-3-1002'
+    }
+
+    It 'refuses a profile that became loaded after it was selected' {
+        $script:Fresh.Loaded = $true
+        $r = Remove-PruneProfile -Profile (New-Selected)
+        $r.Removed | Should -BeFalse
+        $r.Message | Should -Match 'loaded'
+        Should -Invoke Remove-CimInstance -Times 0 -Exactly
+        Should -Invoke Invoke-PruneRegUnload -Times 0 -Exactly
+    }
+
+    It 'refuses a record that is now a special profile' {
+        $script:Fresh.Special = $true
+        $r = Remove-PruneProfile -Profile (New-Selected)
+        $r.Removed | Should -BeFalse
+        $r.Message | Should -Match 'special'
+        Should -Invoke Remove-CimInstance -Times 0 -Exactly
+    }
+
+    It 'refuses when the SID now points at a different profile path' {
+        $script:Fresh.LocalPath = 'C:\Users\someoneelse'
+        $r = Remove-PruneProfile -Profile (New-Selected)
+        $r.Removed | Should -BeFalse
+        $r.Message | Should -Match 'changed'
+        Should -Invoke Remove-CimInstance -Times 0 -Exactly
+    }
+
+    It 'reports a failed removal instead of counting it' {
+        Mock Remove-CimInstance { throw 'Access is denied' } -RemoveParameterType InputObject
+        $r = Remove-PruneProfile -Profile (New-Selected)
+        $r.Removed | Should -BeFalse
+        $r.Message | Should -Match 'Access is denied'
+    }
+
+    It 'does not treat a failed profile lookup as the record being gone' {
+        Mock Get-CimInstance { throw 'WMI repository is unavailable' }
+        $r = Remove-PruneProfile -Profile (New-Selected)
+        $r.Removed | Should -BeFalse
+        Should -Invoke Remove-Item -Times 0 -Exactly
+    }
+
+    It 'rejects a SID that is not a SID before it reaches a CIM filter' {
+        $r = Remove-PruneProfile -Profile (New-Selected -Sid "S-1-5-21-1' OR SID LIKE '%")
+        $r.Removed | Should -BeFalse
+        Should -Invoke Get-CimInstance -Times 0 -Exactly
+    }
+
+    Context 'when the profile record has disappeared' {
+        BeforeEach { $script:Fresh = $null }
+
+        It 'removes the leftover folder by literal path when it is a plain child of the profiles root' {
+            $r = Remove-PruneProfile -Profile (New-Selected -Path 'C:\Users\bob')
+            $r.Removed | Should -BeTrue
+            @($script:Deleted) | Should -Be @('C:\Users\bob')
+        }
+
+        It 'never deletes a wildcard path' {
+            $r = Remove-PruneProfile -Profile (New-Selected -Path 'C:\Users\*')
+            $r.Removed | Should -BeFalse
+            $script:Deleted.Count | Should -Be 0
+        }
+
+        It 'never deletes outside the profiles root' {
+            $r = Remove-PruneProfile -Profile (New-Selected -Path 'C:\Windows\System32')
+            $r.Removed | Should -BeFalse
+            $script:Deleted.Count | Should -Be 0
+        }
+
+        It 'never deletes the profiles root itself' {
+            $r = Remove-PruneProfile -Profile (New-Selected -Path 'C:\Users')
+            $r.Removed | Should -BeFalse
+            $script:Deleted.Count | Should -Be 0
+        }
+
+        It 'never deletes a folder another profile record still owns' {
+            $script:AllRecords = @((New-FakeProfile -Sid 'S-1-5-21-1-2-3-1099' -Path 'C:\Users\bob'))
+            $r = Remove-PruneProfile -Profile (New-Selected -Path 'C:\Users\bob')
+            $r.Removed | Should -BeFalse
+            $script:Deleted.Count | Should -Be 0
+        }
+
+        It 'never deletes through a junction or symlink' {
+            Mock Test-PruneReparsePoint { $true }
+            $r = Remove-PruneProfile -Profile (New-Selected -Path 'C:\Users\bob')
+            $r.Removed | Should -BeFalse
+            $script:Deleted.Count | Should -Be 0
+        }
+
+        It 'reports success without deleting when the folder is gone too' {
+            Mock Test-Path { $false }
+            $r = Remove-PruneProfile -Profile (New-Selected -Path 'C:\Users\bob')
+            $r.Removed | Should -BeTrue
+            $script:Deleted.Count | Should -Be 0
+        }
+    }
+
+    Context 'when asked to release a held hive' {
+        BeforeEach { $script:Fresh.Loaded = $true }
+
+        It 'unloads a stale hive, rechecks, and removes the profile' {
+            $r = Remove-PruneProfile -Profile (New-Selected) -ReleaseHive
+            $script:Unloads | Should -Be 1
+            $r.Removed | Should -BeTrue
+            $script:Removed | Should -Contain 'S-1-5-21-1-2-3-1002'
+        }
+
+        It 'does not remove the profile when the hive is still held after the unload' {
+            Mock Invoke-PruneRegUnload { $script:Unloads++ }
+            $r = Remove-PruneProfile -Profile (New-Selected) -ReleaseHive
+            $r.Removed | Should -BeFalse
+            $r.Message | Should -Match 'held open'
+            Should -Invoke Remove-CimInstance -Times 0 -Exactly
+        }
+
+        It 'does not remove the profile when it is loaded again right after the unload' {
+            $script:ReloadedAfterUnload = $true
+            $r = Remove-PruneProfile -Profile (New-Selected) -ReleaseHive
+            $r.Removed | Should -BeFalse
+            Should -Invoke Remove-CimInstance -Times 0 -Exactly
+        }
+
+        It 'never unloads the hive of the signed-in user' {
+            $script:Active = 'bob'
+            $r = Remove-PruneProfile -Profile (New-Selected) -ReleaseHive
+            $r.Removed | Should -BeFalse
+            $r.Message | Should -Match 'signed-in'
+            $script:Unloads | Should -Be 0
+            Should -Invoke Remove-CimInstance -Times 0 -Exactly
+        }
+
+        It 'never unloads a special profile' {
+            $script:Fresh.Special = $true
+            $r = Remove-PruneProfile -Profile (New-Selected) -ReleaseHive
+            $r.Removed | Should -BeFalse
+            $script:Unloads | Should -Be 0
+        }
+    }
+}
+
+Describe 'Finding 23: a profile that becomes loaded after selection ends the run honestly' {
+    BeforeEach {
+        $script:Fake = [pscustomobject]@{
+            Profiles = @(
+                (New-FakeProfile -Sid 'S-1-5-21-1-2-3-1001' -Path 'C:\Users\alice'),
+                (New-FakeProfile -Sid 'S-1-5-21-1-2-3-1002' -Path 'C:\Users\bob' -DaysOld 500)
+            )
+            Gone = New-Object System.Collections.ArrayList
+        }
+        $script:Removed = New-Object System.Collections.ArrayList
+        $script:LoadsAfterScan = @()
+        $script:ScanDone = $false
+        $script:Selection = '1,2'
+
+        Mock Test-PruneElevated { $true }
+        Mock Clear-Host { }
+        Mock Get-PruneCursorTop { -1 }
+        Mock Set-PruneCursor { $false }
+        Mock Start-Sleep { }
+        Mock Get-ActiveUser { $null }
+        Mock Get-PruneProfilesRoot { 'C:\Users' }
+        Mock Test-PruneReparsePoint { $false }
+        Mock Test-Path { $false }
+        Mock Resolve-SIDToAccount { param($SID) switch ($SID) { 'S-1-5-21-1-2-3-1001' { "$env:COMPUTERNAME\alice" } 'S-1-5-21-1-2-3-1002' { "$env:COMPUTERNAME\bob" } } }
+        Mock Get-AccountStatus { 'Local' }
+        Mock Get-CimInstance {
+            if ($ClassName -eq 'Win32_UserProfile') {
+                $live = @($script:Fake.Profiles | Where-Object { $script:Fake.Gone -notcontains $_.SID })
+                if ($Filter -match "SID='([^']+)'") {
+                    $sid = $Matches[1]
+                    $hit = @($live | Where-Object { $_.SID -eq $sid })
+                    foreach ($h in $hit) { if ($script:LoadsAfterScan -contains $h.SID) { $h.Loaded = $true } }
+                    return $hit
+                }
+                return $live
+            }
+        }
+        Mock Remove-CimInstance { [void]$script:Removed.Add($InputObject.SID); [void]$script:Fake.Gone.Add($InputObject.SID) } -RemoveParameterType InputObject
+        Mock Read-PruneLine {
+            if ($Prompt -like '*Selection*') { return $script:Selection }
+            if ($Prompt -like '*Delete*') { return 'Y' }
+            if ($Prompt -like '*Confirm*') { return 'DELETE' }
+        }
+        Mock Read-PruneKey { $null }
+    }
+
+    It 'skips the profile that became loaded, removes the other, and exits 3' {
+        $script:LoadsAfterScan = @('S-1-5-21-1-2-3-1001')
+        $r = Get-Run
+        $r.Code | Should -Be 3
+        $script:Removed | Should -Not -Contain 'S-1-5-21-1-2-3-1001'
+        $script:Removed | Should -Contain 'S-1-5-21-1-2-3-1002'
+        $r.Text | Should -Match 'loaded'
+        $r.Text | Should -Match '\[WARN\] PRUNE partial'
+    }
+
+    It 'exits 1 and removes nothing when the only selected profile became loaded' {
+        $script:Selection = '1'
+        $script:LoadsAfterScan = @('S-1-5-21-1-2-3-1002')
+        $r = Get-Run
+        $r.Code | Should -Be 1
+        $script:Removed.Count | Should -Be 0
+        $r.Text | Should -Match '\[FAIL\] PRUNE failed'
+    }
+}

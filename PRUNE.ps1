@@ -240,32 +240,101 @@ function Get-StatusColor {
 
 #region [1] - PROFILE SCAN AND REMOVAL
 # ============================================================================
-function Get-PruneProfileRecord {
-    # Fresh Win32_UserProfile lookup by SID. Returns $null when the record is gone.
-    param([string]$SID, [switch]$Quiet)
-    Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$SID'" -ErrorAction SilentlyContinue
-}
-
 function Invoke-PruneRegUnload {
     param([string]$SID)
     & reg unload "HKU\$SID" 2>&1 | Out-Null
 }
 
-function Remove-PruneProfile {
-    # Removes one profile. Returns an object with Removed and Message.
-    param([Parameter(Mandatory)]$Profile)
+function Get-PruneProfilesRoot {
+    # The folder that holds user profiles, normally C:\Users.
     try {
-        $wmiProf = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$($Profile.SID)'" -ErrorAction Stop
-        if ($wmiProf) {
-            # Remove-CimInstance handles both registry cleanup and folder deletion
-            Remove-CimInstance -InputObject $wmiProf -ErrorAction Stop
-        } elseif ($Profile.FolderExists) {
-            # Fallback: WMI entry already gone, remove the folder manually
-            Remove-Item -Path $Profile.LocalPath -Recurse -Force -ErrorAction Stop
+        $v = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -Name ProfilesDirectory -ErrorAction Stop).ProfilesDirectory
+        if ($v) { return [Environment]::ExpandEnvironmentVariables($v) }
+    } catch { }
+    return (Join-Path $env:SystemDrive 'Users')
+}
+
+function Test-PruneReparsePoint {
+    # True when the path is a junction or symlink. Fails closed: an unreadable path counts as one.
+    param([string]$Path)
+    try { return [bool]((Get-Item -LiteralPath $Path -Force -ErrorAction Stop).Attributes -band [System.IO.FileAttributes]::ReparsePoint) } catch { return $true }
+}
+
+function Get-PruneProfileRecord {
+    # Fresh Win32_UserProfile lookup by SID. Returns $null only when the record is really gone. A failed
+    # lookup throws, so an error is never mistaken for a missing record.
+    param([string]$SID)
+    Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$SID'" -ErrorAction Stop
+}
+
+function Get-PruneIneligibleReason {
+    # Why a fresh profile record must not be removed, or $null when it is still eligible.
+    param($Fresh, $Profile)
+    if ($Fresh.Special) { return "profile is now a special system profile" }
+    if ($Fresh.LocalPath -and ([string]$Fresh.LocalPath -ine [string]$Profile.LocalPath)) {
+        return "profile path changed since it was selected ($($Fresh.LocalPath))"
+    }
+    if ($Fresh.Loaded) { return "profile is now loaded (active session or a held hive)" }
+    return $null
+}
+
+function Test-PruneActiveUser {
+    # True when the profile belongs to the user who is signed in at the console.
+    param($Profile)
+    $name = if ($Profile.AccountName -like "*\*") { ($Profile.AccountName -split "\\")[1] } else { $Profile.AccountName }
+    if (-not $name) { $name = [System.IO.Path]::GetFileName($Profile.LocalPath) }
+    $active = Get-ActiveUser
+    return [bool]($active -and ($active -ieq $name))
+}
+
+function Remove-PruneProfile {
+    # Removes one profile after a fresh recheck of its identity and eligibility. Returns an object with
+    # Removed and Message. With -ReleaseHive a loaded hive may be unloaded first, but never the hive
+    # of the signed-in user and never a special profile.
+    param([Parameter(Mandatory)]$Profile, [switch]$ReleaseHive)
+    $result = { param([bool]$Removed, [string]$Message) [pscustomobject]@{ Removed = $Removed; Message = $Message } }
+
+    if ([string]$Profile.SID -notmatch '^S-1-\d+(-\d+)+$') { return (& $result $false "not a valid SID: $($Profile.SID)") }
+
+    try {
+        $fresh = Get-PruneProfileRecord -SID $Profile.SID
+        if ($fresh) {
+            $why = Get-PruneIneligibleReason -Fresh $fresh -Profile $Profile
+            if ($why -and $fresh.Loaded -and -not $fresh.Special -and $ReleaseHive -and ([string]$fresh.LocalPath -ieq [string]$Profile.LocalPath)) {
+                if (Test-PruneActiveUser -Profile $Profile) { return (& $result $false "refused: this is the signed-in user's profile") }
+                Invoke-PruneRegUnload -SID $Profile.SID
+                Start-Sleep -Milliseconds 750
+                $fresh = Get-PruneProfileRecord -SID $Profile.SID
+                if ($fresh) {
+                    $why = Get-PruneIneligibleReason -Fresh $fresh -Profile $Profile
+                    if ($why -and $fresh.Loaded -and -not $fresh.Special) { $why = "profile hive is still held open - reboot and re-run PRUNE" }
+                } else { $why = $null }
+            }
+            if ($fresh) {
+                if ($why) { return (& $result $false "refused: $why") }
+                # Remove-CimInstance handles both registry cleanup and folder deletion
+                Remove-CimInstance -InputObject $fresh -ErrorAction Stop
+                return (& $result $true "removed")
+            }
         }
-        return [pscustomobject]@{ Removed = $true; Message = '' }
+
+        # The profile record is gone. Only a leftover folder may remain, and it is removed only when it is
+        # provably a plain profile folder that nothing else owns.
+        $path = [string]$Profile.LocalPath
+        if (-not (Test-Path -LiteralPath $path)) { return (& $result $true "profile entry and folder were already gone") }
+        if ([string]::IsNullOrWhiteSpace($path) -or $path -match '[*?\[\]]') { return (& $result $false "refused: unsafe folder path '$path'") }
+        $root = (Get-PruneProfilesRoot).TrimEnd('\')
+        $parent = Split-Path -Path $path -Parent -ErrorAction Stop
+        if (-not $parent -or $parent.TrimEnd('\') -ine $root -or (Split-Path -Path $path -Leaf) -in @('', '.', '..')) {
+            return (& $result $false "refused: '$path' is not a folder directly under $root")
+        }
+        if (Test-PruneReparsePoint -Path $path) { return (& $result $false "refused: '$path' is a junction or symlink") }
+        $owner = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object { [string]$_.LocalPath -ieq $path })
+        if ($owner.Count -gt 0) { return (& $result $false "refused: another profile record still owns '$path'") }
+        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+        return (& $result $true "leftover folder removed")
     } catch {
-        return [pscustomobject]@{ Removed = $false; Message = $_.Exception.Message }
+        return (& $result $false $_.Exception.Message)
     }
 }
 
@@ -441,33 +510,12 @@ function Invoke-PruneInvestigation {
 
     $profileRemoved = $false
     if ($tryRemoveKey -and $tryRemoveKey.Key -eq [ConsoleKey]::Y) {
-        $recheckProf = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$($Target.SID)'" -ErrorAction SilentlyContinue
-        if (-not $recheckProf) {
-            Write-Host "    Profile entry is already gone." -ForegroundColor $script:DimCol
+        $res = Remove-PruneProfile -Profile $Target -ReleaseHive
+        if ($res.Removed) {
+            Write-Host "    Profile removed successfully ($($res.Message))." -ForegroundColor $script:OkCol
             $profileRemoved = $true
-        } elseif ($recheckProf.Loaded) {
-            Invoke-PruneRegUnload -SID $Target.SID
-            Start-Sleep -Milliseconds 750
-            $recheckProf = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$($Target.SID)'" -ErrorAction SilentlyContinue
-            if ($recheckProf -and $recheckProf.Loaded) {
-                Write-Host "    Profile hive is still held open - reboot and re-run PRUNE." -ForegroundColor $script:WarnCol
-            } else {
-                try {
-                    if ($recheckProf) { Remove-CimInstance -InputObject $recheckProf -ErrorAction Stop }
-                    Write-Host "    Profile removed successfully." -ForegroundColor $script:OkCol
-                    $profileRemoved = $true
-                } catch {
-                    Write-Host "    Removal failed: $($_.Exception.Message)" -ForegroundColor "Red"
-                }
-            }
         } else {
-            try {
-                Remove-CimInstance -InputObject $recheckProf -ErrorAction Stop
-                Write-Host "    Profile removed successfully." -ForegroundColor $script:OkCol
-                $profileRemoved = $true
-            } catch {
-                Write-Host "    Removal failed: $($_.Exception.Message)" -ForegroundColor "Red"
-            }
+            Write-Host "    Profile was not removed: $($res.Message)" -ForegroundColor $script:WarnCol
         }
     }
     [pscustomobject]@{ Rescan = $true; Removed = $profileRemoved }
