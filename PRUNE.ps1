@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Profile Removal Utility for Neglected Entries (PRUNE) v1.0
-    Developed by SteveTheKiller | Updated: 2026-03-20
+    Profile Removal Utility for Neglected Entries (PRUNE) v2.0
+    Developed by SteveTheKiller | Updated: 2026-11-18
 .DESCRIPTION
     Scans local Windows user profiles and displays them sorted by last-used
     date, flagging stale, orphaned, and disabled accounts for safe removal.
@@ -44,7 +44,7 @@ function Exit-KillerScript {
 #region [0] - HELPERS & THEME
 # ============================================================================
 $script:Width   = 85
-$script:Version = "v1.0"
+$script:Version = "v2.0"
 
 $script:LineCol   = "DarkGreen"    # HLine dashes, section labels
 $script:MainCol   = "DarkRed"      # Titles, step text
