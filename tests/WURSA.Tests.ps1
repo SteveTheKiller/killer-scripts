@@ -920,6 +920,9 @@ Describe 'Dispatch gate (finding 32)' {
         Mock Get-WursaTaskState { $script:TaskState }
         Mock Get-WursaLastBoot { $script:Boot }
         Mock Get-WursaDirectoryProblem { $null }
+        $script:Now = [datetime]'2026-06-15 12:00:00'
+        Mock Get-WursaNow { $script:Now }
+        $script:Fresh = $script:Now.AddHours(-3).ToString('yyyy-MM-dd HH:mm:ss')
     }
 
     It 'sees a running task as active, whatever language the OS speaks' {
@@ -934,20 +937,20 @@ Describe 'Dispatch gate (finding 32)' {
     }
 
     It 'treats <Text> as active even though the task has finished (the runner is waiting on Windows Update or the verifier)' -ForEach @(
-        @{ Text = 'WU_HANDOFF 2026-01-01 00:00:00' }
-        @{ Text = 'VERIFY_PENDING VERSION_25H2 BUILD_26200.1 x' }
+        @{ Text = 'WU_HANDOFF {STAMP}' }
+        @{ Text = 'VERIFY_PENDING VERSION_25H2 BUILD_26200.1 {STAMP}' }
         @{ Text = 'RUNNING IA_INPROGRESS x' }
         @{ Text = 'DOWNLOADING 50 x' }
         @{ Text = 'REPAIRING x' }
     ) {
-        Set-Content -LiteralPath $script:StatusFile -Value $Text
+        Set-Content -LiteralPath $script:StatusFile -Value $Text.Replace('{STAMP}', $script:Fresh)
         $script:TaskState = 'Ready'
         $script:Boot = (Get-Date).AddMinutes(-30)
         (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeTrue
     }
 
-    It 'keeps a WU_HANDOFF or VERIFY_PENDING status active across a reboot' -ForEach @(@{ Text = 'WU_HANDOFF x' }, @{ Text = 'VERIFY_PENDING x' }) {
-        Set-Content -LiteralPath $script:StatusFile -Value $Text
+    It 'keeps a WU_HANDOFF or VERIFY_PENDING status active across a reboot' -ForEach @(@{ Text = 'WU_HANDOFF {STAMP}' }, @{ Text = 'VERIFY_PENDING x {STAMP}' }) {
+        Set-Content -LiteralPath $script:StatusFile -Value $Text.Replace('{STAMP}', $script:Fresh)
         $script:Boot = (Get-Date).AddMinutes(10)
         (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeTrue
     }
@@ -960,7 +963,7 @@ Describe 'Dispatch gate (finding 32)' {
 
     It 'does not adopt or undo the record while a WU_HANDOFF is current (unmocked active check)' {
         $script:Events = New-Object System.Collections.ArrayList; $script:WaitResult = $true; $script:WaitThrows = $false
-        Set-Content -LiteralPath $script:StatusFile -Value 'WU_HANDOFF x'
+        Set-Content -LiteralPath $script:StatusFile -Value "WU_HANDOFF $script:Fresh"
         $rec = Join-Path $script:Work 'au_restore.txt'
         Set-Content -LiteralPath $rec -Value @('NoAutoUpdate=1')
         Initialize-FakePolicyRegistry -Initial @{ "$script:Auk|NoAutoUpdate" = 0; "$script:Auk|AUOptions" = 4 }
@@ -977,8 +980,59 @@ Describe 'Dispatch gate (finding 32)' {
         [System.IO.File]::Exists($rec) | Should -BeTrue
     }
 
+    It 'reports STALE_HANDOFF and allows recovery for a handoff older than 14 days' {
+        $old = $script:Now.AddDays(-15).ToString('yyyy-MM-dd HH:mm:ss')
+        Set-Content -LiteralPath $script:StatusFile -Value "WU_HANDOFF $old"
+        $r = Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile
+        $r.Active | Should -BeFalse
+        $r.Stale | Should -BeTrue
+        $r.Reason | Should -BeLike 'STALE_HANDOFF*'
+    }
+
+    It 'keeps a 13-day-old handoff active and a fresh one not stale' {
+        $d13 = $script:Now.AddDays(-13).ToString('yyyy-MM-dd HH:mm:ss')
+        Set-Content -LiteralPath $script:StatusFile -Value "WU_HANDOFF $d13"
+        $r = Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile
+        $r.Active | Should -BeTrue
+        $r.Stale | Should -BeFalse
+    }
+
+    It 'expires a VERIFY_PENDING after 7 days' {
+        $old = $script:Now.AddDays(-8).ToString('yyyy-MM-dd HH:mm:ss')
+        Set-Content -LiteralPath $script:StatusFile -Value "VERIFY_PENDING VERSION_25H2 BUILD_26200.1 $old"
+        $r = Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile
+        $r.Active | Should -BeFalse
+        $r.Stale | Should -BeTrue
+    }
+
+    It 'treats a missing, unparseable or future stamp as expired' -ForEach @(@{ Text = 'WU_HANDOFF' }, @{ Text = 'WU_HANDOFF x' }, @{ Text = 'WU_HANDOFF 2026-13-45 99:99:99' }, @{ Text = 'WU_HANDOFF 2030-01-01 00:00:00' }) {
+        Set-Content -LiteralPath $script:StatusFile -Value $Text
+        $r = Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile
+        $r.Active | Should -BeFalse
+        $r.Stale | Should -BeTrue
+    }
+
+    It 'adopts and rolls back the policy record for an expired handoff (unmocked active check)' {
+        $old = $script:Now.AddDays(-15).ToString('yyyy-MM-dd HH:mm:ss')
+        Set-Content -LiteralPath $script:StatusFile -Value "WU_HANDOFF $old"
+        $rec = Join-Path $script:Work 'au_restore.txt'
+        Set-Content -LiteralPath $rec -Value @('NoAutoUpdate=1')
+        Initialize-FakePolicyRegistry -Initial @{ "$script:Auk|NoAutoUpdate" = 0; "$script:Auk|AUOptions" = 4 }
+        $script:Events = New-Object System.Collections.ArrayList; $script:WaitResult = $true; $script:WaitThrows = $false
+        Mock Write-Host { }
+        Mock Restart-Service { }
+        Mock New-WursaDispatchMutex { New-FakeMutexObject }
+        $IPU_AURestoreFile = $rec; $IPU_TaskName = 'T'; $IPU_WorkDir = $script:Work; $IPU_StatusFile = $script:StatusFile
+        $busy = Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile
+        $o = Open-WursaUpdatePolicy -RecordFile $rec -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting (-not $busy.Active)
+        $o.Owned | Should -BeTrue
+        $script:PolicyOwned = $o.Owned; $script:FeatureUpgradeState = 'NOT_STARTED'
+        Undo-WursaOwnedPolicy
+        $script:Reg["$script:Auk|NoAutoUpdate"] | Should -Be 1
+    }
+
     It 'ignores an active-looking status in a directory that is not protected' {
-        Set-Content -LiteralPath $script:StatusFile -Value 'WU_HANDOFF x'
+        Set-Content -LiteralPath $script:StatusFile -Value "WU_HANDOFF $script:Fresh"
         Mock Get-WursaDirectoryProblem { 'acl: Users can write' }
         (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeFalse
     }
