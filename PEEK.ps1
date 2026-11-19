@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Patch & Event Examination Kit (P.E.E.K.) v1.0
-    Created by Steve the Killer | Updated: 2026-08-27   
+    Patch & Event Examination Kit (P.E.E.K.) v2.0
+    Created by Steve the Killer | Updated: 2026-11-19
 .DESCRIPTION
     Read-only live Windows Update and Windows Setup servicing monitor for
     remote support. Correlates WindowsUpdateClient events, servicing processes,
@@ -13,6 +13,7 @@
     Safe for Kaseya LiveConnect and SYSTEM execution.
     Makes no registry changes, starts no updates, opens no UI, and never reboots.
     Press Q or ESC to exit cleanly. Ctrl+C also stops the monitor.
+    Exit codes: 0 finished, 1 stopped on an error, 2 not elevated.
 #>
 
 param(
@@ -48,7 +49,7 @@ function Test-PEEKElevated {
 $script:Acronym    = "PEEK"
 $script:AcronymFmt = "P.E.E.K."
 $script:ScriptName = "Patch & Event Examination Kit"
-$script:Version    = "v1.0"
+$script:Version    = "v2.0"
 
 $LineCol   = "Blue"
 $MainCol   = "Magenta"
