@@ -510,7 +510,8 @@ function Invoke-DebloatMain {
     Set-ItemProperty -Path $chatPolicyPath -Name "ChatIcon" -Value 3
     $feedsPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds"
     if (!(Test-Path $feedsPath)) { New-Item -Path $feedsPath -Force | Out-Null }
-    Set-ItemProperty -Path $feedsPath -Name "EnableFeeds" -Value 0
+    # Windows 11 blocks scripted writes to this policy value, even as SYSTEM, so don't dump an exception.
+    Set-ItemProperty -Path $feedsPath -Name "EnableFeeds" -Value 0 -ErrorAction SilentlyContinue
     # Start menu recommendations (HKLM policy)
     $startPolPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
     if (!(Test-Path $startPolPath)) { New-Item -Path $startPolPath -Force | Out-Null }

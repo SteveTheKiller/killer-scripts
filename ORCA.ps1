@@ -708,7 +708,9 @@ function Invoke-OrcaMain {
             if (-not (Test-OrcaWingetPresent)) {
                 if (-not (Get-Module -ListAvailable Microsoft.WinGet.Client)) {
                     Install-PackageProvider -Name NuGet -Force | Out-Null
-                    Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser -AllowClobber | Out-Null
+                    # SYSTEM's CurrentUser module folder isn't on PSModulePath, so install for all users when elevated.
+                    $wgScope = if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { "AllUsers" } else { "CurrentUser" }
+                    Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope $wgScope -AllowClobber | Out-Null
                 }
                 Import-Module Microsoft.WinGet.Client
                 Start-Process powershell.exe -ArgumentList "-NoProfile -Command `"Import-Module Microsoft.WinGet.Client; Repair-WinGetPackageManager -Latest`"" -WindowStyle Hidden -Wait
