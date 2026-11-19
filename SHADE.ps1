@@ -22,6 +22,26 @@ function Test-IsAdmin {
     ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 }
 
+function Test-IsSystem {
+    [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+}
+
+function Get-LoadedUserSids {
+    # SIDs of real user accounts whose registry hive is loaded, meaning they are signed in.
+    Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21-\d+-\d+-\d+-\d+$' } |
+        ForEach-Object { $_.PSChildName }
+}
+
+function Get-UserHiveRoots {
+    # Where per-user (HKCU) settings must be written. As SYSTEM, HKCU is the SYSTEM profile, which
+    # nobody uses, so each signed-in user's loaded hive is targeted instead.
+    if (Test-IsSystem) {
+        return @(Get-LoadedUserSids | ForEach-Object { "Registry::HKEY_USERS\$_" })
+    }
+    return @("HKCU:")
+}
+
 # Helper to handle WMI/CIM switching
 function Get-SystemData {
     param([string]$Class)
@@ -129,19 +149,41 @@ function Write-HLine {
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+function Add-ShadeFailure {
+    param([string]$What)
+    [void]$script:ShadeFailures.Add($What)
+}
+
 function Set-RegKeys {
+    # Writes each value. HKCU paths follow Get-UserHiveRoots, so SYSTEM or RMM runs reach the
+    # signed-in users instead of the SYSTEM profile. Failures and skips are counted, never hidden.
     param([array]$Keys)
     foreach ($K in $Keys) {
-        try {
-            if (-not (Test-Path $K.Path)) { New-Item -Path $K.Path -Force | Out-Null }
-            Set-ItemProperty -Path $K.Path -Name $K.Name -Value $K.Value -Type DWord -Force -ErrorAction Stop | Out-Null
-        } catch { }
+        $paths = @()
+        if ($K.Path -like 'HKCU:*') {
+            $roots = @(Get-UserHiveRoots)
+            if ($roots.Count -eq 0) { $script:ShadeSkipped++; continue }
+            foreach ($r in $roots) { $paths += ($r + $K.Path.Substring(5)) }
+        } else {
+            $paths = @($K.Path)
+        }
+        $type = if ($K.Type) { $K.Type } else { 'DWord' }
+        foreach ($p in $paths) {
+            try {
+                if (-not (Test-Path $p)) { New-Item -Path $p -Force -ErrorAction Stop | Out-Null }
+                Set-ItemProperty -Path $p -Name $K.Name -Value $K.Value -Type $type -Force -ErrorAction Stop | Out-Null
+                $script:ShadeApplied++
+            } catch {
+                Add-ShadeFailure ("{0} : {1} ({2})" -f $p, $K.Name, $_.Exception.Message)
+            }
+        }
     }
 }
 
 function Invoke-ScDisable {
     param([string]$Name)
     & sc.exe config $Name start= disabled 2>$null | Out-Null
+    return $LASTEXITCODE
 }
 
 function Disable-Svc {
@@ -149,12 +191,22 @@ function Disable-Svc {
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if ($svc) {
         Stop-Service  -Name $Name -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-        Set-Service   -Name $Name -StartupType Disabled -ErrorAction SilentlyContinue
-        Invoke-ScDisable $Name
+        $ok = $true
+        $err = ''
+        try { Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop } catch { $ok = $false; $err = $_.Exception.Message }
+        $rc = [int](Invoke-ScDisable $Name)
+        if (-not $ok -and $rc -ne 0) {
+            Add-ShadeFailure ("service {0} could not be disabled ({1}; sc.exe exit {2})" -f $Name, $err, $rc)
+        } else {
+            $script:ShadeApplied++
+        }
     }
 }
 
 function Invoke-ShadeMain {
+    $script:ShadeFailures = New-Object System.Collections.ArrayList
+    $script:ShadeApplied  = 0
+    $script:ShadeSkipped  = 0
 #region Pre-Flight Checks
 # ============================================================================
     # Force UTF-8 output so box-drawing characters render correctly
@@ -288,15 +340,12 @@ function Invoke-ShadeMain {
     Write-StepUpdate "[04/08] Denying Camera & Microphone Access..."
 
     # ConsentStore uses string "Deny" not DWORD
-    foreach ($p in @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam",
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam",
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone",
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
-    )) {
-        if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
-        Set-ItemProperty -Path $p -Name "Value" -Value "Deny" -Force -ErrorAction SilentlyContinue
-    }
+    Set-RegKeys @(
+        @{Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";     Name="Value"; Value="Deny"; Type="String"},
+        @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";     Name="Value"; Value="Deny"; Type="String"},
+        @{Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"; Name="Value"; Value="Deny"; Type="String"},
+        @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"; Name="Value"; Value="Deny"; Type="String"}
+    )
 
     Set-RegKeys @(
         # Policy values: 0 = user in control (apps may prompt, so Teams and Zoom work), 1 = force allow, 2 = force deny.
@@ -408,6 +457,28 @@ function Invoke-ShadeMain {
     Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr3 -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
     #endregion
+
+    # Effective outcome. The final line always agrees with the exit code.
+    if (Test-IsSystem) {
+        $sids = @(Get-LoadedUserSids)
+        Write-Output ("Per-user settings   : running as SYSTEM, applied to {0} signed-in user(s)" -f $sids.Count)
+        if ($sids.Count -eq 0) {
+            Write-Output "                      No signed-in user found. Per-user values were skipped and do not apply to anyone."
+        } else {
+            Write-Output "                      Users who sign in later do not get the per-user values until SHADE is run again."
+        }
+    } else {
+        Write-Output ("Per-user settings   : applied to the executing user ({0})" -f [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    }
+    Write-Output ("Values applied      : {0}" -f $script:ShadeApplied)
+    if ($script:ShadeSkipped -gt 0) { Write-Output ("Values skipped      : {0} per-user value(s), no signed-in user to apply them to" -f $script:ShadeSkipped) }
+    foreach ($f in $script:ShadeFailures) { Write-Output ("[FAILED] {0}" -f $f) }
+
+    if ($script:ShadeFailures.Count -gt 0 -or $script:ShadeSkipped -gt 0) {
+        Write-Output ("[WARN] SHADE partial: {0} failed, {1} skipped, {2} applied (exit 3)" -f $script:ShadeFailures.Count, $script:ShadeSkipped, $script:ShadeApplied)
+        Exit-KillerScript 3
+    }
+    Write-Output ("[PASS] SHADE complete: {0} values applied. Reboot recommended (exit 0)" -f $script:ShadeApplied)
     Exit-KillerScript 0
 }
 
