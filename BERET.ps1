@@ -4,7 +4,7 @@
     Developed by SteveTheKiller | Updated: 2026-03-12
 .DESCRIPTION
     Interactive BitLocker lifecycle manager that prompts to choose
-    between FIPS (AES-256) and Standard (AES-128) mode. Initializes
+    between FIPS (XTS-AES-256) and Standard (XTS-AES-128) mode. Initializes
     TPM, enforces compliance-gated encryption, generates recovery keys,
     and escrows them to AD, Entra ID, or MSA depending on join state.
 #>
@@ -189,8 +189,30 @@ function Read-BeretFipsChoice {
     }
 }
 
+function Get-BeretNativePath {
+    # A 32-bit host on 64-bit Windows sees System32 redirected to SysWOW64, which has no
+    # manage-bde or dsregcmd. Sysnative reaches the real 64-bit folder.
+    param([string]$Name)
+    $dir = 'System32'
+    if ([IntPtr]::Size -eq 4 -and $env:PROCESSOR_ARCHITEW6432) { $dir = 'Sysnative' }
+    Join-Path (Join-Path $env:windir $dir) $Name
+}
+
 function Get-BeretDsreg {
-    dsregcmd /status | Out-String
+    $ErrorActionPreference = 'Continue'
+    & (Get-BeretNativePath 'dsregcmd.exe') /status 2>&1 | Out-String
+}
+
+function Invoke-BeretManageBde {
+    # The only place manage-bde runs. Returns the exit code and the text, so callers can check both.
+    param([string[]]$Arguments)
+    $ErrorActionPreference = 'Continue'
+    $text = & (Get-BeretNativePath 'manage-bde.exe') @Arguments 2>&1 | Out-String
+    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $text }
+}
+
+function Get-BeretNow {
+    Get-Date
 }
 
 function Test-BeretElevated {
@@ -222,17 +244,19 @@ function Invoke-BeretMain {
     }
     if ($null -eq $BeretModeChoice) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-BeretRun 0 "cancelled by the operator. Nothing was changed." }
     if ($BeretModeChoice -eq 'FIPS') {
-        $EncryptionMethod = "Aes256"
+        $EncryptionMethod = "XtsAes256"
+        $BdeMethod = "xts_aes256"
         $ModeLabel = "FIPS"
         $EnforceFipsReg = $true
         Write-Host ("`r" + (" " * $script:Width) + "`r") -NoNewline
-        Write-Host "MODE: " -ForegroundColor $InfoCol -NoNewline; Write-Host "FIPS COMPLIANCE (AES-256)" -ForegroundColor $MainTextCol
+        Write-Host "MODE: " -ForegroundColor $InfoCol -NoNewline; Write-Host "FIPS COMPLIANCE (XTS-AES-256)" -ForegroundColor $MainTextCol
     } else {
-        $EncryptionMethod = "Aes128"
+        $EncryptionMethod = "XtsAes128"
+        $BdeMethod = "xts_aes128"
         $ModeLabel = "STANDARD"
         $EnforceFipsReg = $false
         Write-Host ("`r" + (" " * $script:Width) + "`r") -NoNewline
-        Write-Host "MODE: " -ForegroundColor $InfoCol -NoNewline; Write-Host "STANDARD EDITION (AES-128)" -ForegroundColor $MainTextCol
+        Write-Host "MODE: " -ForegroundColor $InfoCol -NoNewline; Write-Host "STANDARD EDITION (XTS-AES-128)" -ForegroundColor $MainTextCol
     }
     # --- OS Edition Gatekeeper ---
     $OSCaption = (Get-CimInstance Win32_OperatingSystem).Caption
@@ -301,7 +325,7 @@ function Invoke-BeretMain {
     Write-Host $_blMsg -ForegroundColor $InfoCol -NoNewline
     $BLV = Get-BitLockerVolume -MountPoint $DriveLetter -ErrorAction Stop
     $RecoveryProtector = $BLV.KeyProtector | Where-Object {$_.KeyProtectorType -eq 'RecoveryPassword'}
-    $IsCompliant = ($BLV.EncryptionMethod -match $EncryptionMethod)
+    $IsCompliant = ([string]$BLV.EncryptionMethod -eq $EncryptionMethod)
     $NeedsDecryption = $false
     $ExplicitKeyID = $null
     if ($BLV.VolumeStatus -ne 'FullyDecrypted') {
@@ -364,6 +388,7 @@ function Invoke-BeretMain {
     # =================================================================================
     if (-not $ExplicitKeyID) {
         Write-Host "Enabling BitLocker ($EncryptionMethod)..." -ForegroundColor $InfoCol -NoNewline
+        $enableError = $null
         try {
             $BLV_Check = Get-BitLockerVolume -MountPoint $DriveLetter
             if (-not ($BLV_Check.KeyProtector | Where-Object {$_.KeyProtectorType -eq 'Tpm'})) {
@@ -378,17 +403,27 @@ function Invoke-BeretMain {
             Show-RecoveryInfo -Drive $DriveLetter -KeyID $ExplicitKeyID -RecoveryKey $RecoveryKey -RealName $DeviceName
             $SysInfo = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
             $IsVM = $SysInfo.Model -match "Virtual|QEMU|VMware"
+            $bdeBase = @('-on', $DriveLetter, '-EncryptionMethod', $BdeMethod)
+            $bdeSkip = @('-SkipHardwareTest')
             if ($IsVM) {
-                manage-bde -on $DriveLetter -EncryptionMethod $EncryptionMethod -UsedSpaceOnly:0 -SkipHardwareTest | Out-Null
+                # Full-volume encryption is manage-bde's default, so the used-space switch is simply left out.
+                $Result = Invoke-BeretManageBde -Arguments ($bdeBase + $bdeSkip)
             } else {
-                $Result = manage-bde -on $DriveLetter -EncryptionMethod $EncryptionMethod -UsedSpaceOnly -SkipHardwareTest 2>&1
-                if ($Result -match "0x803100a5") {
-                    manage-bde -on $DriveLetter -EncryptionMethod $EncryptionMethod -UsedSpaceOnly:0 -SkipHardwareTest | Out-Null
+                $Result = Invoke-BeretManageBde -Arguments ($bdeBase + @('-UsedSpaceOnly') + $bdeSkip)
+                if ($Result.ExitCode -ne 0 -and $Result.Output -match "0x803100a5") {
+                    $Result = Invoke-BeretManageBde -Arguments ($bdeBase + $bdeSkip)
                 }
+            }
+            if ($Result.ExitCode -ne 0) {
+                $enableError = "manage-bde -on exited $($Result.ExitCode): $(($Result.Output -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1))"
             }
         }
         catch {
-            Write-Error "Failed to enable: $($_.Exception.Message)"
+            $enableError = $_.Exception.Message
+        }
+        if ($enableError) {
+            Write-Host "[FAILED] $enableError" -ForegroundColor $BorderCol
+            Exit-BeretRun 1 "BitLocker was not enabled ($enableError)."
         }
     }
     #endregion
