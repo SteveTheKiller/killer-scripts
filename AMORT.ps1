@@ -30,29 +30,45 @@ param(
     [ValidateRange(1, 365)][int]$RetainDays = 14,
     [ValidateRange(1, 64)][int]$KeepRestorePoints = 2
 )
-$TempAgeDays = 2
-$_fver   = "| v17.0"
-#region Pre-Flight Checks
-# ============================================================================
-# Force UTF-8 output so box-drawing characters render correctly
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding            = [System.Text.Encoding]::UTF8
 
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Warning "Elevation Required: Please run as Administrator."
-    Exit
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
 }
-# Detect active Windows servicing - do NOT kill it.
-# Force-killing TiWorker/DISM mid-servicing corrupts the component store, which
-# the repair region would then have to fix. Instead we detect and skip repair.
-$ServicingActive = $null -ne (Get-Process -Name "TiWorker", "DISM" -ErrorAction SilentlyContinue)
-if ($ServicingActive) {
-    Write-Host "[Pre-Flight] Windows servicing active (TiWorker/DISM running). Repair steps will be skipped." -ForegroundColor Yellow
-}
-# A pending reboot means SoftwareDistribution and upgrade staging are still in use.
-$PendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
 
-# Helper to handle WMI/CIM switching
+# Console and system boundaries. Each one is a small function so a missing console (RMM, SYSTEM,
+# redirected output) never throws and a test can replace it.
+function Test-AmortElevated {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+}
+function Test-AmortConsole {
+    try { $null = [Console]::CursorTop; return $true } catch { return $false }
+}
+function Get-AmortCursorTop {
+    try { return [int][Console]::CursorTop } catch { return -1 }
+}
+function Get-AmortCursorLeft {
+    try { return [int][Console]::CursorLeft } catch { return 0 }
+}
+function Set-AmortCursor {
+    param([int]$Left, [int]$Top)
+    try { if ($Top -ge 0) { [Console]::SetCursorPosition($Left, $Top) } } catch { }
+}
+function New-AmortTempFile {
+    [System.IO.Path]::GetTempFileName()
+}
+function Start-AmortProcess {
+    param([System.Diagnostics.ProcessStartInfo]$StartInfo)
+    [System.Diagnostics.Process]::Start($StartInfo)
+}
+# Runs a native tool and returns its exit code and output, so callers can check the result.
+function Invoke-AmortTool {
+    param([string]$FilePath, [string[]]$ArgumentList = @())
+    $out = & $FilePath @ArgumentList 2>&1
+    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = (@($out) -join [Environment]::NewLine) }
+}
+
 function Get-SystemData {
     param([string]$Class)
     if ($PSVersionTable.PSVersion.Major -ge 6) {
@@ -66,11 +82,12 @@ function Get-SystemData {
 # Standardized Console Output
 $script:StepRow = 0
 $script:LastStepMessage = ""
+$script:Width = 90
 
 function Write-StepUpdate {
     param([string]$Message, [switch]$Success, [switch]$Reprint, [string]$CustomInfo)
     $isDone = $Success -or ($CustomInfo -eq "[SKIPPED]")
-    
+
     # Store the header message
     if ($Message -match '^\[[\d.]+/') { $script:LastStepMessage = $Message }
     $printMsg = if ($Message) { $Message } else { $script:LastStepMessage }
@@ -88,19 +105,25 @@ function Write-StepUpdate {
 
     if ($Message -and -not $isDone) {
         # STARTING A STEP: Save the current cursor row so we can return to it later
-        $script:StepRow = [Console]::CursorTop
+        $script:StepRow = Get-AmortCursorTop
         & $writeMsg $printMsg $false
         Write-Host "" # Move cursor to next line so WARNINGS have a place to go
-    } 
+    }
     elseif ($isDone) {
+        if (-not (Test-AmortConsole)) {
+            # No console (RMM pane, SYSTEM, redirected output): one plain line per result.
+            $tag = if ($Success) { if ($script:DryRun) { "[EST]" } else { "[SUCCESS]" } } else { "" }
+            Write-Host ("        " + (@($CustomInfo, $tag) | Where-Object { $_ }) -join " ")
+            return
+        }
         # COMPLETING A STEP: Jump back to the saved row to overwrite the Cyan text
-        $currentPos = [Console]::CursorTop
-        [Console]::SetCursorPosition(0, $script:StepRow)
-        
+        $currentPos = Get-AmortCursorTop
+        Set-AmortCursor 0 $script:StepRow
+
         # Clear the original Cyan line
         Write-Host (" " * $script:Width) -NoNewline
-        [Console]::SetCursorPosition(0, $script:StepRow)
-        
+        Set-AmortCursor 0 $script:StepRow
+
         # Reprint the line in the "Done" (Gray/White) style
         & $writeMsg $printMsg $true
 
@@ -108,14 +131,14 @@ function Write-StepUpdate {
         if ($CustomInfo) {
             if ($CustomInfo -eq "[SKIPPED]") {
                 $tag = "[SKIPPED]"
-                $currentCol = [Console]::CursorLeft
+                $currentCol = Get-AmortCursorLeft
                 $targetCol  = $script:Width - $tag.Length
                 if ($targetCol -gt $currentCol) { Write-Host (" " * ($targetCol - $currentCol)) -NoNewline }
                 Write-Host $tag -ForegroundColor Yellow
             } else {
                 # Right-align the info so it ends one space left of the 9-character status tag column
                 $infoCol = if ($CustomInfo -in @("Saved: 0 MB", "Est: 0 MB")) { "Gray" } elseif ($CustomInfo.StartsWith("Saved:")) { "Red" } elseif ($CustomInfo.StartsWith("Est:")) { "Magenta" } else { "Gray" }
-                $currentCol = [Console]::CursorLeft
+                $currentCol = Get-AmortCursorLeft
                 $targetCol  = $script:Width - 10 - $CustomInfo.Length
                 $pad = [Math]::Max(1, $targetCol - $currentCol)
                 Write-Host ((" " * $pad) + $CustomInfo) -NoNewline -ForegroundColor $infoCol
@@ -125,7 +148,7 @@ function Write-StepUpdate {
         # Final Success Tag (right-aligned to console width)
         if ($Success) {
             $tag = if ($script:DryRun) { "[EST]" } else { "[SUCCESS]" }
-            $currentCol = [Console]::CursorLeft
+            $currentCol = Get-AmortCursorLeft
             $targetCol  = $script:Width - $tag.Length
             if ($targetCol -gt $currentCol) { Write-Host (" " * ($targetCol - $currentCol)) -NoNewline }
             Write-Host $tag -ForegroundColor $(if ($script:DryRun) { "Magenta" } else { "Green" })
@@ -133,9 +156,7 @@ function Write-StepUpdate {
 
         # Return the cursor to where it was (below any warnings that appeared)
         if ($currentPos -gt $script:StepRow) {
-            [Console]::SetCursorPosition(0, $currentPos)
-        #} else {
-        #    Write-Host ""
+            Set-AmortCursor 0 $currentPos
         }
     }
 }
@@ -170,50 +191,6 @@ function Write-DryEstimate {
     if (-not $script:EstYieldBytes) { $script:EstYieldBytes = 0 }
     $script:EstYieldBytes = [int64]$script:EstYieldBytes + [int64]$Bytes
 }
-# Environment Setup
-# Expose DryRun at script scope so the output helpers can see it
-$script:DryRun = [bool]$DryRun
-$Drive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-$StartSpace = $Drive.FreeSpace
-$TotalSize = $Drive.Size
-# Initialize cumulative yield (bytes)
-if (-not $TotalYieldBytes) { $TotalYieldBytes = 0 }
-$script:EstYieldBytes = 0
-# Ensure TotalSize is valid
-$TotalSize = [double]$TotalSize
-$script:RegionHistory = @()
-if ($TotalSize -le 0) { throw "TotalSize is zero or undefined. Aborting." }
-
-$StartUsagePct = [Math]::Round(((($TotalSize - $StartSpace) / $TotalSize) * 100), 2)
-$LastRegionSpace = $Drive.FreeSpace # Rolling baseline for step-by-step reporting
-$CS = Get-CimInstance Win32_ComputerSystem
-$Vendor = $CS.Manufacturer
-$IsVM = ($Vendor -match "QEMU|VMware|Virtual|Hyper-V")
-# --- Custom-build architecture display ---
-$Sys = Get-SystemData Win32_ComputerSystem
-$Baseboard = Get-SystemData Win32_BaseBoard
-# Rule: If Manufacturer and Model are the same (typical of "To Be Filled By O.E.M."), 
-# fallback to Motherboard Manufacturer and Product.
-if ($Sys.Manufacturer -eq $Sys.Model) {
-    $ArchitectureDisplay = "$($Baseboard.Manufacturer) $($Baseboard.Product)"
-} else {
-    $ArchitectureDisplay = "$($Sys.Manufacturer) $($Sys.Model)"
-}
-$OS = Get-SystemData Win32_OperatingSystem
-$WinVer = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).DisplayVersion
-$CS = Get-SystemData Win32_LogicalDisk | Where-Object { $_.DeviceID -eq 'C:' }
-# Suppress standard progress bars for speed in RMM/VSA
-$ProgressPreference = 'SilentlyContinue'
-
-Clear-Host
-$script:Width    = 90
-$LineCol   = "DarkCyan"
-$MainCol   = "DarkYellow"
-$BorderCol = "Cyan"
-$ArtCol    = "White"
-$AccentCol = "Yellow"
-$DimCol    = "DarkGray"
-$InfoCol      = "Cyan"
 function Write-HLine {
     param(
         [string]$Style = "dashed",
@@ -254,38 +231,6 @@ function Write-HLine {
         Write-Host ""
     }
 }
-
-# Header Art & Logic
-$_pfx  = "█  "
-$_art1 = "╔═╗ ╔╦╗ ╔═╗ ╦═╗ ╔╦╗ "
-$_art2 = "╠═╣ ║║║ ║ ║ ╠╦╝  ║  "
-$_art3 = "╩ ╩ ╩ ╩ ╚═╝ ╩╚═  ╩  "
-$_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
-$_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
-$_fillW = $script:Width - $_pfx.Length - $_artW
-$_title = "ADVANCED MAINTENANCE, OPTIMIZATION, & REPAIR TOOL"
-
-Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art1 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
-Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art2 -ForegroundColor $ArtCol -NoNewline; Write-Host "$_title" -ForegroundColor $MainCol
-Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art3 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
-# System Info Banner
-# System Info with split coloring (Cyan Labels, Yellow Data)
-Write-Host "Device Name         : " -ForegroundColor $InfoCol -NoNewline; Write-Host "$($env:COMPUTERNAME)" -ForegroundColor Yellow
-Write-Host "System Architecture : " -ForegroundColor $InfoCol -NoNewline; Write-Host "$ArchitectureDisplay" -ForegroundColor Yellow
-Write-Host "Operating System    : " -ForegroundColor $InfoCol -NoNewline; Write-Host "$($OS.Caption) ($WinVer)" -ForegroundColor Yellow
-$StartUsedGB = [Math]::Round(($TotalSize - $StartSpace) / 1GB, 2)
-$StartTotalGB = [Math]::Round($TotalSize / 1GB, 0)
-$DiskColor = if ($StartUsagePct -ge 90) { "Red" } elseif ($StartUsagePct -ge 80) { "DarkYellow" } else { "Green" }
-Write-Host "Disk Usage          : " -ForegroundColor $InfoCol -NoNewline; Write-Host "${StartUsedGB}GB Used of ${StartTotalGB}GB ($StartUsagePct%)" -ForegroundColor $DiskColor
-Write-HLine -Style dashed
-if ($DryRun) {
-    Write-Host "      Mode: DRY RUN - estimate only, no changes will be made" -ForegroundColor Magenta
-}
-if ($IsVM) {
-    Write-Host "      Mode: Virtual Machine" -ForegroundColor Yellow 
-}
-#endregion
-
 #region Cleanup Helpers
 # ============================================================================
 # Every cleanup step is built to be safe on a live endpoint with a user signed in.
@@ -353,11 +298,221 @@ function Remove-Tree {
         & cmd.exe /c "rd /s /q `"$Path`"" 2>$null | Out-Null
     }
 }
+
+# Helper: clear console lines from $StartRow to current row, then reprint a step result
+function Clear-AndReprintStep {
+    param([int]$StartRow, [string]$Message, [switch]$Success, [string]$CustomInfo)
+    if ($StartRow -ge 0 -and (Test-AmortConsole)) {
+        try {
+            $endRow = Get-AmortCursorTop
+            $width  = $script:Width
+            for ($r = $StartRow; $r -le $endRow; $r++) {
+                [Console]::SetCursorPosition(0, $r)
+                [Console]::Write(' ' * $width)
+            }
+            [Console]::SetCursorPosition(0, $StartRow)
+        } catch {}
+    }
+    if ($Success) { Write-StepUpdate $Message -Success }
+    elseif ($CustomInfo -eq "[SKIPPED]") { Write-StepUpdate $Message -CustomInfo "[SKIPPED]" }
+    elseif ($CustomInfo -match '^\[FAILED' -or $CustomInfo -eq "[WARNING]") {
+        $color = if ($CustomInfo -eq "[WARNING]") { "Yellow" } else { "Red" }
+        if (-not (Test-AmortConsole)) {
+            Write-Host ("        " + $CustomInfo) -ForegroundColor $color
+            return
+        }
+        # Print step label in Gray, description in White, result in color
+        if ($Message -match '^(\[[\d./]+\])(\s+.+)$') {
+            Write-Host $Matches[1] -NoNewline -ForegroundColor DarkGray
+            Write-Host $Matches[2] -NoNewline -ForegroundColor White
+        } else { Write-Host $Message -NoNewline -ForegroundColor White }
+        $currentCol = Get-AmortCursorLeft
+        $targetCol  = $script:Width - $CustomInfo.Length
+        if ($targetCol -gt $currentCol) { Write-Host (" " * ($targetCol - $currentCol)) -NoNewline }
+        Write-Host $CustomInfo -ForegroundColor $color
+    }
+    elseif ($CustomInfo) { Write-StepUpdate $Message -CustomInfo $CustomInfo }
+}
+# Helper: flush buffered console keypresses using raw .NET Console API (bypasses PSReadLine)
+function Clear-InputBuffer { try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {} }
+# Kills cmd.exe and any DISM/TiWorker children it left behind
+function Stop-DismTree {
+    Get-Process -Name "DISM","TiWorker" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+# After DISM exits, give TiWorker 5s to exit naturally, then kill it to release the console stdin handle
+function Stop-TiWorker {
+    $tw = Get-Process -Name "TiWorker" -ErrorAction SilentlyContinue
+    if ($tw) {
+        $tw | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+        Get-Process -Name "TiWorker" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+    }
+}
+function Get-FreeColor { param([double]$Pct) if ($Pct -lt 10) { "Red" } elseif ($Pct -lt 20) { "DarkYellow" } else { "Green" } }
+function Write-FreeLine {
+    param([string]$Label, [int64]$Free)
+    $Pct = [Math]::Round(($Free / $TotalSize) * 100, 1)
+    Write-Host $Label -NoNewline -ForegroundColor $InfoCol
+    Write-Host ("{0} free of {1} ({2}% free)" -f (Format-Size $Free), $TotalGBStr, $Pct) -ForegroundColor (Get-FreeColor $Pct)
+}
+
+# Removes C:\Windows.old. Strips the previous-installation protection first, then tries rd,
+# an ownership retry, a robocopy mirror and finally a delete-on-reboot.
+function Remove-AmortWindowsOld {
+# Strip the previous-installation protection so Windows.old is deletable.
+& DISM.exe /Online /Remove-OSUninstall /NoRestart *>&1 | Out-Null
+
+# cleanmgr is skipped entirely: it ignores -WindowStyle Hidden (spawns an uncontrolled
+# child process), shows its UI in interactive sessions, and silently fails under
+# SYSTEM/LiveConnect where there is no desktop. rd /s /q is an order of magnitude
+# faster than Remove-Item -Recurse for deep trees (minutes vs hours).
+$rdProc = Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+if ($rdProc) {
+    $rdProc | Wait-Process -Timeout 1800 -ErrorAction SilentlyContinue
+    if (-not $rdProc.HasExited) { $rdProc | Stop-Process -Force -ErrorAction SilentlyContinue }
+}
+
+# Fallback: if rd hit locked files, take ownership and retry once
+if (Test-Path "C:\Windows.old") {
+    & takeown /F "C:\Windows.old" /R /A /D Y 2>$null | Out-Null
+    & icacls "C:\Windows.old" /grant "*S-1-5-32-544:F" /T /C /Q 2>$null | Out-Null
+    Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+}
+
+# Fallback: robocopy mirror against an empty folder. This handles long paths and
+# stale ACL entries far more reliably than rd or Remove-Item.
+if (Test-Path "C:\Windows.old") {
+    $EmptyDir = Join-Path $env:TEMP ("amort_empty_" + [guid]::NewGuid().ToString())
+    New-Item -ItemType Directory -Path $EmptyDir -Force | Out-Null
+    & robocopy.exe $EmptyDir "C:\Windows.old" /MIR /NFL /NDL /NJH /NJS /NC /NS /NP *>&1 | Out-Null
+    Remove-Item $EmptyDir -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path "C:\Windows.old") {
+        Remove-Item "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Last resort: whatever is left has an open handle, so schedule it for deletion on
+# the next boot (the same mechanism Windows uses for PendingFileRenameOperations).
+if (Test-Path "C:\Windows.old") {
+    try {
+        Add-Type -Name Kernel32 -Namespace AmortNative -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+'@ -ErrorAction SilentlyContinue
+
+        Get-ChildItem "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue |
+            Sort-Object { $_.FullName.Length } -Descending |
+            ForEach-Object { [AmortNative.Kernel32]::MoveFileEx($_.FullName, $null, 4) | Out-Null }
+        [AmortNative.Kernel32]::MoveFileEx("C:\Windows.old", $null, 4) | Out-Null
+        $script:Notes += "Windows.old was partly in use and is scheduled for deletion on the next reboot."
+        $script:AmortReboot = $true
+    } catch {
+        $script:Notes += "Windows.old is still present after every removal attempt."
+        $script:AmortFailures += "Windows.old could not be removed"
+    }
+}
+}
+
+function Invoke-AmortCleanup {
+    param(
+        [switch]$DryRun,
+        [int]$RetainDays = 14,
+        [int]$KeepRestorePoints = 2
+    )
+$TempAgeDays = 2
+$_fver   = "| v17.0"
+#region Pre-Flight Checks
+# ============================================================================
+# Force UTF-8 output so box-drawing characters render correctly
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+$OutputEncoding            = [System.Text.Encoding]::UTF8
+
+# Detect active Windows servicing - do NOT kill it.
+# Force-killing TiWorker/DISM mid-servicing corrupts the component store, which
+# the repair region would then have to fix. Instead we detect and skip repair.
+$ServicingActive = $null -ne (Get-Process -Name "TiWorker", "DISM" -ErrorAction SilentlyContinue)
+if ($ServicingActive) {
+    Write-Host "[Pre-Flight] Windows servicing active (TiWorker/DISM running). Repair steps will be skipped." -ForegroundColor Yellow
+}
+# A pending reboot means SoftwareDistribution and upgrade staging are still in use.
+$PendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+
+# Environment Setup
+# Expose DryRun at script scope so the output helpers can see it
+$script:DryRun = [bool]$DryRun
+$Drive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+$StartSpace = $Drive.FreeSpace
+$TotalSize = $Drive.Size
+# Initialize cumulative yield (bytes)
+if (-not $TotalYieldBytes) { $TotalYieldBytes = 0 }
+$script:EstYieldBytes = 0
+# Ensure TotalSize is valid
+$TotalSize = [double]$TotalSize
+$script:RegionHistory = @()
+if ($TotalSize -le 0) { throw "PRECONDITION: the C: volume size could not be read." }
+
+$StartUsagePct = [Math]::Round(((($TotalSize - $StartSpace) / $TotalSize) * 100), 2)
+$LastRegionSpace = $Drive.FreeSpace # Rolling baseline for step-by-step reporting
+$CS = Get-CimInstance Win32_ComputerSystem
+$Vendor = $CS.Manufacturer
+$IsVM = ($Vendor -match "QEMU|VMware|Virtual|Hyper-V")
+# --- Custom-build architecture display ---
+$Sys = Get-SystemData Win32_ComputerSystem
+$Baseboard = Get-SystemData Win32_BaseBoard
+# Rule: If Manufacturer and Model are the same (typical of "To Be Filled By O.E.M."), 
+# fallback to Motherboard Manufacturer and Product.
+if ($Sys.Manufacturer -eq $Sys.Model) {
+    $ArchitectureDisplay = "$($Baseboard.Manufacturer) $($Baseboard.Product)"
+} else {
+    $ArchitectureDisplay = "$($Sys.Manufacturer) $($Sys.Model)"
+}
+$OS = Get-SystemData Win32_OperatingSystem
+$WinVer = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).DisplayVersion
+$CS = Get-SystemData Win32_LogicalDisk | Where-Object { $_.DeviceID -eq 'C:' }
+# Suppress standard progress bars for speed in RMM/VSA
+$ProgressPreference = 'SilentlyContinue'
+try { Clear-Host } catch { }
+$script:Width    = 90
+$LineCol   = "DarkCyan"
+$MainCol   = "DarkYellow"
+$BorderCol = "Cyan"
+$ArtCol    = "White"
+$AccentCol = "Yellow"
+$DimCol    = "DarkGray"
+$InfoCol      = "Cyan"
+# Header Art & Logic
+$_pfx  = "█  "
+$_art1 = "╔═╗ ╔╦╗ ╔═╗ ╦═╗ ╔╦╗ "
+$_art2 = "╠═╣ ║║║ ║ ║ ╠╦╝  ║  "
+$_art3 = "╩ ╩ ╩ ╩ ╚═╝ ╩╚═  ╩  "
+$_artW = [Math]::Max($_art1.Length, [Math]::Max($_art2.Length, $_art3.Length))
+$_art1 = $_art1.PadRight($_artW); $_art2 = $_art2.PadRight($_artW); $_art3 = $_art3.PadRight($_artW)
+$_fillW = $script:Width - $_pfx.Length - $_artW
+$_title = "ADVANCED MAINTENANCE, OPTIMIZATION, & REPAIR TOOL"
+
+Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art1 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
+Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art2 -ForegroundColor $ArtCol -NoNewline; Write-Host "$_title" -ForegroundColor $MainCol
+Write-Host $_pfx -ForegroundColor $LineCol -NoNewline; Write-Host $_art3 -ForegroundColor $ArtCol -NoNewline; Write-Host ("-" * $_fillW) -ForegroundColor $LineCol
+# System Info Banner
+# System Info with split coloring (Cyan Labels, Yellow Data)
+Write-Host "Device Name         : " -ForegroundColor $InfoCol -NoNewline; Write-Host "$($env:COMPUTERNAME)" -ForegroundColor Yellow
+Write-Host "System Architecture : " -ForegroundColor $InfoCol -NoNewline; Write-Host "$ArchitectureDisplay" -ForegroundColor Yellow
+Write-Host "Operating System    : " -ForegroundColor $InfoCol -NoNewline; Write-Host "$($OS.Caption) ($WinVer)" -ForegroundColor Yellow
+$StartUsedGB = [Math]::Round(($TotalSize - $StartSpace) / 1GB, 2)
+$StartTotalGB = [Math]::Round($TotalSize / 1GB, 0)
+$DiskColor = if ($StartUsagePct -ge 90) { "Red" } elseif ($StartUsagePct -ge 80) { "DarkYellow" } else { "Green" }
+Write-Host "Disk Usage          : " -ForegroundColor $InfoCol -NoNewline; Write-Host "${StartUsedGB}GB Used of ${StartTotalGB}GB ($StartUsagePct%)" -ForegroundColor $DiskColor
+Write-HLine -Style dashed
+if ($DryRun) {
+    Write-Host "      Mode: DRY RUN - estimate only, no changes will be made" -ForegroundColor Magenta
+}
+if ($IsVM) {
+    Write-Host "      Mode: Virtual Machine" -ForegroundColor Yellow 
+}
+#endregion
 $UserProfiles = Get-ChildItem "C:\Users" -Directory -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notin @("All Users", "Default User") -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }
 $script:Notes = @()
-#endregion
-
 #region 1. Snapshots, Upgrade Leftovers & OEM Installers
 # ============================================================================
 Write-StepUpdate "[01/11] Purging Snapshots, Upgrade Leftovers & OEM Installers"
@@ -428,56 +583,7 @@ if (Test-Path "C:\Windows.old") {
     if ($DryRun) {
         $RegionEst += Get-PathSize "C:\Windows.old"
     } else {
-        # Strip the previous-installation protection so Windows.old is deletable.
-        & DISM.exe /Online /Remove-OSUninstall /NoRestart *>&1 | Out-Null
-
-        # cleanmgr is skipped entirely: it ignores -WindowStyle Hidden (spawns an uncontrolled
-        # child process), shows its UI in interactive sessions, and silently fails under
-        # SYSTEM/LiveConnect where there is no desktop. rd /s /q is an order of magnitude
-        # faster than Remove-Item -Recurse for deep trees (minutes vs hours).
-        $rdProc = Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
-        if ($rdProc) {
-            $rdProc | Wait-Process -Timeout 1800 -ErrorAction SilentlyContinue
-            if (-not $rdProc.HasExited) { $rdProc | Stop-Process -Force -ErrorAction SilentlyContinue }
-        }
-
-        # Fallback: if rd hit locked files, take ownership and retry once
-        if (Test-Path "C:\Windows.old") {
-            & takeown /F "C:\Windows.old" /R /A /D Y 2>$null | Out-Null
-            & icacls "C:\Windows.old" /grant "*S-1-5-32-544:F" /T /C /Q 2>$null | Out-Null
-            Start-Process "cmd.exe" -ArgumentList "/c rd /s /q `"C:\Windows.old`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
-        }
-
-        # Fallback: robocopy mirror against an empty folder. This handles long paths and
-        # stale ACL entries far more reliably than rd or Remove-Item.
-        if (Test-Path "C:\Windows.old") {
-            $EmptyDir = Join-Path $env:TEMP ("amort_empty_" + [guid]::NewGuid().ToString())
-            New-Item -ItemType Directory -Path $EmptyDir -Force | Out-Null
-            & robocopy.exe $EmptyDir "C:\Windows.old" /MIR /NFL /NDL /NJH /NJS /NC /NS /NP *>&1 | Out-Null
-            Remove-Item $EmptyDir -Recurse -Force -ErrorAction SilentlyContinue
-            if (Test-Path "C:\Windows.old") {
-                Remove-Item "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-
-        # Last resort: whatever is left has an open handle, so schedule it for deletion on
-        # the next boot (the same mechanism Windows uses for PendingFileRenameOperations).
-        if (Test-Path "C:\Windows.old") {
-            try {
-                Add-Type -Name Kernel32 -Namespace AmortNative -MemberDefinition @'
-[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
-'@ -ErrorAction SilentlyContinue
-
-                Get-ChildItem "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue |
-                    Sort-Object { $_.FullName.Length } -Descending |
-                    ForEach-Object { [AmortNative.Kernel32]::MoveFileEx($_.FullName, $null, 4) | Out-Null }
-                [AmortNative.Kernel32]::MoveFileEx("C:\Windows.old", $null, 4) | Out-Null
-                $script:Notes += "Windows.old was partly in use and is scheduled for deletion on the next reboot."
-            } catch {
-                $script:Notes += "Windows.old is still present after every removal attempt."
-            }
-        }
+        Remove-AmortWindowsOld
     }
 }
 Complete-Step -Estimate $RegionEst
@@ -624,7 +730,7 @@ if ($OldShadows.Count -gt 0) {
         if ($Storage) { $RegionEst = [int64]([double]$Storage.UsedSpace * $OldShadows.Count / $Shadows.Count) }
     } else {
         foreach ($S in $OldShadows) {
-            & vssadmin.exe delete shadows "/shadow=$($S.ID)" /quiet 2>$null | Out-Null
+            Invoke-AmortTool "vssadmin.exe" @("delete", "shadows", "/shadow=$($S.ID)", "/quiet") | Out-Null
         }
     }
 }
@@ -641,13 +747,11 @@ if ($DryRun) {
     Complete-Step -NoEstimate
 } else {
     foreach ($L in $LogDirs) {
-        if (Test-Path $L) { & compact.exe /c "/s:$L" /i /q 2>$null | Out-Null }
+        if (Test-Path $L) { Invoke-AmortTool "compact.exe" @("/c", "/s:$L", "/i", "/q") | Out-Null }
     }
     Complete-Step
 }
 #endregion
-
-
 #region 5. Repair & Integrity
 # ============================================================================
 if ($IsVM) { [System.GC]::Collect() }
@@ -664,12 +768,15 @@ if ($DryRun) {
 }
 elseif ($PendingReboot) {
     Write-Host "        [!] Reboot pending, so upgrade folders, WU cache, and DISM/SFC were skipped." -ForegroundColor DarkYellow
+    $script:AmortSkips += "reboot pending, so upgrade folders, WU cache, DISM and SFC were skipped"
 }
 elseif ($ServicingActive) {
     Write-Host "        [!] Windows servicing active (TiWorker/DISM running) - DISM and SFC repair steps will be skipped." -ForegroundColor DarkYellow
+    $script:AmortSkips += "Windows servicing was active, so DISM and SFC were skipped"
 }
 elseif ($HasPendingRename) {
     Write-Host "        [!] PendingFileRenameOperations found - skipping repair steps." -ForegroundColor DarkYellow
+    $script:AmortSkips += "PendingFileRenameOperations found, so DISM and SFC were skipped"
 }
 # Ensure TrustedInstaller is available (prevents DISM Error 87 / SFC failures)
 if (-not $SkipRepair -and -not $DryRun) {
@@ -678,61 +785,6 @@ if (-not $SkipRepair -and -not $DryRun) {
     if ($TI.Status -ne 'Running') { Start-Service -Name "TrustedInstaller" -ErrorAction SilentlyContinue }
 }
 if (-not $SkipRepair) {
-# Helper: clear console lines from $startRow to current row, then reprint a step result
-    function Clear-AndReprintStep {
-        param([int]$StartRow, [string]$Message, [switch]$Success, [string]$CustomInfo)
-        try {
-            $endRow = [Console]::CursorTop
-            $width  = $script:Width
-            for ($r = $StartRow; $r -le $endRow; $r++) {
-                [Console]::SetCursorPosition(0, $r)
-                [Console]::Write(' ' * $width)
-            }
-            [Console]::SetCursorPosition(0, $StartRow)
-        } catch {}
-        if ($Success) { Write-StepUpdate $Message -Success }
-        elseif ($CustomInfo -eq "[SKIPPED]") { Write-StepUpdate $Message -CustomInfo "[SKIPPED]" }
-        elseif ($CustomInfo -match '^\[FAILED') {
-            # Print step label in Gray, description in White, error in Red
-            if ($Message -match '^(\[[\d./]+\])(\s+.+)$') {
-                Write-Host $Matches[1] -NoNewline -ForegroundColor DarkGray
-                Write-Host $Matches[2] -NoNewline -ForegroundColor White
-            } else { Write-Host $Message -NoNewline -ForegroundColor White }
-            $tag = $CustomInfo
-            $currentCol = [Console]::CursorLeft
-            $targetCol  = $script:Width - $tag.Length
-            if ($targetCol -gt $currentCol) { Write-Host (" " * ($targetCol - $currentCol)) -NoNewline }
-            Write-Host $tag -ForegroundColor Red
-        }
-        elseif ($CustomInfo -eq "[WARNING]") {
-            # Print step label in Gray, description in White, warning in Yellow
-            if ($Message -match '^(\[[\d./]+\])(\s+.+)$') {
-                Write-Host $Matches[1] -NoNewline -ForegroundColor DarkGray
-                Write-Host $Matches[2] -NoNewline -ForegroundColor White
-            } else { Write-Host $Message -NoNewline -ForegroundColor White }
-            $tag = $CustomInfo
-            $currentCol = [Console]::CursorLeft
-            $targetCol  = $script:Width - $tag.Length
-            if ($targetCol -gt $currentCol) { Write-Host (" " * ($targetCol - $currentCol)) -NoNewline }
-            Write-Host $tag -ForegroundColor Yellow
-        }
-        elseif ($CustomInfo) { Write-StepUpdate $Message -CustomInfo $CustomInfo }
-    }
-# Helper: flush buffered console keypresses using raw .NET Console API (bypasses PSReadLine)
-    function Clear-InputBuffer { try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {} }
-    # Kills cmd.exe and any DISM/TiWorker children it left behind
-    function Stop-DismTree {
-        Get-Process -Name "DISM","TiWorker" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
-    # After DISM exits, give TiWorker 5s to exit naturally, then kill it to release the console stdin handle
-    function Stop-TiWorker {
-        $tw = Get-Process -Name "TiWorker" -ErrorAction SilentlyContinue
-        if ($tw) {
-            $tw | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
-            Get-Process -Name "TiWorker" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 300
-        }
-    }
 # --- STEP 5: RestoreHealth ---
             Clear-InputBuffer
             $S72 = "[08/11] DISM RestoreHealth"
@@ -744,7 +796,7 @@ if (-not $SkipRepair) {
             }
             else {
                 $DismSpin = [char[]]@('|','/','-','\')
-                $DismTmp1 = [System.IO.Path]::GetTempFileName()
+                $DismTmp1 = New-AmortTempFile
 
                 # Use .NET Process directly; Start-Process -PassThru returns $null ExitCode
                 # when combined with -RedirectStandardOutput. Wrap in cmd.exe for file redirection.
@@ -754,7 +806,7 @@ if (-not $SkipRepair) {
                 $psi1.UseShellExecute        = $false
                 $psi1.CreateNoWindow         = $true
                 $psi1.WindowStyle            = [System.Diagnostics.ProcessWindowStyle]::Hidden
-                $Proc1 = [System.Diagnostics.Process]::Start($psi1)
+                $Proc1 = Start-AmortProcess $psi1
 
                 $Skipped1 = $false
                 $DismSpinIdx1 = 0
@@ -801,9 +853,11 @@ if (-not $SkipRepair) {
                     Clear-AndReprintStep -StartRow $Row72 -Message $S72 -CustomInfo "[SKIPPED]"
                 }
                 elseif ($ExitCode1 -in @(0, 3010)) {
+                    if ($ExitCode1 -eq 3010) { $script:AmortReboot = $true }
                     Clear-AndReprintStep -StartRow $Row72 -Message $S72 -Success
                 }
                 else {
+                    $script:AmortFailures += "DISM RestoreHealth failed (0x$($ExitCode1.ToString('X')))"
                     Clear-AndReprintStep -StartRow $Row72 -Message $S72 -CustomInfo "[FAILED:0x$($ExitCode1.ToString('X'))]"
                 }
             }
@@ -825,7 +879,7 @@ if (-not $SkipRepair) {
 
                 Clear-InputBuffer
 
-                $DismTmp2 = [System.IO.Path]::GetTempFileName()
+                $DismTmp2 = New-AmortTempFile
 
                 $psi2 = New-Object System.Diagnostics.ProcessStartInfo
                 $psi2.FileName               = "cmd.exe"
@@ -833,7 +887,7 @@ if (-not $SkipRepair) {
                 $psi2.UseShellExecute        = $false
                 $psi2.CreateNoWindow         = $true
                 $psi2.WindowStyle            = [System.Diagnostics.ProcessWindowStyle]::Hidden
-                $Proc2 = [System.Diagnostics.Process]::Start($psi2)
+                $Proc2 = Start-AmortProcess $psi2
 
                 $Skipped2 = $false
                 $DismSpinIdx2 = 0
@@ -882,9 +936,11 @@ if (-not $SkipRepair) {
                     Clear-AndReprintStep -StartRow $Row73 -Message $S73 -CustomInfo "[SKIPPED]"
                 }
                 elseif ($ExitCode2 -in @(0, 3010)) {
+                    if ($ExitCode2 -eq 3010) { $script:AmortReboot = $true }
                     Clear-AndReprintStep -StartRow $Row73 -Message $S73 -Success
                 }
                 else {
+                    $script:AmortFailures += "DISM ComponentCleanup failed (0x$($ExitCode2.ToString('X')))"
                     Clear-AndReprintStep -StartRow $Row73 -Message $S73 -CustomInfo "[FAILED:0x$($ExitCode2.ToString('X'))]"
                 }
             }
@@ -899,7 +955,7 @@ if (-not $SkipRepair) {
             }
             else {
                 Clear-InputBuffer
-                $SfcTmp = [System.IO.Path]::GetTempFileName()
+                $SfcTmp = New-AmortTempFile
 
                 # sfc.exe writes Unicode; capture via cmd redirection for reliable exit code
                 $psi3 = New-Object System.Diagnostics.ProcessStartInfo
@@ -908,7 +964,7 @@ if (-not $SkipRepair) {
                 $psi3.UseShellExecute        = $false
                 $psi3.CreateNoWindow         = $true
                 $psi3.WindowStyle            = [System.Diagnostics.ProcessWindowStyle]::Hidden
-                $Proc3 = [System.Diagnostics.Process]::Start($psi3)
+                $Proc3 = Start-AmortProcess $psi3
 
                 $Skipped3 = $false
                 $SfcSpinIdx = 0
@@ -957,9 +1013,11 @@ if (-not $SkipRepair) {
                     Clear-AndReprintStep -StartRow $Row74 -Message $S74 -Success
                 }
                 elseif ($ExitCode3 -eq 2) {
+                    $script:AmortFailures += "SFC /scannow reported a warning"
                     Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[WARNING]"
                 }
                 else {
+                    $script:AmortFailures += "SFC /scannow failed (0x$($ExitCode3.ToString('X')))"
                     Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[FAILED:0x$($ExitCode3.ToString('X'))]"
                 }
             }
@@ -982,8 +1040,8 @@ if ($DryRun) {
     }
     Write-DryEstimate $HibBytes
 } else {
-    & ipconfig.exe /flushdns | Out-Null
-    & powercfg.exe /h off | Out-Null
+    Invoke-AmortTool "ipconfig.exe" @("/flushdns") | Out-Null
+    Invoke-AmortTool "powercfg.exe" @("/h", "off") | Out-Null
     try { Optimize-Volume -DriveLetter C -ReTrim -ErrorAction SilentlyContinue | Out-Null } catch { }
     Complete-Step
 }
@@ -996,13 +1054,6 @@ if ($DryRun) {
 $FinalFree  = Get-FreeBytes
 $StartFree  = [int64]$StartSpace
 $TotalGBStr = "{0:N0} GB" -f ($TotalSize / 1GB)
-function Get-FreeColor { param([double]$Pct) if ($Pct -lt 10) { "Red" } elseif ($Pct -lt 20) { "DarkYellow" } else { "Green" } }
-function Write-FreeLine {
-    param([string]$Label, [int64]$Free)
-    $Pct = [Math]::Round(($Free / $TotalSize) * 100, 1)
-    Write-Host $Label -NoNewline -ForegroundColor $InfoCol
-    Write-Host ("{0} free of {1} ({2}% free)" -f (Format-Size $Free), $TotalGBStr, $Pct) -ForegroundColor (Get-FreeColor $Pct)
-}
 
 Write-HLine -Style dashed
 if ($DryRun) {
@@ -1027,4 +1078,58 @@ $_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $_fver.Length))
 Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art1" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
 Write-Host "$_footer$_fpad$_fver" -ForegroundColor $MainCol -NoNewline; Write-Host " $_art2" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
 Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-#endregion
+}
+
+function Invoke-AmortMain {
+    param(
+        [switch]$DryRun,
+        [int]$RetainDays = 14,
+        [int]$KeepRestorePoints = 2
+    )
+    if (-not (Test-AmortElevated)) {
+        Write-Warning "Elevation Required: Please run as Administrator."
+        Write-Output "[FAIL] AMORT not elevated, nothing was changed (exit 2)"
+        Exit-KillerScript 2
+    }
+    $script:AmortFailures = @()
+    $script:AmortSkips    = @()
+    $script:AmortReboot   = $false
+    $script:Notes         = @()
+
+    $fatal = $null
+    $precondition = $false
+    try {
+        Invoke-AmortCleanup -DryRun:$DryRun -RetainDays $RetainDays -KeepRestorePoints $KeepRestorePoints
+    } catch {
+        $fatal = $_.Exception.Message
+        if ($fatal -like 'PRECONDITION:*') { $precondition = $true; $fatal = $fatal.Substring(13).Trim() }
+    }
+
+    # The final result line goes to the output stream, where an RMM captures it.
+    if ($fatal) {
+        if ($precondition) {
+            Write-Output "[FAIL] AMORT precondition failed: $fatal Nothing was changed (exit 2)"
+            Exit-KillerScript 2
+        }
+        Write-Output "[FAIL] AMORT stopped on an error: $fatal (exit 1)"
+        Exit-KillerScript 1
+    }
+    $problems = @($script:AmortFailures) + @($script:AmortSkips)
+    if ($problems.Count -gt 0) {
+        $tail = if ($script:AmortReboot) { "; a reboot is also needed" } else { "" }
+        Write-Output ("[WARN] AMORT partial: {0} (exit 3){1}" -f ($problems -join "; "), $tail)
+        Exit-KillerScript 3
+    }
+    if ($DryRun) {
+        Write-Output "[PASS] AMORT dry run complete, nothing was changed (exit 0)"
+        Exit-KillerScript 0
+    }
+    if ($script:AmortReboot) {
+        Write-Output "[PASS] AMORT complete, reboot required (exit 3010)"
+        Exit-KillerScript 3010
+    }
+    Write-Output "[PASS] AMORT complete (exit 0)"
+    Exit-KillerScript 0
+}
+
+if (-not $global:KillerScriptsTestMode) { Invoke-AmortMain -DryRun:$DryRun -RetainDays $RetainDays -KeepRestorePoints $KeepRestorePoints }
