@@ -6,7 +6,7 @@
     Resets broken Outlook installations for one or all user profiles.
     Supports New Outlook (Microsoft Store), Classic Outlook (Office/M365),
     or both simultaneously. Clears cached data, registry hives, and
-    authentication tokens. Optionally removes OST files and purges 3rd-party
+    authentication tokens. Optionally renames OST files to .ost.bak-<timestamp> and purges 3rd-party
     extensions for Classic Outlook. New Outlook is reinstalled clean from
     the Microsoft Store after reset.
 .NOTES
@@ -14,9 +14,9 @@
     NTUSER.DAT is loaded for per-user registry cleanup on non-current accounts
     (requires the target user to be logged out).
     .\ORCA.ps1
-        Prompts for user, Outlook type, and OST/ext. deletion preference.
+        Prompts for user, Outlook type, and OST/ext. reset preference.
     .\ORCA.ps1 -Silent
-        Non-interactive - All Users, Both Outlook types, no OST/ext. deletion.
+        Non-interactive - All Users, Both Outlook types, no OST/ext. changes.
 #>
 param(
     [switch]$Silent
@@ -275,10 +275,24 @@ function Invoke-ClearClassicOutlookData {
     ) | Where-Object { Test-Path $_ } | ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
 
     if ($script:DeleteOST) {
-        $ostFiles = Get-ChildItem "$local\Microsoft\Outlook" -Filter "*.ost" -ErrorAction SilentlyContinue
+        # The OST is renamed in place, never deleted, so the cached mail survives a bad reset.
+        # Each rename is verified before it is reported.
+        $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $ostFiles = @(Get-ChildItem -LiteralPath "$local\Microsoft\Outlook" -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer -and $_.Extension -eq ".ost" })
         foreach ($ostFile in $ostFiles) {
-            $script:DeletedOSTs += $ostFile.FullName
-            Remove-Item -Path $ostFile.FullName -Force -ErrorAction SilentlyContinue
+            $leaf   = "$($ostFile.Name).bak-$stamp"
+            $backup = Join-Path $ostFile.DirectoryName $leaf
+            try {
+                if (Test-Path -LiteralPath $backup) { throw "the backup name already exists" }
+                Rename-Item -LiteralPath $ostFile.FullName -NewName $leaf -ErrorAction Stop
+                if ((Test-Path -LiteralPath $ostFile.FullName) -or -not (Test-Path -LiteralPath $backup)) {
+                    throw "the rename could not be verified"
+                }
+                [void]$script:BackedUpOSTs.Add($backup)
+            } catch {
+                [void]$script:Problems.Add("OST not backed up for $UserName and left in place: $($ostFile.Name) ($($_.Exception.Message))")
+            }
         }
     }
 }
@@ -356,7 +370,7 @@ function Invoke-AuthFlush {
 function Invoke-OrcaMain {
     param([switch]$Silent)
     $script:IsAdmin = Test-OrcaElevated
-    $script:DeletedOSTs = @()
+    $script:BackedUpOSTs = New-Object System.Collections.Generic.List[string]
     $script:PurgedExtensions = New-Object System.Collections.Generic.List[string]
     $script:Problems = New-Object System.Collections.Generic.List[string]
     $ProgressPreference = 'SilentlyContinue'
@@ -478,8 +492,8 @@ function Invoke-OrcaMain {
         $script:DeleteOST = $false
         if (-not $Silent -and $script:OutlookMode -ne "New") {
             Write-Host ""
-            Write-Host "Delete OST files?" -ForegroundColor $LineCol
-            Write-Host "  (removes local email cache - mailbox will re-sync on next login)" -ForegroundColor $WarnCol
+            Write-Host "Reset OST files?" -ForegroundColor $LineCol
+            Write-Host "  (renames each OST to .ost.bak-<timestamp> - mailbox will re-sync on next login)" -ForegroundColor $WarnCol
             Write-Host ""
             Write-Host "Choice " -ForegroundColor $LineCol -NoNewline
             Write-Host "[Y/N]  Enter = N  Esc = quit: " -ForegroundColor $DimCol -NoNewline
@@ -538,7 +552,7 @@ function Invoke-OrcaMain {
             Write-Host "$($script:OutlookMode) Outlook" -ForegroundColor $AccentCol
         }
         if ($script:OutlookMode -ne "New") {
-            Write-Host "Delete OSTs     : " -ForegroundColor $LineCol -NoNewline
+            Write-Host "Back up OSTs    : " -ForegroundColor $LineCol -NoNewline
             if ($script:DeleteOST) { Write-Host "Yes" -ForegroundColor Red } else { Write-Host "No" -ForegroundColor $DimCol }
             Write-Host "Purge Extensions: " -ForegroundColor $LineCol -NoNewline
             if ($script:PurgeExtensions) { Write-Host "Yes" -ForegroundColor Red } else { Write-Host "No" -ForegroundColor $DimCol }
@@ -743,9 +757,9 @@ function Invoke-OrcaMain {
             Write-Host "$_padL$_status" -ForegroundColor $OkCol
         }
 
-        if ($script:DeletedOSTs.Count -gt 0) {
-            Write-Host "Deleted OSTs :" -ForegroundColor $LineCol
-            foreach ($ostPath in $script:DeletedOSTs) {
+        if ($script:BackedUpOSTs.Count -gt 0) {
+            Write-Host "OST backups (original renamed, Outlook builds a new OST) :" -ForegroundColor $LineCol
+            foreach ($ostPath in $script:BackedUpOSTs) {
                 Write-Host "  - $ostPath" -ForegroundColor $DimCol
             }
         }

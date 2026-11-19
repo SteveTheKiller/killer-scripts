@@ -1,4 +1,4 @@
-#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
+﻿#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
 # ORCA tests. Every process, package, registry, credential and winget call is mocked or goes
 # to a fake profile tree under TestDrive. Nothing here touches the real machine.
 
@@ -36,6 +36,8 @@ AfterAll { Disable-KillerTestMode }
 
 Describe 'ORCA' {
     BeforeEach {
+        # TestDrive is shared by every test in the block, so start each test from a clean tree.
+        foreach ($leaf in 'Users', 'Temp') { $d = Join-Path $TestDrive $leaf; if ([IO.Directory]::Exists($d)) { [IO.Directory]::Delete($d, $true) } }
         $script:UsersRoot = Join-Path $TestDrive 'Users'
         $script:TempRoot  = Join-Path $TestDrive 'Temp'
         New-Item -ItemType Directory -Path $script:TempRoot -Force | Out-Null
@@ -119,6 +121,70 @@ Describe 'ORCA' {
             Mock Get-ActiveUser { $null }
             Invoke-OrcaRun -Silent
             $script:Code | Should -Be 2
+        }
+    }
+
+    Context 'OST handling (18a, decision D2)' {
+        BeforeEach {
+            Mock Get-Date { [datetime]'2026-11-18T10:05:09' }
+            # Classic only, Delete OSTs = Y, Purge extensions = N. Profile choice is set by each test.
+            $script:AnswersAfterProfile = @('2', 'y', 'n')
+            function Set-OrcaAnswers { param([string]$Profile)
+                $script:Keys.Enqueue((New-OrcaKey -Key D0 -Char $Profile))
+                foreach ($a in $script:AnswersAfterProfile) { $script:Keys.Enqueue((New-OrcaKey -Key A -Char $a)) }
+            }
+            $script:AliceOst = Join-Path $script:UsersRoot 'alice\AppData\Local\Microsoft\Outlook\alice@contoso.com.ost'
+            $script:BobOst   = Join-Path $script:UsersRoot 'bob\AppData\Local\Microsoft\Outlook\bob@contoso.com.ost'
+        }
+
+        It 'renames the OST to NAME.ost.bak-TIMESTAMP and keeps its content' {
+            Set-OrcaAnswers '0'
+            Invoke-OrcaRun
+            $bak = "$script:AliceOst.bak-20261118-100509"
+            Test-Path -LiteralPath $script:AliceOst | Should -BeFalse
+            Test-Path -LiteralPath $bak | Should -BeTrue
+            (Get-Content -LiteralPath $bak -Raw).Trim() | Should -Be 'synthetic OST for alice'
+            $script:Code | Should -Be 0
+        }
+
+        It 'leaves the other profile OST alone when one profile is selected' {
+            Set-OrcaAnswers '0'
+            Invoke-OrcaRun
+            Test-Path -LiteralPath $script:BobOst | Should -BeTrue
+        }
+
+        It 'backs up every selected profile when All Users is chosen' {
+            Set-OrcaAnswers 'A'
+            Invoke-OrcaRun
+            Test-Path -LiteralPath "$script:BobOst.bak-20261118-100509" | Should -BeTrue
+            Test-Path -LiteralPath "$script:AliceOst.bak-20261118-100509" | Should -BeTrue
+        }
+
+        It 'reports the backup path in the results, not a deletion' {
+            Mock Write-Host { $script:HostText += ($Object -join ' ') + "`n" }
+            $script:HostText = ''
+            Set-OrcaAnswers '0'
+            Invoke-OrcaRun
+            $script:HostText | Should -Match 'ost\.bak-20261118-100509'
+            $script:HostText | Should -Not -Match 'Deleted OSTs'
+        }
+
+        It 'does not touch an earlier .ost.bak-* file' {
+            $old = "$script:AliceOst.bak-20250101-000000"
+            Set-Content -LiteralPath $old -Value 'older backup'
+            Set-OrcaAnswers '0'
+            Invoke-OrcaRun
+            (Get-Content -LiteralPath $old -Raw).Trim() | Should -Be 'older backup'
+            @(Get-ChildItem -LiteralPath (Split-Path $script:AliceOst) -Filter '*.bak-*').Count | Should -Be 2
+        }
+
+        It 'exits 3 and says so when the OST is locked and cannot be preserved' {
+            Set-OrcaAnswers '0'
+            $lock = [System.IO.File]::Open($script:AliceOst, 'Open', 'Read', 'None')
+            try { Invoke-OrcaRun } finally { $lock.Dispose() }
+            Test-Path -LiteralPath $script:AliceOst | Should -BeTrue
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match 'ORCA RESULT: exit code 3 .*OST'
         }
     }
 }
