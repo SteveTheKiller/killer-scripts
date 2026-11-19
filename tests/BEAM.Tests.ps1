@@ -204,7 +204,8 @@ BeforeAll {
     function Invoke-Deploy {
         # Calls the publishing function with sensible defaults for one local installer.
         param([string]$AppName = 'Contoso Agent', [string[]]$Targets = @('PC01'), [string]$RunId = '20261118120000-aaaa1111',
-              [string]$InstallArgs = '/S', [bool]$IsMsi = $false, [string]$LocalPath, [string]$Url, [string]$SetupFile = 'setup.exe')
+              [string]$InstallArgs = '/S', [bool]$IsMsi = $false, [string]$LocalPath, [string]$Url, [string]$SetupFile = 'setup.exe', [switch]$KeepWork)
+        if (-not $KeepWork) { $script:WorkRoot = Join-Path $TestDrive ('w' + [guid]::NewGuid().ToString('N').Substring(0, 8)) }
         if (-not $LocalPath -and -not $Url) { $LocalPath = New-FakeInstaller $SetupFile }
         Invoke-IntuneInstall -Targets $Targets -Url $Url -LocalPath $LocalPath -SetupFile $SetupFile -IsMsi $IsMsi `
             -InstallArgs $InstallArgs -AppName $AppName -Publisher 'BEAM' -TenantId '11111111-2222-3333-4444-555555555555' -RunId $RunId
@@ -357,6 +358,41 @@ Context 'Finding 03b: the install wrapper stamps the marker only on an accepted 
         $r = Invoke-InstallWrapper -App $script:App -SetupExit 1641
         $r.MarkerText | Should -Be 'RUN-ID-0001'
         $r.ExitCode | Should -Be 3010
+    }
+}
+
+Context 'Finding 03a: each app has its own detection marker' {
+    It 'gives different apps different marker files, used by both the install command and detection' {
+        Invoke-Deploy -AppName 'Alpha Agent' | Out-Null
+        Invoke-Deploy -AppName 'Beta Agent' | Out-Null
+        $a = $script:G.Apps | Where-Object { $_.displayName -eq 'Alpha Agent (BEAM)' }
+        $b = $script:G.Apps | Where-Object { $_.displayName -eq 'Beta Agent (BEAM)' }
+        $ma = Get-MarkerPathFromScript (Get-AppDetectScript $a)
+        $mb = Get-MarkerPathFromScript (Get-AppDetectScript $b)
+        $ma | Should -Not -BeNullOrEmpty
+        $mb | Should -Not -BeNullOrEmpty
+        $ma | Should -Not -Be $mb
+        $ma | Should -Not -Be 'C:\ProgramData\BEAM\BEAM.marker'
+        (Get-MarkerPathFromScript (Get-AppInstallScript $a)) | Should -Be $ma
+        (Get-MarkerPathFromScript (Get-AppInstallScript $b)) | Should -Be $mb
+    }
+
+    It 'keeps names that sanitize to the same text apart' {
+        Invoke-Deploy -AppName 'Tool:One' | Out-Null
+        Invoke-Deploy -AppName 'Tool?One' | Out-Null
+        $a = $script:G.Apps | Where-Object { $_.displayName -eq 'Tool:One (BEAM)' }
+        $b = $script:G.Apps | Where-Object { $_.displayName -eq 'Tool?One (BEAM)' }
+        (Get-MarkerPathFromScript (Get-AppDetectScript $a)) | Should -Not -Be (Get-MarkerPathFromScript (Get-AppDetectScript $b))
+    }
+
+    It 'reuses the same marker file when the same app is deployed again, with the new run ID' {
+        Invoke-Deploy -AppName 'Alpha Agent' -RunId 'RUN-1' | Out-Null
+        $first = Get-MarkerPathFromScript (Get-AppDetectScript $script:G.Apps[0])
+        Invoke-Deploy -AppName 'Alpha Agent' -RunId 'RUN-2' | Out-Null
+        $script:G.Apps.Count | Should -Be 1
+        $detect = Get-AppDetectScript $script:G.Apps[0]
+        (Get-MarkerPathFromScript $detect) | Should -Be $first
+        $detect | Should -Match 'RUN-2'
     }
 }
 }

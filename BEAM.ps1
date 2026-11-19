@@ -709,6 +709,20 @@ function Resolve-DirectDownload {
     } catch { return $pick }
 }
 
+function Get-BeamAppKey {
+    # A stable, file-name-safe identity for one deployed app: a readable slice of the name plus a
+    # short hash of the exact display name, so two names that sanitize to the same text still differ.
+    param([string]$DisplayName)
+    $readable = ($DisplayName -replace '[^A-Za-z0-9._-]+', '_').Trim('_')
+    if ($readable.Length -gt 40) { $readable = $readable.Substring(0, 40) }
+    if (-not $readable) { $readable = 'app' }
+    $sha  = [System.Security.Cryptography.SHA256]::Create()
+    $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($DisplayName.ToLowerInvariant()))
+    $sha.Dispose()
+    $short = ([BitConverter]::ToString($hash, 0, 4) -replace '-', '').ToLowerInvariant()
+    return "$readable-$short"
+}
+
 function New-BeamInstallScript {
     # The PowerShell the Intune SYSTEM install command runs (wrapped in -EncodedCommand). It runs the
     # package, reads the installer's real exit code, and stamps the run ID marker only for an accepted
@@ -871,7 +885,9 @@ function Invoke-IntuneInstall {
     # run ID won't match the old marker, so it installs again. This is app-agnostic by design, so no
     # per-app product code or file path is needed for any installer.
     $markerDir  = 'C:\ProgramData\BEAM'
-    $markerPath = 'C:\ProgramData\BEAM\BEAM.marker'
+    $appDisplayName = "$AppName (BEAM)"
+    # One marker file per app, so a second app on the same device never overwrites the first one's run ID.
+    $markerPath = "$markerDir\$(Get-BeamAppKey $appDisplayName).marker"
     $detectScript = @"
 `$m = '$markerPath'
 if ((Test-Path `$m) -and ((Get-Content `$m -Raw -ErrorAction SilentlyContinue).Trim() -eq '$runId')) { Write-Output 'Detected'; exit 0 }
@@ -888,7 +904,6 @@ exit 1
     # uninstall never re-runs the installer (detection is marker-based and won't trigger it anyway).
     if ($IsMsi) { $uninstallCmd = "msiexec /x `"$SetupFile`" /qn" } else { $uninstallCmd = "cmd /c exit 0" }
 
-    $appDisplayName = "$AppName (BEAM)"
     $app = $null
     try {
         $existingApp = Invoke-RestMethod "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps?`$filter=displayName eq '$appDisplayName'" -Headers $h -ErrorAction Stop
