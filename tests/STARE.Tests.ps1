@@ -161,4 +161,65 @@ Describe 'STARE' {
             $r.Output | Should -Match 'STARE RESULT: exit code 3 - partial: 1 change\(s\) applied, 1 failed'
         }
     }
+
+    Context 'finding 60: delete targets one task by folder and name and reports the real result' {
+        BeforeEach {
+            # Two tasks share a name in different folders. The list sorts by name, then folder.
+            $script:Sched = @((New-TestTask 'Backup' '\A\'), (New-TestTask 'Backup' '\B\'), (New-TestTask 'Zeta' '\'))
+        }
+        It 'unregisters only the task in the chosen folder and leaves the same-named one alone' {
+            Set-Script -Keys 'D', 'Y', 'Q' -Lines '2'
+            $r = Get-Run
+            $r.Code | Should -Be 0 -Because $r.All
+            Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
+            Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'Backup' -and $TaskPath -eq '\B\' }
+            @($script:Sched | Where-Object { $_.TaskName -eq 'Backup' -and $_.TaskPath -eq '\A\' }).Count | Should -Be 1
+            $r.Host | Should -Match 'Deleted\.'
+            $r.Output | Should -Match 'STARE RESULT: exit code 0 - session ended, 1 change\(s\) applied'
+        }
+        It 'shows the folder in the list and in the confirmation so duplicates can be told apart' {
+            Set-Script -Keys 'D', 'N', 'Q' -Lines '1'
+            $r = Get-Run
+            $r.Host | Should -Match '\\A\\Backup'
+            $r.Host | Should -Match "Delete '\\B\\Backup'|Delete '\\A\\Backup'"
+        }
+        It 'refuses task number 0 instead of resolving it to the last task' {
+            Set-Script -Keys 'D', 'Q' -Lines '0', $null
+            $r = Get-Run
+            Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly
+            $r.Host | Should -Match 'Invalid Selection'
+            @($script:Sched).Count | Should -Be 3
+        }
+        It 'refuses a number past the end of the list, including one too large for an integer' {
+            Set-Script -Keys 'D', 'Q' -Lines '4', '99999999999', $null
+            $r = Get-Run
+            Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly
+            $r.Code | Should -Be 0 -Because $r.All
+            @($script:Sched).Count | Should -Be 3
+        }
+        It 'deletes nothing when the confirmation is declined' {
+            Set-Script -Keys 'D', 'N', 'Q' -Lines '2'
+            $r = Get-Run
+            Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly
+            $r.Host | Should -Match 'Cancelled'
+            $r.Host | Should -Not -Match 'Deleted\.'
+        }
+        It 'does not print Deleted and exits 1 when the scheduler refuses the delete' {
+            Mock Unregister-ScheduledTask { throw 'access is denied' }
+            Set-Script -Keys 'D', 'Y', 'Q' -Lines '2'
+            $r = Get-Run
+            $r.Host | Should -Not -Match 'Deleted\.'
+            $r.Host | Should -Match 'Delete failed.*access is denied'
+            $r.Code | Should -Be 1 -Because $r.All
+            $r.Output | Should -Match 'STARE RESULT: exit code 1 - 1 change\(s\) failed'
+        }
+        It 'reads the result back and does not print Deleted when the task is still registered' {
+            Mock Unregister-ScheduledTask {}
+            Set-Script -Keys 'D', 'Y', 'Q' -Lines '2'
+            $r = Get-Run
+            $r.Host | Should -Not -Match 'Deleted\.'
+            $r.Host | Should -Match 'Delete failed.*still registered'
+            $r.Code | Should -Be 1 -Because $r.All
+        }
+    }
 }

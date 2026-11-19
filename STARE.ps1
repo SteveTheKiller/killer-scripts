@@ -55,6 +55,28 @@ function Move-StareCursor {
     try { $Host.UI.RawUI.CursorPosition = New-Object System.Management.Automation.Host.Coordinates($X, $Y) } catch { }
 }
 
+function Get-StareTaskLabel {
+    # Folder plus name, so same-named tasks in different folders can be told apart.
+    param($Task)
+    if ($Task.TaskPath -and $Task.TaskPath -ne '\') { return "$($Task.TaskPath)$($Task.TaskName)" }
+    [string]$Task.TaskName
+}
+
+function Remove-StareTask {
+    # Deletes exactly one task, by folder and name. Returns $null once the task is verified gone,
+    # otherwise the reason it is not.
+    param([string]$Name, [string]$Path)
+    try {
+        Unregister-ScheduledTask -TaskName $Name -TaskPath $Path -Confirm:$false -ErrorAction Stop
+    } catch {
+        return $_.Exception.Message
+    }
+    if (@(Get-ScheduledTask -TaskName $Name -TaskPath $Path -ErrorAction SilentlyContinue).Count -gt 0) {
+        return "the task is still registered after the delete"
+    }
+    $null
+}
+
 function Get-StareScheduleService {
     $svc = New-Object -ComObject "Schedule.Service"
     $svc.Connect()
@@ -571,7 +593,7 @@ function Invoke-StareMain {
 
                 $tasks = @(Get-ScheduledTask |
                          Where-Object { $_.TaskPath -notlike "\Microsoft\*" } |
-                         Sort-Object { $_.TaskName })
+                         Sort-Object -Property TaskName, TaskPath)
 
                 $nameColWidth = $script:Width - 34
                 Write-Host ("{0,-4}"                    -f "#")          -ForegroundColor $script:SubLabelFG -NoNewline
@@ -591,7 +613,7 @@ function Invoke-StareMain {
                         $taskInfo.NextRunTime.ToString("yyyy-MM-dd HH:mm:ss")
                     } else { "N/A" }
 
-                    $displayName  = $t.TaskName
+                    $displayName  = Get-StareTaskLabel $t
                     if ($displayName.Length -gt ($nameColWidth - 3)) { $displayName = $displayName.Substring(0, ($nameColWidth - 3)) + "..." }
                     $stateColor = if ($t.State -eq 'Ready') { $script:DoneFG } else { "Red" }
 
@@ -661,19 +683,27 @@ function Invoke-StareMain {
 
                     Write-Host "Task Number to Delete: " -ForegroundColor $script:LabelFG -NoNewline
                     $idx = Read-Esc ""
+                    $delIndex = 0
 
                     if ($null -eq $idx) {
                         $waitingForDelete = $false
                         $script:RefreshRequired = $false # Bypass the slow list refresh
                     }
-                    elseif ($idx -match '^\d+$' -and $tasks[([int]$idx) - 1]) {
-                        $delTaskName = $tasks[([int]$idx) - 1].TaskName
-                        Write-Host " Delete '$delTaskName'? [Y/N]: " -ForegroundColor $script:WarnFG -NoNewline
+                    elseif ($idx -match '^\d+$' -and [int]::TryParse($idx, [ref]$delIndex) -and $delIndex -ge 1 -and $delIndex -le $tasks.Count) {
+                        $delTask = $tasks[$delIndex - 1]
+                        Write-Host " Delete '$(Get-StareTaskLabel $delTask)'? [Y/N]: " -ForegroundColor $script:WarnFG -NoNewline
                         $confirmKey = Read-StareKey
                         if ($confirmKey.Key -eq [ConsoleKey]::Y) {
-                            Unregister-ScheduledTask -TaskName $delTaskName -Confirm:$false -ErrorAction SilentlyContinue
-                            Write-Host "Deleted." -ForegroundColor $script:DoneFG
-                            Start-Sleep -Seconds 1
+                            $delError = Remove-StareTask -Name $delTask.TaskName -Path $delTask.TaskPath
+                            if ($delError) {
+                                $script:StareFailures++
+                                Write-Host "Delete failed: $delError" -ForegroundColor Red
+                                Start-Sleep -Seconds 2
+                            } else {
+                                $script:StareChanges++
+                                Write-Host "Deleted." -ForegroundColor $script:DoneFG
+                                Start-Sleep -Seconds 1
+                            }
                             $script:RefreshRequired = $true
                             $waitingForDelete = $false
                         } else {
