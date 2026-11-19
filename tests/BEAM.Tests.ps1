@@ -51,6 +51,13 @@ BeforeAll {
         foreach ($p in $Source.PSObject.Properties) { $Target | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force }
     }
 
+    function Get-FakeFilterValue {
+        # Graph rejects an OData string literal with an unescaped single quote.
+        param([string]$Raw)
+        if ($Raw -match "(?<!')'(?!')") { throw 'HTTP 400 Bad Request: invalid filter' }
+        $Raw -replace "''", "'"
+    }
+
     function Invoke-FakeGraph {
         param($Uri, $Method, $Body)
         $m = if ($Method) { "$Method".ToUpper() } else { 'GET' }
@@ -62,6 +69,7 @@ BeforeAll {
         foreach ($f in $script:G.Fail) {
             if ($f.Method -eq $m -and "$Uri" -match $f.Pattern) {
                 if ($f.Mode -eq 'throw') { throw $f.Message }
+                if ($f.Mode -eq 'noop') { return }
                 Write-Error $f.Message
                 return
             }
@@ -69,7 +77,7 @@ BeforeAll {
         $u = "$Uri" -replace '^https://graph\.microsoft\.com/(beta|v1\.0)', ''
         if ($u -match '^/deviceAppManagement/mobileApps\?\$top=1') { return [pscustomobject]@{ value = @() } }
         if ($u -match "^/deviceAppManagement/mobileApps\?\`$filter=displayName eq '(.*)'$") {
-            $n = $Matches[1] -replace "''", "'"
+            $n = Get-FakeFilterValue $Matches[1]
             return [pscustomobject]@{ value = @($script:G.Apps | Where-Object { $_.displayName -eq $n }) }
         }
         if ($u -match '^/deviceAppManagement/mobileApps$' -and $m -eq 'POST') {
@@ -105,7 +113,7 @@ BeforeAll {
             return $app
         }
         if ($u -match "^/groups\?\`$filter=displayName eq '(.*)'$") {
-            $n = $Matches[1] -replace "''", "'"
+            $n = Get-FakeFilterValue $Matches[1]
             return [pscustomobject]@{ value = @($script:G.Groups | Where-Object { $_.displayName -eq $n }) }
         }
         if ($u -match '^/groups$' -and $m -eq 'POST') {
@@ -125,11 +133,11 @@ BeforeAll {
             return [pscustomobject]@{ value = @($script:G.Members[$Matches[1]] | ForEach-Object { [pscustomobject]@{ id = $_ } }) }
         }
         if ($u -match "^/devices\?\`$filter=(displayName|deviceId) eq '(.*)'$") {
-            $prop = $Matches[1]; $val = $Matches[2] -replace "''", "'"
+            $prop = $Matches[1]; $val = Get-FakeFilterValue $Matches[2]
             return [pscustomobject]@{ value = @($script:G.Entra | Where-Object { $_.$prop -eq $val }) }
         }
         if ($u -match "^/deviceManagement/managedDevices\?\`$filter=deviceName eq '(.*)'$") {
-            $val = $Matches[1] -replace "''", "'"
+            $val = Get-FakeFilterValue $Matches[1]
             return [pscustomobject]@{ value = @($script:G.Managed | Where-Object { $_.deviceName -eq $val }) }
         }
         if ($u -match '^/deviceManagement/managedDevices/([^/]+)/syncDevice$') { return }
@@ -536,6 +544,83 @@ Context 'Finding 46: every run packages from its own staging folder' {
         { $script:r = Invoke-Deploy } | Should -Not -Throw
         ($script:r | Select-Object -Last 1) | Should -BeFalse
         ($script:Log -join "`n") | Should -Match 'FAIL\].*Unexpected error'
+    }
+}
+
+Context 'Finding 05: a rerun keeps the live deployment coherent until the new content is validated' {
+    BeforeEach {
+        Add-FakeDevice 'PC01'
+        Invoke-Deploy -RunId 'RUN-1' | Out-Null
+        $script:Live = $script:G.Apps[0]
+        $script:Before = @{ Cmd = $script:Live.installCommandLine; Rules = ($script:Live.rules | ConvertTo-Json -Depth 5 -Compress); Version = $script:Live.committedContentVersion }
+        $script:G.Calls.Clear()
+        $script:Log.Clear()
+    }
+
+    It 'sets up the first run as a committed, detectable app' {
+        $script:Before.Version | Should -Not -BeNullOrEmpty
+        (Get-AppDetectScript $script:Live) | Should -Match 'RUN-1'
+    }
+
+    It 'leaves the live command, detection and content untouched when the upload fails' {
+        Mock Send-AzureStorageBlock { throw 'storage unreachable' }
+        $r = Invoke-Deploy -RunId 'RUN-2'
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        $script:Live.installCommandLine | Should -Be $script:Before.Cmd
+        ($script:Live.rules | ConvertTo-Json -Depth 5 -Compress) | Should -Be $script:Before.Rules
+        $script:Live.committedContentVersion | Should -Be $script:Before.Version
+        (Get-FakeCalls -Method PATCH -Pattern 'mobileApps/app-\d+$').Count | Should -Be 0
+    }
+
+    It 'leaves the live deployment untouched when the file commit fails' {
+        $script:G.CommitState = 'commitFileFailed'
+        $r = Invoke-Deploy -RunId 'RUN-2'
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        $script:Live.installCommandLine | Should -Be $script:Before.Cmd
+        ($script:Live.rules | ConvertTo-Json -Depth 5 -Compress) | Should -Be $script:Before.Rules
+    }
+
+    It 'leaves the live deployment untouched and reports failure when the publishing patch is rejected' {
+        Add-FakeFailure -Method PATCH -Pattern 'mobileApps/app-\d+$'
+        $r = Invoke-Deploy -RunId 'RUN-2'
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        $script:Live.installCommandLine | Should -Be $script:Before.Cmd
+        ($script:Live.rules | ConvertTo-Json -Depth 5 -Compress) | Should -Be $script:Before.Rules
+        $script:Live.committedContentVersion | Should -Be $script:Before.Version
+    }
+
+    It 'does not report published when the patch is accepted but did not take effect' {
+        Add-FakeFailure -Method PATCH -Pattern 'mobileApps/app-\d+$' -Mode noop
+        $r = Invoke-Deploy -RunId 'RUN-2'
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        ($script:Log -join "`n") | Should -Not -Match 'OK\] App version committed'
+    }
+
+    It 'publishes command, detection and content together in one patch after the file is committed' {
+        $r = Invoke-Deploy -RunId 'RUN-2'
+        ($r | Select-Object -Last 1) | Should -BeTrue
+        $patches = @(Get-FakeCalls -Method PATCH -Pattern 'mobileApps/app-\d+$')
+        $patches.Count | Should -Be 1
+        $commitIdx = [array]::IndexOf(@($script:G.Calls | ForEach-Object { $_.Uri }), (Get-FakeCalls -Method POST -Pattern '/commit$')[0].Uri)
+        $patchIdx = [array]::IndexOf(@($script:G.Calls), $patches[0])
+        $patchIdx | Should -BeGreaterThan $commitIdx
+        $script:Live.committedContentVersion | Should -Not -Be $script:Before.Version
+        (Get-AppDetectScript $script:Live) | Should -Match 'RUN-2'
+        (Get-AppInstallScript $script:Live) | Should -Match 'RUN-2'
+    }
+
+    It 'reuses the app instead of creating a duplicate when its name contains an apostrophe' {
+        Invoke-Deploy -AppName "O'Neil Tool" -RunId 'RUN-A' | Out-Null
+        Invoke-Deploy -AppName "O'Neil Tool" -RunId 'RUN-B' | Out-Null
+        @($script:G.Apps | Where-Object { $_.displayName -eq "O'Neil Tool (BEAM)" }).Count | Should -Be 1
+    }
+
+    It 'stops instead of creating a duplicate app when the existing-app lookup fails' {
+        Add-FakeFailure -Method GET -Pattern 'mobileApps\?\$filter' -Mode throw -Message 'HTTP 429 Too Many Requests'
+        $r = Invoke-Deploy -RunId 'RUN-2'
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        $script:G.Apps.Count | Should -Be 1
+        ($script:Log -join "`n") | Should -Match 'FAIL\].*429'
     }
 }
 }

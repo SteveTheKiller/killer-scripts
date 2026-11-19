@@ -925,6 +925,18 @@ if ((Test-Path `$m) -and ((Get-Content `$m -Raw -ErrorAction SilentlyContinue).T
 exit 1
 "@
     $detectB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($detectScript))
+    $detectRules = @(
+        @{
+            "@odata.type"         = "#microsoft.graph.win32LobAppPowerShellScriptRule"
+            ruleType              = "detection"
+            enforceSignatureCheck = $false
+            runAs32Bit            = $false
+            scriptContent         = $detectB64
+            operationType         = "notConfigured"
+            operator              = "notConfigured"
+            comparisonValue       = $null
+        }
+    )
 
     # The install command is one powershell.exe -EncodedCommand (see New-BeamInstallScript).
     $installScript = New-BeamInstallScript -SetupFile $SetupFile -InstallArgs $InstallArgs -IsMsi $IsMsi -MarkerDir $markerDir -MarkerPath $markerPath -RunId $runId
@@ -936,36 +948,22 @@ exit 1
     if ($IsMsi) { $uninstallCmd = "msiexec /x `"$SetupFile`" /qn" } else { $uninstallCmd = "cmd /c exit 0" }
 
     $app = $null
+    $odataName = $appDisplayName -replace "'", "''"
     try {
-        $existingApp = Invoke-RestMethod "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps?`$filter=displayName eq '$appDisplayName'" -Headers $h -ErrorAction Stop
+        $existingApp = Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps?`$filter=displayName eq '$odataName'" $h
         $app = $existingApp.value | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.win32LobApp' } | Select-Object -First 1
-    } catch { }
+    } catch {
+        # Carrying on would create a second app with the same name, so stop instead.
+        Write-StepUpdate "Could not look up an existing app named '$appDisplayName': $_" FAIL
+        return $false
+    }
 
     if ($app) {
         Write-StepUpdate "Reusing existing app: $($app.displayName) ($($app.id))" OK
         Write-StepUpdate "Adding a new content version to the existing app..." INFO
-        # Update BOTH the install command and the detection rule to this run's ID. Patching only the
-        # command would leave the old run ID in detection, so the prior marker would still satisfy it
-        # and the re-run would never fire. Both must carry the new run ID.
-        try {
-            $fixBody = @{
-                "@odata.type"      = "#microsoft.graph.win32LobApp"
-                installCommandLine = $installCmd
-                rules = @(
-                    @{
-                        "@odata.type"         = "#microsoft.graph.win32LobAppPowerShellScriptRule"
-                        ruleType              = "detection"
-                        enforceSignatureCheck = $false
-                        runAs32Bit            = $false
-                        scriptContent         = $detectB64
-                        operationType         = "notConfigured"
-                        operator              = "notConfigured"
-                        comparisonValue       = $null
-                    }
-                )
-            } | ConvertTo-Json -Depth 10
-            Invoke-RestMethod "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)" -Method PATCH -Headers $h -Body ([System.Text.Encoding]::UTF8.GetBytes($fixBody)) -ContentType "application/json; charset=utf-8" | Out-Null
-        } catch { }
+        # The live install command and detection rule are NOT touched here. They change together with
+        # the committed content version in one patch, only after the new content is uploaded and
+        # committed. Until then devices keep a coherent command, detection and package.
     }
     if (-not $app) {
     Write-StepUpdate "Creating Win32 app in Intune..." INFO
@@ -994,18 +992,7 @@ exit 1
             @{ returnCode = 1618; type = "retry"      }
             @{ returnCode = 1603; type = "failed"     }
         )
-        rules = @(
-            @{
-                "@odata.type"         = "#microsoft.graph.win32LobAppPowerShellScriptRule"
-                ruleType              = "detection"
-                enforceSignatureCheck = $false
-                runAs32Bit            = $false
-                scriptContent         = $detectB64
-                operationType         = "notConfigured"
-                operator              = "notConfigured"
-                comparisonValue       = $null
-            }
-        )
+        rules = $detectRules
     } | ConvertTo-Json -Depth 10
     try {
         # UTF-8 bytes: the display name / description / publisher can contain non-ASCII, and PS 5.1
@@ -1063,9 +1050,26 @@ exit 1
     catch { Write-StepUpdate "Waiting for the file commit failed: $_" FAIL; return $false }
     Write-StepUpdate "File committed" OK
 
-    $patchBody = @{ "@odata.type" = "#microsoft.graph.win32LobApp"; committedContentVersion = $cv.id } | ConvertTo-Json
-    try { Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)" $h PATCH $patchBody | Out-Null }
-    catch { Write-StepUpdate "Committing the app version failed: $_" FAIL; return $false }
+    # One patch publishes the new install command, uninstall command, detection rule and committed
+    # content version together, and only now that the content is uploaded and committed. It is then
+    # read back, so a patch that was accepted but did not take effect is not reported as published.
+    $patchBody = @{
+        "@odata.type"           = "#microsoft.graph.win32LobApp"
+        fileName                = $SetupFile
+        setupFilePath           = $SetupFile
+        installCommandLine      = $installCmd
+        uninstallCommandLine    = $uninstallCmd
+        rules                   = $detectRules
+        committedContentVersion = $cv.id
+    } | ConvertTo-Json -Depth 10
+    try {
+        Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)" $h PATCH $patchBody | Out-Null
+        $live = Invoke-BeamGraph "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($app.id)" $h
+    } catch { Write-StepUpdate "Committing the app version failed: $_" FAIL; return $false }
+    if ("$($live.committedContentVersion)" -ne "$($cv.id)" -or $live.installCommandLine -ne $installCmd) {
+        Write-StepUpdate "Committing the app version failed: Intune did not apply the new content version and install command." FAIL
+        return $false
+    }
     Write-StepUpdate "App version committed" OK
 
     $groupName = "BEAM-$safeName"
