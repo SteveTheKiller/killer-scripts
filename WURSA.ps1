@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v3.0
-    Developed by Steve the Killer | Updated: 2026-10-16
+    Windows Update, Repair, & System Alignment (W.U.R.S.A.) v4.0
+    Developed by Steve the Killer | Updated: 2026-11-18
 .DESCRIPTION
     Enforces OS patches, OEM driver updates, and Chocolatey third-party app upgrades
     (skips in-use apps). Performs unattended feature upgrades to 26H2, dispatched to a
@@ -11,10 +11,17 @@
 .NOTES
     Params: -InplaceUpgrade (auto-confirm, unattended/RMM), -No3rdParty, -NoUpgrade.
     Feature-upgrade result is written to C:\Windows\Temp\25H2IPU\ipu_status.txt; poll it.
-    Status: REBOOT_REQUIRED (staged, reboot to finish), DISPATCHED/RUNNING/DOWNLOADING/
-    REPAIRING/VERIFY_PENDING/WU_HANDOFF (upgrade active), VERIFIED (committed), BLOCK_*/FAILED_*/
-    UNEXPECTED (not complete).
-    Only REBOOT_REQUIRED should trigger a reboot, always left to the caller.
+    Status: REBOOT_REQUIRED (staged, reboot to finish; REBOOT_REQUIRED_UNARMED means the post-reboot
+    verifier could not be registered, so run WURSA again after the reboot), DISPATCHED/RUNNING/
+    DOWNLOADING/REPAIRING/VERIFY_PENDING/WU_HANDOFF (upgrade active), VERIFIED (committed),
+    BLOCK_*/FAILED_*/UNEXPECTED (not complete). FAILED IA_SIGNATURE means the Installation
+    Assistant failed its Microsoft signature check and was not run.
+    Only REBOOT_REQUIRED* should trigger a reboot, always left to the caller.
+    Exit codes: 0 success or upgrade in progress, 1 failure (including a failed upgrade, a failed
+    update scan, or nothing succeeded), 2 not elevated, 3 partial success (some updates installed,
+    some failed), 3010 reboot required. A failed feature upgrade outranks 3010, which outranks 3.
+    The Windows Update policy is opened only for the run and rolled back, verified, if the upgrade
+    is not dispatched; a power source that cannot be read blocks the upgrade (BLOCKED_POWER_UNKNOWN).
 #>
 param(
     [switch]$InplaceUpgrade,   # Auto-confirm the feature upgrade prompt (implies -Update3rdParty)
@@ -23,7 +30,7 @@ param(
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
 
-$_ver    = "| v3.0"
+$_ver    = "| v4.0"
 
 # Define the latest known Windows release
 $LatestVersion = "26H2"
