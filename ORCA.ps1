@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Outlook Repair & Configuration Assistant (ORCA) v2.1
-    Developed by SteveTheKiller | Updated: 2026-03-13
+    Outlook Repair & Configuration Assistant (ORCA) v2.2
+    Developed by SteveTheKiller | Updated: 2026-11-18
 .DESCRIPTION
     Resets broken Outlook installations for one or all user profiles.
     Supports New Outlook (Microsoft Store), Classic Outlook (Office/M365),
@@ -123,7 +123,7 @@ function Clear-OrcaScreen {
 #region [1] - BANNER & DISPLAY HELPERS
 # ============================================================================
 $script:Width  = 85
-$_ver    = "| v2.1"
+$_ver    = "| v2.2"
 $LineCol   = "DarkCyan"
 $MainCol   = "Cyan"
 $WarnCol   = "DarkYellow"
