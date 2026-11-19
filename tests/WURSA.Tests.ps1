@@ -12,7 +12,8 @@ BeforeAll {
     foreach ($fn in 'Invoke-WursaNative', 'Invoke-WursaChoco', 'Save-WursaFile', 'Expand-WursaZip',
                     'Invoke-WursaScriptFile', 'Invoke-WursaRestorePoint', 'Register-WursaProductService',
                     'New-WursaUpdateSession', 'New-WursaUpdateColl', 'Get-WursaPowerLineStatus',
-                    'Get-WursaPolicyValue', 'Set-WursaPolicyValue', 'Remove-WursaPolicyValue', 'Initialize-WursaPolicyKey') {
+                    'Get-WursaPolicyValue', 'Set-WursaPolicyValue', 'Remove-WursaPolicyValue', 'Initialize-WursaPolicyKey',
+                    'Get-WursaTaskState', 'Get-WursaLastBoot', 'New-WursaDispatchMutex') {
         $name = $fn
         Mock $name { throw "UNMOCKED WURSA BOUNDARY: $name" }.GetNewClosure()
     }
@@ -898,5 +899,254 @@ Describe 'Reboot status and the verifier arming (finding 43)' {
         $r = Resolve-WursaFinalStatus -NoUpgrade $false -FinalBuild 26100 -FinalVersion '25H2' -FeatureUpgradeState 'DISPATCHED' -IpuState 'REBOOT_REQUIRED_UNARMED 3010 x' -RebootPending $false
         $r.Code | Should -Be 3010
         ($r.Lines | ForEach-Object { $_.Text }) -join "`n" | Should -Match 'run WURSA again'
+    }
+}
+
+Describe 'Dispatch gate (finding 32)' {
+    BeforeEach {
+        $script:Work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:Work | Out-Null
+        $script:StatusFile = Join-Path $script:Work 'ipu_status.txt'
+        $script:Boot = (Get-Date).AddHours(-2)
+        $script:TaskState = $null
+        Mock Get-WursaTaskState { $script:TaskState }
+        Mock Get-WursaLastBoot { $script:Boot }
+        Mock Get-WursaDirectoryProblem { $null }
+    }
+
+    It 'sees a running task as active, whatever language the OS speaks' {
+        $script:TaskState = 'Running'
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeTrue
+    }
+
+    It 'does not treat a stale in-progress status with no running task as active' {
+        Set-Content -LiteralPath $script:StatusFile -Value 'RUNNING DOWNLOADING 2026-01-01 00:00:00'
+        $script:TaskState = 'Ready'
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeFalse
+    }
+
+    It 'treats a reboot-required status written since the last boot as active, so it is not redispatched' {
+        Set-Content -LiteralPath $script:StatusFile -Value 'REBOOT_REQUIRED 3010 x'
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeTrue
+    }
+
+    It 'does not block on a reboot-required status that predates the last boot' {
+        Set-Content -LiteralPath $script:StatusFile -Value 'REBOOT_REQUIRED 3010 x'
+        $script:Boot = (Get-Date).AddMinutes(10)
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeFalse
+    }
+
+    It 'ignores a status file in a directory that is not protected' {
+        Set-Content -LiteralPath $script:StatusFile -Value 'REBOOT_REQUIRED 3010 x'
+        Mock Get-WursaDirectoryProblem { 'acl: Users can write' }
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeFalse
+    }
+
+    Context 'Invoke-WursaDispatch' {
+        BeforeEach {
+            $script:Events = New-Object System.Collections.ArrayList
+            $script:Native = New-Object System.Collections.ArrayList
+            $script:WaitResult = $true
+            $script:WaitThrows = $false
+            function script:New-FakeMutex {
+                $m = [pscustomobject]@{}
+                $m | Add-Member -MemberType ScriptMethod -Name WaitOne -Value { param($ms) [void]$script:Events.Add('wait'); if ($script:WaitThrows) { throw (New-Object System.Threading.AbandonedMutexException) } $script:WaitResult }
+                $m | Add-Member -MemberType ScriptMethod -Name ReleaseMutex -Value { [void]$script:Events.Add('release') }
+                $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+                $m
+            }
+            Mock New-WursaDispatchMutex { New-FakeMutex }
+            Mock Test-WursaDispatchActive { [pscustomobject]@{ Active = $false; Reason = '' } }
+            $script:NativeExit = @{}
+            Mock Invoke-WursaNative { [void]$script:Native.Add(($Arguments -join ' ')); $code = 0; if ($script:NativeExit.ContainsKey($Arguments[0])) { $code = $script:NativeExit[$Arguments[0]] }; [pscustomobject]@{ ExitCode = $code; Output = @('x') } }
+            $script:Prepared = 0
+        }
+
+        It 'prepares, registers and starts the task, then releases the lock' {
+            $r = Invoke-WursaDispatch -TaskName 'T' -RunnerPath 'C:\r.ps1' -StatusFile $script:StatusFile -WorkDir $script:Work -Prepare { $script:Prepared++ }
+            $r.State | Should -Be 'DISPATCHED'
+            $script:Prepared | Should -Be 1
+            ($script:Native -join "`n") | Should -Match '/Create'
+            ($script:Native -join "`n") | Should -Match '/Run'
+            $script:Events[-1] | Should -Be 'release'
+            (Get-Content -LiteralPath $script:StatusFile) | Should -Match '^DISPATCHED'
+        }
+
+        It 'passes the task command as one argument' {
+            Invoke-WursaDispatch -TaskName 'T' -RunnerPath 'C:\Program Files\r.ps1' -StatusFile $script:StatusFile -WorkDir $script:Work -Prepare { } | Out-Null
+            Should -Invoke Invoke-WursaNative -ParameterFilter { $Arguments[0] -eq '/Create' -and ($Arguments | Where-Object { $_ -like 'powershell.exe*-File*r.ps1' }).Count -eq 1 }
+        }
+
+        It 'does not write any file, register or start anything when a dispatch is already active' {
+            Mock Test-WursaDispatchActive { [pscustomobject]@{ Active = $true; Reason = 'task running' } }
+            $r = Invoke-WursaDispatch -TaskName 'T' -RunnerPath 'C:\r.ps1' -StatusFile $script:StatusFile -WorkDir $script:Work -Prepare { $script:Prepared++ }
+            $r.State | Should -Be 'ALREADY_ACTIVE'
+            $script:Prepared | Should -Be 0
+            $script:Native.Count | Should -Be 0
+            Test-Path -LiteralPath $script:StatusFile | Should -BeFalse
+            $script:Events[-1] | Should -Be 'release'
+        }
+
+        It 'reports ALREADY_ACTIVE when another dispatch holds the lock' {
+            $script:WaitResult = $false
+            $r = Invoke-WursaDispatch -TaskName 'T' -RunnerPath 'C:\r.ps1' -StatusFile $script:StatusFile -WorkDir $script:Work -Prepare { $script:Prepared++ }
+            $r.State | Should -Be 'ALREADY_ACTIVE'
+            $script:Prepared | Should -Be 0
+            $script:Events | Should -Not -Contain 'release'
+        }
+
+        It 'treats an abandoned lock as acquired' {
+            $script:WaitThrows = $true
+            $r = Invoke-WursaDispatch -TaskName 'T' -RunnerPath 'C:\r.ps1' -StatusFile $script:StatusFile -WorkDir $script:Work -Prepare { }
+            $r.State | Should -Be 'DISPATCHED'
+            $script:Events[-1] | Should -Be 'release'
+        }
+
+        It 'records FAILED TASK_CREATE when the task cannot be created' {
+            $script:NativeExit['/Create'] = 1
+            $r = Invoke-WursaDispatch -TaskName 'T' -RunnerPath 'C:\r.ps1' -StatusFile $script:StatusFile -WorkDir $script:Work -Prepare { }
+            $r.State | Should -Be 'FAILED'
+            (Get-Content -LiteralPath $script:StatusFile) | Should -Match '^FAILED TASK_CREATE'
+        }
+
+        It 'records FAILED TASK_START when the task cannot be started' {
+            $script:NativeExit['/Run'] = 1
+            $r = Invoke-WursaDispatch -TaskName 'T' -RunnerPath 'C:\r.ps1' -StatusFile $script:StatusFile -WorkDir $script:Work -Prepare { }
+            $r.State | Should -Be 'FAILED'
+            (Get-Content -LiteralPath $script:StatusFile) | Should -Match '^FAILED TASK_START'
+        }
+    }
+}
+
+Describe 'Final status for an upgrade that is already running (finding 32)' {
+    It 'reports IN PROGRESS with exit 0' {
+        $r = Resolve-WursaFinalStatus -NoUpgrade $false -FinalBuild 26100 -FinalVersion '25H2' -FeatureUpgradeState 'ALREADY_ACTIVE' -IpuState 'RUNNING x' -RebootPending $true
+        $r.Code | Should -Be 0
+        ($r.Lines | ForEach-Object { $_.Text }) -join "`n" | Should -BeLike '*IN PROGRESS*'
+    }
+}
+
+Describe 'Policy ownership and rollback (finding 29)' {
+    BeforeEach {
+        $script:Work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:Work | Out-Null
+        $IPU_AURestoreFile = Join-Path $script:Work 'au_restore.txt'
+        $script:Original = @{
+            "$script:Auk|NoAutoUpdate" = 1; "$script:Auk|AUOptions" = 2
+            "$script:Polk|SetActiveHours" = 0
+        }
+        Initialize-FakePolicyRegistry -Initial $script:Original
+        Mock Write-Host { }
+        Mock Restart-Service { }
+    }
+
+    It 'records the originals once, opens the policy, and owns the record it created' {
+        $r = Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting $false
+        $r.Owned | Should -BeTrue
+        (Get-Content -LiteralPath $IPU_AURestoreFile) | Should -Contain 'NoAutoUpdate=1'
+        (Get-Content -LiteralPath $IPU_AURestoreFile) | Should -Contain 'ActiveHoursStart=ABSENT'
+        $script:Reg["$script:Auk|NoAutoUpdate"] | Should -Be 0
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 4
+    }
+
+    It 'does not own a record that already exists and does not overwrite its originals' {
+        Set-Content -LiteralPath $IPU_AURestoreFile -Value @('NoAutoUpdate=ABSENT')
+        $r = Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting $false
+        $r.Owned | Should -BeFalse
+        (Get-Content -LiteralPath $IPU_AURestoreFile) | Should -Be 'NoAutoUpdate=ABSENT'
+    }
+
+    It 'adopts a leftover record when nothing is running, keeping its originals' {
+        Set-Content -LiteralPath $IPU_AURestoreFile -Value @('NoAutoUpdate=ABSENT')
+        $r = Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting $true
+        $r.Owned | Should -BeTrue
+        (Get-Content -LiteralPath $IPU_AURestoreFile) | Should -Be 'NoAutoUpdate=ABSENT'
+    }
+
+    It 'rolls its own changes back when the upgrade was not dispatched' {
+        Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting $false | Out-Null
+        $script:PolicyOwned = $true; $script:FeatureUpgradeState = 'NOT_STARTED'
+        Undo-WursaOwnedPolicy
+        $script:Reg["$script:Auk|NoAutoUpdate"] | Should -Be 1
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 2
+        $script:Reg.ContainsKey("$script:Polk|ActiveHoursStart") | Should -BeFalse
+        Test-Path -LiteralPath $IPU_AURestoreFile | Should -BeFalse
+    }
+
+    It 'leaves the overrides in place once the runner owns them (DISPATCHED)' {
+        Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting $false | Out-Null
+        $script:PolicyOwned = $true; $script:FeatureUpgradeState = 'DISPATCHED'
+        Undo-WursaOwnedPolicy
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 4
+        Test-Path -LiteralPath $IPU_AURestoreFile | Should -BeTrue
+    }
+
+    It 'never undoes a record it does not own' {
+        Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting $false | Out-Null
+        $script:PolicyOwned = $false; $script:FeatureUpgradeState = 'NOT_STARTED'
+        Undo-WursaOwnedPolicy
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 4
+        Test-Path -LiteralPath $IPU_AURestoreFile | Should -BeTrue
+    }
+
+    It 'keeps the record when the rollback does not verify' {
+        Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting $false | Out-Null
+        $script:FailSet = @('AUOptions')
+        $script:PolicyOwned = $true; $script:FeatureUpgradeState = 'BLOCKED_BATTERY'
+        Undo-WursaOwnedPolicy
+        Test-Path -LiteralPath $IPU_AURestoreFile | Should -BeTrue
+    }
+}
+
+Describe 'Policy rollback in a full run (finding 29)' {
+    BeforeEach {
+        Set-MainMocks -Build 26100 -Version '24H2'
+        $script:Work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:Work | Out-Null
+        Mock Get-WursaWorkDir { $script:Work }
+        Mock Confirm-WursaWorkDir { $true }
+        Mock Get-WursaDirectoryProblem { $null }
+        Mock Test-WursaDispatchActive { [pscustomobject]@{ Active = $false; Reason = '' } }
+        Mock Get-WursaPowerState { 'AC' }
+        Initialize-FakePolicyRegistry -Initial @{ "$script:Auk|NoAutoUpdate" = 1; "$script:Auk|AUOptions" = 2 }
+        $script:Rec = Join-Path $script:Work 'au_restore.txt'
+        $InplaceUpgrade = [switch]$true; $No3rdParty = [switch]$true; $NoUpgrade = [switch]$false
+    }
+
+    It 'restores the policy when the battery blocks the upgrade' {
+        Mock Get-WursaPowerState { 'Battery' }
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 1
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 2
+        [System.IO.File]::Exists($script:Rec) | Should -BeFalse
+    }
+
+    It 'restores the policy when the task cannot be created or started' {
+        Mock Invoke-WursaDispatch { [pscustomobject]@{ State = 'FAILED'; Message = 'create failed' } }
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 1
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 2
+        [System.IO.File]::Exists($script:Rec) | Should -BeFalse
+    }
+
+    It 'restores the policy after an unexpected error' {
+        Mock Invoke-WursaDispatch { throw 'surprise' }
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 1
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 2
+        [System.IO.File]::Exists($script:Rec) | Should -BeFalse
+    }
+
+    It 'keeps the overrides for the runner once the upgrade is dispatched' {
+        Mock Invoke-WursaDispatch { [pscustomobject]@{ State = 'DISPATCHED'; Message = '' } }
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 0
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 4
+        [System.IO.File]::Exists($script:Rec) | Should -BeTrue
+    }
+
+    It 'leaves a live runner alone and reports it as in progress' {
+        Set-Content -LiteralPath $script:Rec -Value @('NoAutoUpdate=1', 'AUOptions=2')
+        Mock Test-WursaDispatchActive { [pscustomobject]@{ Active = $true; Reason = 'task running' } }
+        Mock Invoke-WursaDispatch { [pscustomobject]@{ State = 'ALREADY_ACTIVE'; Message = 'task running' } }
+        Get-ExitCode { Invoke-WursaMain } | Should -Be 0
+        [System.IO.File]::Exists($script:Rec) | Should -BeTrue
+        ($script:said -join "`n") | Should -Match 'IN PROGRESS'
     }
 }

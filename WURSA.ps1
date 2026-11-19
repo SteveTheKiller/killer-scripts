@@ -812,6 +812,146 @@ function Get-WursaVerifierScript {
         "exit (Invoke-WursaVerifyRun -StatusFile '$StatusFile' -RestoreFile '$RestoreFile' -VerifyTaskName '$VerifyTaskName' -TargetBuild $TargetBuild)`r`n"
 }
 
+function Get-WursaWorkDir { 'C:\Windows\Temp\25H2IPU' }
+
+function Get-WursaTaskState {
+    # The scheduled task's State as text ('Running', 'Ready', 'Disabled', ...), or $null when it does not
+    # exist. The State enum is not localized, unlike schtasks.exe output.
+    param([string]$TaskName)
+    try { return [string](Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop).State } catch { return $null }
+}
+
+function Get-WursaLastBoot {
+    try { return (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { return $null }
+}
+
+function New-WursaDispatchMutex {
+    New-Object System.Threading.Mutex($false, 'Global\WURSA-IPU-Dispatch')
+}
+
+function Test-WursaDispatchActive {
+    # A feature-upgrade dispatch is active when its task is running, or when its status file (read only from
+    # a protected directory) says a reboot is needed and was written since the last boot. Any other state
+    # with no running task is a stale leftover and may be recovered.
+    param([string]$TaskName, [string]$WorkDir, [string]$StatusFile)
+    $res = [pscustomobject]@{ Active = $false; Reason = '' }
+    if ((Get-WursaTaskState -TaskName $TaskName) -eq 'Running') {
+        $res.Active = $true; $res.Reason = "task $TaskName is running"
+        return $res
+    }
+    try {
+        if (-not (Get-WursaDirectoryProblem -Path $WorkDir) -and [System.IO.File]::Exists($StatusFile)) {
+            $first = [string]([System.IO.File]::ReadAllLines($StatusFile) | Select-Object -First 1)
+            $boot = Get-WursaLastBoot
+            if ($first.Trim() -match '^REBOOT_REQUIRED' -and $boot -and [System.IO.File]::GetLastWriteTime($StatusFile) -gt $boot) {
+                $res.Active = $true; $res.Reason = 'an upgrade is staged and waiting for a reboot'
+            }
+        }
+    } catch {}
+    $res
+}
+
+function Invoke-WursaDispatch {
+    # Dispatches the detached upgrade under a machine-wide lock so two runs cannot both register the task.
+    # The active check, the file writes (-Prepare) and the task registration all happen inside the lock, so a
+    # live runner's files are never overwritten. Returns @{ State = DISPATCHED | FAILED | ALREADY_ACTIVE; Message }.
+    param([string]$TaskName, [string]$RunnerPath, [string]$StatusFile, [string]$WorkDir, [scriptblock]$Prepare)
+    $res = [pscustomobject]@{ State = 'FAILED'; Message = '' }
+    $mutex = New-WursaDispatchMutex
+    $held = $false
+    try {
+        try {
+            $held = [bool]$mutex.WaitOne(15000)
+        } catch {
+            # A previous owner died holding the lock: that still means we own it now. PowerShell wraps the
+            # .NET exception, so walk the chain instead of relying on a typed catch.
+            $e = $_.Exception
+            while ($e) {
+                if ($e -is [System.Threading.AbandonedMutexException]) { $held = $true; break }
+                $e = $e.InnerException
+            }
+            if (-not $held) { throw }
+        }
+        if (-not $held) {
+            $res.State = 'ALREADY_ACTIVE'; $res.Message = 'another WURSA run is dispatching the upgrade'
+            return $res
+        }
+        $act = Test-WursaDispatchActive -TaskName $TaskName -WorkDir $WorkDir -StatusFile $StatusFile
+        if ($act.Active) {
+            $res.State = 'ALREADY_ACTIVE'; $res.Message = $act.Reason
+            return $res
+        }
+        if ($Prepare) { & $Prepare }
+        $stamp = { Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+        Write-WursaStatusFile -Path $StatusFile -Text ('DISPATCHED ' + (& $stamp))
+        $tr = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $RunnerPath"
+        $create = Invoke-WursaNative -FilePath 'schtasks.exe' -Arguments @('/Create', '/TN', $TaskName, '/TR', $tr, '/SC', 'ONCE', '/ST', '00:00', '/RU', 'SYSTEM', '/RL', 'HIGHEST', '/F')
+        if ($create.ExitCode -ne 0) {
+            Write-WursaStatusFile -Path $StatusFile -Text ('FAILED TASK_CREATE ' + (& $stamp))
+            $res.Message = "Failed to register scheduled task: $($create.Output -join ' ')"
+            return $res
+        }
+        $run = Invoke-WursaNative -FilePath 'schtasks.exe' -Arguments @('/Run', '/TN', $TaskName)
+        if ($run.ExitCode -ne 0) {
+            Write-WursaStatusFile -Path $StatusFile -Text ('FAILED TASK_START ' + (& $stamp))
+            $res.Message = "Task created but failed to start: $($run.Output -join ' ')"
+            return $res
+        }
+        $res.State = 'DISPATCHED'
+        return $res
+    } finally {
+        if ($held) { try { $mutex.ReleaseMutex() } catch {} }
+        try { $mutex.Dispose() } catch {}
+    }
+}
+
+function Open-WursaUpdatePolicy {
+    # Opens the Windows Update policy for the update pass. The original values are recorded once, in the
+    # format Restore-WursaPolicyRecord reads. Returns @{ Owned } where Owned says whether this run created
+    # (or, with -AdoptExisting, took over a leftover) record and so must roll it back if the upgrade is not
+    # dispatched. A record that already exists belongs to a live runner and is never overwritten or undone.
+    param([string]$RecordFile, [int]$ActiveHoursStart, [int]$ActiveHoursEnd, [bool]$AdoptExisting)
+    $polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auk  = $polk + '\AU'
+    Initialize-WursaPolicyKey -Key $polk
+    Initialize-WursaPolicyKey -Key $auk
+    $owned = $false
+    if (-not [System.IO.File]::Exists($RecordFile)) {
+        $rec = New-Object System.Collections.ArrayList
+        foreach ($item in @(@('NoAutoUpdate', $auk), @('AUOptions', $auk), @('SetActiveHours', $polk), @('ActiveHoursStart', $polk), @('ActiveHoursEnd', $polk))) {
+            $v = Get-WursaPolicyValue -Key $item[1] -Name $item[0]
+            [void]$rec.Add("$($item[0])=$(if ($null -eq $v) { 'ABSENT' } else { $v })")
+        }
+        [System.IO.File]::WriteAllLines($RecordFile, [string[]]@($rec), [System.Text.Encoding]::ASCII)
+        $owned = $true
+    } elseif ($AdoptExisting) {
+        $owned = $true
+    }
+    # NoAutoUpdate=0 alone does not release a pending feature update on the re-keyed Enterprise-composition
+    # boxes; AUOptions=4 (auto download + schedule install) is what actually moves it. Pin active hours so
+    # any WU-driven reboot lands out of hours.
+    Set-WursaPolicyValue -Key $auk  -Name 'NoAutoUpdate'     -Value 0 -Type 'DWord'
+    Set-WursaPolicyValue -Key $auk  -Name 'AUOptions'        -Value 4 -Type 'DWord'
+    Set-WursaPolicyValue -Key $polk -Name 'SetActiveHours'   -Value 1 -Type 'DWord'
+    Set-WursaPolicyValue -Key $polk -Name 'ActiveHoursStart' -Value $ActiveHoursStart -Type 'DWord'
+    Set-WursaPolicyValue -Key $polk -Name 'ActiveHoursEnd'   -Value $ActiveHoursEnd -Type 'DWord'
+    [pscustomobject]@{ Owned = $owned }
+}
+
+function Undo-WursaOwnedPolicy {
+    # Rolls back the policy changes this run made, unless the detached runner now owns them (DISPATCHED) or
+    # the record is not ours. Uses the verified restore; if it does not stick the record is kept for the
+    # next run to adopt and retry.
+    if (-not $script:PolicyOwned) { return }
+    if ($script:FeatureUpgradeState -eq 'DISPATCHED') { return }
+    if (Restore-WursaPolicyRecord -RecordFile $IPU_AURestoreFile) {
+        $script:PolicyOwned = $false
+        Write-Host "      Windows Update policy returned to its original values (the upgrade was not dispatched)." -ForegroundColor $DimCol
+    } else {
+        Write-Host "      [!] Could not fully restore the Windows Update policy values; the record is kept and the next run will retry." -ForegroundColor $WarnCol
+    }
+}
+
 function Get-WursaPowerState {
     # 'AC', 'Battery' or 'Unknown'. The OS power line is trusted first. When it cannot say, the battery
     # status decides: no battery means a desktop on AC; any AC-ish battery means AC (BatteryStatus 2 and 3
@@ -1474,6 +1614,11 @@ function Resolve-WursaFinalStatus {
         & $add "[!] STATUS: $LatestVersion FEATURE UPGRADE NOT COMPLETE" "Red"
         & $add "      Upgrade state: $FeatureUpgradeState" $WarnCol
         $code = 1
+    } elseif ($FeatureUpgradeState -eq "ALREADY_ACTIVE") {
+        & $add "[>] STATUS: $LatestVersion FEATURE UPGRADE IN PROGRESS (already running)" $WarnCol
+        if ($IpuState) { & $add "      Upgrade state: $IpuState" $DimCol }
+        $code = 0
+        $upgradeActive = $true
     } elseif ($FeatureUpgradeState -eq "DISPATCHED") {
         if ($IpuState -match '^REBOOT_REQUIRED') {
             & $add "[!] STATUS: REBOOT REQUIRED TO FINISH $LatestVersion" "Red"
@@ -1534,6 +1679,7 @@ function Invoke-WursaMain {
 trap {
     if ($_.Exception.Message -like 'KILLERSCRIPT_EXIT:*') { throw $_ }
     Write-Host "[!] Fatal: $($_.Exception.Message)" -ForegroundColor Red
+    try { Undo-WursaOwnedPolicy } catch {}
     Write-Host "[!] STATUS: FAILED" -ForegroundColor Red
     Exit-KillerScript 1
 }
@@ -1548,6 +1694,7 @@ $script:StepOpen = $false
 $script:FeatureUpdateStaged = $false
 $script:FeatureUpgradeState = "UNKNOWN"
 $script:WorkDirChecked = $null
+$script:PolicyOwned = $false
 $ProgressPreference = 'SilentlyContinue'   # suppress console-wide progress overlays (VSS/BITS/Invoke-WebRequest)
 
 #region 0 - Pre-Flight
@@ -1620,41 +1767,19 @@ try {
 # can pre-download the feature update in parallel and race the deterministic ISO/eKB path. Enterprise
 # and ARM64 fallback paths explicitly start USO later only when Windows Update is the
 # selected upgrade mechanism. Original policy values are recorded for restoration.
-$IPU_WorkDir          = "C:\Windows\Temp\25H2IPU"
+$IPU_WorkDir          = Get-WursaWorkDir
 $IPU_AURestoreFile    = Join-Path $IPU_WorkDir "au_restore.txt"
+$IPU_StatusFile        = Join-Path $IPU_WorkDir "ipu_status.txt"
+$IPU_TaskName          = "WURSA-25H2-IPU"
 $IPU_ActiveHoursStart = 7     # WU will not auto-reboot the feature update between these hours (0-23, max 18h span)
 $IPU_ActiveHoursEnd   = 19
 if (-not $NoUpgrade -and $WinBuild -lt $LatestBuild -and -not (Confirm-WursaWorkDir -Path $IPU_WorkDir)) {
     Write-Host "      [!] Windows Update policy left untouched; the upgrade will not be dispatched." -ForegroundColor $WarnCol
 } elseif (-not $NoUpgrade -and $WinBuild -lt $LatestBuild) {
     Write-Host "[>] Opening Windows Update policy for the update pass..." -ForegroundColor $LineCol
-    $_polk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $_auk  = "$_polk\AU"
-    if (-not (Test-Path $_polk)) { New-Item -Path $_polk -Force | Out-Null }
-    if (-not (Test-Path $_auk))  { New-Item -Path $_auk  -Force | Out-Null }
-    # Record originals once, in the same format Restore-WUUpgradeOverrides expects.
-    if (-not (Test-Path $IPU_AURestoreFile)) {
-        $_noAuto = (Get-ItemProperty -Path $_auk  -Name NoAutoUpdate     -ErrorAction SilentlyContinue).NoAutoUpdate
-        $_auOpt  = (Get-ItemProperty -Path $_auk  -Name AUOptions        -ErrorAction SilentlyContinue).AUOptions
-        $_setAH  = (Get-ItemProperty -Path $_polk -Name SetActiveHours   -ErrorAction SilentlyContinue).SetActiveHours
-        $_ahS    = (Get-ItemProperty -Path $_polk -Name ActiveHoursStart -ErrorAction SilentlyContinue).ActiveHoursStart
-        $_ahE    = (Get-ItemProperty -Path $_polk -Name ActiveHoursEnd   -ErrorAction SilentlyContinue).ActiveHoursEnd
-        @(
-            "NoAutoUpdate=$(if ($null -eq $_noAuto) {'ABSENT'} else {$_noAuto})"
-            "AUOptions=$(if ($null -eq $_auOpt) {'ABSENT'} else {$_auOpt})"
-            "SetActiveHours=$(if ($null -eq $_setAH) {'ABSENT'} else {$_setAH})"
-            "ActiveHoursStart=$(if ($null -eq $_ahS) {'ABSENT'} else {$_ahS})"
-            "ActiveHoursEnd=$(if ($null -eq $_ahE) {'ABSENT'} else {$_ahE})"
-        ) | Set-Content -Path $IPU_AURestoreFile -Encoding ASCII -Force
-    }
-    # NoAutoUpdate=0 alone does not release a pending feature update on the re-keyed
-    # Enterprise-composition boxes; AUOptions=4 (auto download + schedule install) is
-    # what actually moves it. Pin active hours so any WU-driven reboot lands out of hours.
-    Set-ItemProperty -Path $_auk  -Name NoAutoUpdate     -Value 0 -Type DWord -Force
-    Set-ItemProperty -Path $_auk  -Name AUOptions        -Value 4 -Type DWord -Force
-    Set-ItemProperty -Path $_polk -Name SetActiveHours   -Value 1 -Type DWord -Force
-    Set-ItemProperty -Path $_polk -Name ActiveHoursStart -Value $IPU_ActiveHoursStart -Type DWord -Force
-    Set-ItemProperty -Path $_polk -Name ActiveHoursEnd   -Value $IPU_ActiveHoursEnd   -Type DWord -Force
+    $_busy = Test-WursaDispatchActive -TaskName $IPU_TaskName -WorkDir $IPU_WorkDir -StatusFile $IPU_StatusFile
+    $_open = Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart $IPU_ActiveHoursStart -ActiveHoursEnd $IPU_ActiveHoursEnd -AdoptExisting (-not $_busy.Active)
+    $script:PolicyOwned = [bool]$_open.Owned
     Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
     Write-Host "      WU opened (NoAutoUpdate=0, AUOptions=4); direct API scan follows." -ForegroundColor $DimCol
@@ -1696,9 +1821,7 @@ $IPU_IsoSizeGB  = 6.0
 $IPU_IsoPath    = Join-Path $IPU_WorkDir $IPU_IsoName
 $IPU_LogDir     = Join-Path $IPU_WorkDir "SetupLogs"
 $IPU_SetupLog   = Join-Path $IPU_WorkDir "setup_exit.log"
-$IPU_StatusFile = Join-Path $IPU_WorkDir "ipu_status.txt"
 $IPU_RunnerPath = Join-Path $IPU_WorkDir "Invoke-IPU.ps1"
-$IPU_TaskName   = "WURSA-25H2-IPU"
 $IPU_VerifierPath  = Join-Path $IPU_WorkDir "Verify-25H2.ps1"
 $IPU_VerifyTaskName = "WURSA-25H2-Verify"
 
@@ -1756,7 +1879,8 @@ if ($NoUpgrade) {
     $script:FeatureUpdateStaged = $true
     $script:FeatureUpgradeState = "REBOOT_REQUIRED"
     Write-Host "      > $LatestVersion is staged by Windows Update and requires a reboot." -ForegroundColor $DimCol
-    if (Confirm-WursaWorkDir -Path $IPU_WorkDir) {
+    # Never overwrite the status file of a runner that is still executing.
+    if ((Get-WursaTaskState -TaskName $IPU_TaskName) -ne 'Running' -and (Confirm-WursaWorkDir -Path $IPU_WorkDir)) {
         ('REBOOT_REQUIRED WU ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
     }
 } elseif ($InstalledBuild -lt $LatestBuild) {
@@ -1814,12 +1938,14 @@ if ($NoUpgrade) {
             Write-Host "      [!] Upgrade not dispatched: $IPU_WorkDir is not a protected directory." -ForegroundColor Red
         } else {
 
-        # One-shot post-reboot verifier, built by Get-WursaVerifierScript.
-        $VerifierBody = Get-WursaVerifierScript -StatusFile $IPU_StatusFile -RestoreFile $IPU_AURestoreFile -VerifyTaskName $IPU_VerifyTaskName -TargetBuild $LatestBuild
-        $VerifierBody | Out-File -FilePath $IPU_VerifierPath -Encoding ASCII -Force
-
-        # --- Build the standalone runner the scheduled task executes as SYSTEM ---
-        # Config preamble (double-quoted here-string: values are injected now).
+        # The verifier and runner are written inside Invoke-WursaDispatch, after it has taken the dispatch lock and
+        # confirmed no earlier dispatch is live, so a running upgrade's files are never overwritten.
+        $_prepare = {
+            # One-shot post-reboot verifier, built by Get-WursaVerifierScript.
+            $VerifierBody = Get-WursaVerifierScript -StatusFile $IPU_StatusFile -RestoreFile $IPU_AURestoreFile -VerifyTaskName $IPU_VerifyTaskName -TargetBuild $LatestBuild
+            $VerifierBody | Out-File -FilePath $IPU_VerifierPath -Encoding ASCII -Force
+            # Build the standalone runner the scheduled task executes as SYSTEM. Config preamble
+            # (double-quoted here-string: values are injected now).
         $RunnerConfig = @"
 `$IPU_IsoUrl     = '$IPU_IsoUrl'
 `$IPU_IsoSizeGB  = $IPU_IsoSizeGB
@@ -1848,30 +1974,21 @@ if ($NoUpgrade) {
 `$LatestVersion    = '$LatestVersion'
 "@
 
-
-        New-WursaRunnerScript -Config $RunnerConfig | Out-File -FilePath $IPU_RunnerPath -Encoding ASCII -Force
-
-        # --- Register + start the detached SYSTEM task ---
-        $null = ('DISPATCHED ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
-        $TR = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $IPU_RunnerPath"
-        $createOut = schtasks.exe /Create /TN $IPU_TaskName /TR $TR /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            $runOut = schtasks.exe /Run /TN $IPU_TaskName 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                $script:FeatureUpgradeState = "DISPATCHED"
-                Write-Host "      > Upgrade dispatched as SYSTEM. It continues after you disconnect." -ForegroundColor Green
-                Write-Host "      > Status file : $IPU_StatusFile" -ForegroundColor $DimCol
-                Write-Host "      > Setup logs  : $IPU_LogDir" -ForegroundColor $DimCol
-                Write-Host "      > A reboot will be required once the detached upgrade completes." -ForegroundColor $WarnCol
-            } else {
-                $script:FeatureUpgradeState = "FAILED"
-                ('FAILED TASK_START ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
-                Write-Host "      [!] Task created but failed to start: $runOut" -ForegroundColor Red
-            }
+            New-WursaRunnerScript -Config $RunnerConfig | Out-File -FilePath $IPU_RunnerPath -Encoding ASCII -Force
+        }
+        $_disp = Invoke-WursaDispatch -TaskName $IPU_TaskName -RunnerPath $IPU_RunnerPath -StatusFile $IPU_StatusFile -WorkDir $IPU_WorkDir -Prepare $_prepare
+        if ($_disp.State -eq 'DISPATCHED') {
+            $script:FeatureUpgradeState = "DISPATCHED"
+            Write-Host "      > Upgrade dispatched as SYSTEM. It continues after you disconnect." -ForegroundColor Green
+            Write-Host "      > Status file : $IPU_StatusFile" -ForegroundColor $DimCol
+            Write-Host "      > Setup logs  : $IPU_LogDir" -ForegroundColor $DimCol
+            Write-Host "      > A reboot will be required once the detached upgrade completes." -ForegroundColor $WarnCol
+        } elseif ($_disp.State -eq 'ALREADY_ACTIVE') {
+            $script:FeatureUpgradeState = "ALREADY_ACTIVE"
+            Write-Host "      > An upgrade is already in progress ($($_disp.Message)); not dispatching another." -ForegroundColor $WarnCol
         } else {
             $script:FeatureUpgradeState = "FAILED"
-            ('FAILED TASK_CREATE ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Out-File -FilePath $IPU_StatusFile -Encoding ASCII -Force
-            Write-Host "      [!] Failed to register scheduled task: $createOut" -ForegroundColor Red
+            Write-Host "      [!] $($_disp.Message)" -ForegroundColor Red
         }
         }   # staging directory trusted
     }
@@ -1888,6 +2005,8 @@ if ($NoUpgrade) {
 
 #region 6 - Finalization
 # ============================================================================
+# Roll back the policy changes this run made if the upgrade was not handed to the runner.
+Undo-WursaOwnedPolicy
 # Checking reboot status via direct API to bypass Get-WURebootStatus crash.
 $RebootPending = [bool]$passRes.RebootRequired -or [bool]$tpRes.RebootRequired
 if (-not $RebootPending) {
