@@ -250,6 +250,19 @@ function Get-InstalledMsiPackage {
     return $matched
 }
 
+# True when a McAfee or Trellix product or service is on the machine. In that case the
+# McAfee data folder belongs to a live (often managed) AV and must be left alone.
+function Test-McAfeeTrellixPresent {
+    foreach ($pattern in @("*McAfee*", "*Trellix*")) {
+        if (@(Get-InstalledMsiPackage -NamePattern $pattern).Count -gt 0) { return $true }
+    }
+    $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match 'McAfee|Trellix|^(mfe|masvc|macmnsvc|macompatsvc|mcpltsvc|mcshield|xagt)' -or
+        $_.DisplayName -match 'McAfee|Trellix'
+    })
+    return ($svc.Count -gt 0)
+}
+
 function Uninstall-MsiPackage {
     param([Parameter(Mandatory)]$Package)
     $name = $Package.DisplayName
@@ -635,11 +648,8 @@ function Invoke-DebloatMain {
             Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like $app} | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null
         }
 
-        # 3.4: Kill Killer Networking
-        $killerDir = "C:\Windows\System32\drivers\RivetNetworks"
-        if (Test-Path $killerDir) {
-            Remove-Item -Path $killerDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        # System32\drivers\RivetNetworks is left alone: it is not proven safe to remove, and
+        # Killer NIC support may depend on it.
     } else {
         Write-Host "[2.2] Dell: Not applicable. Skipping." -ForegroundColor $DimCol
     }
@@ -785,11 +795,12 @@ function Invoke-DebloatMain {
     }
 
     # 5.1: Clean up remaining folders
-    $crapPaths = @(
-        "$env:ProgramData\McAfee",
-        "$env:ProgramFiles\Norton Security",
-        "C:\Windows\System32\drivers\RivetNetworks"
-    )
+    $crapPaths = @("$env:ProgramFiles\Norton Security")
+    if (Test-McAfeeTrellixPresent) {
+        Write-Host "[*]   McAfee or Trellix is installed. Leaving ProgramData\McAfee in place." -ForegroundColor $DimCol
+    } else {
+        $crapPaths += "$env:ProgramData\McAfee"
+    }
     foreach ($path in $crapPaths) {
         if (Test-Path $path) { Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue }
     }

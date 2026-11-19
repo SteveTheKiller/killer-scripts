@@ -162,4 +162,58 @@ Describe 'DEBLOAT' {
             Should -Invoke Invoke-RegExe -Times 2 -Exactly -ParameterFilter { $Arguments[0] -eq 'load' -and $Arguments[1] -eq 'HKU\TempHive_bob' }
         }
     }
+
+    Context 'finding 67: McAfee data and the Killer NIC driver folder' {
+        BeforeEach {
+            $script:Services = @()
+            $script:McAfeeDir = Join-Path $env:ProgramData 'McAfee'
+            $script:NortonDir = Join-Path $env:ProgramFiles 'Norton Security'
+            New-Item -ItemType Directory -Path $script:McAfeeDir, $script:NortonDir -Force | Out-Null
+            Set-Content -Path (Join-Path $script:McAfeeDir 'agent.db') -Value 'managed AV data'
+            Mock Get-Service {
+                if ($Name) { $script:Services | Where-Object { $_.Name -eq $Name } } else { $script:Services }
+            }
+            # The Rivet folder is a real system path: pretend it exists and record any delete attempt.
+            Mock Test-Path { $true } -ParameterFilter { "$Path" -like '*RivetNetworks*' }
+            Mock Remove-Item {} -ParameterFilter { "$Path" -like '*RivetNetworks*' }
+        }
+
+        It 'deletes ProgramData\McAfee when no McAfee or Trellix product or service is present' {
+            Get-Exit | Should -Be 0
+            Test-Path -LiteralPath $script:McAfeeDir | Should -BeFalse
+        }
+        It 'keeps ProgramData\McAfee when a McAfee MSI product is installed (any manufacturer)' {
+            Mock Get-InstalledMsiPackage { [pscustomobject]@{ DisplayName = 'McAfee Agent'; UninstallString = 'msiexec /x' } } -ParameterFilter { $NamePattern -eq '*McAfee*' }
+            Get-Exit | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $script:McAfeeDir 'agent.db') | Should -BeTrue
+        }
+        It 'keeps ProgramData\McAfee when a Trellix MSI product is installed' {
+            Mock Get-InstalledMsiPackage { [pscustomobject]@{ DisplayName = 'Trellix Endpoint Security'; UninstallString = 'msiexec /x' } } -ParameterFilter { $NamePattern -eq '*Trellix*' }
+            Get-Exit | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $script:McAfeeDir 'agent.db') | Should -BeTrue
+        }
+        It 'keeps ProgramData\McAfee when a McAfee service is present' {
+            $script:Services = @([pscustomobject]@{ Name = 'masvc'; DisplayName = 'McAfee Agent Service' })
+            Get-Exit | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $script:McAfeeDir 'agent.db') | Should -BeTrue
+        }
+        It 'keeps ProgramData\McAfee when a Trellix service is present' {
+            $script:Services = @([pscustomobject]@{ Name = 'xagt'; DisplayName = 'Trellix Endpoint Agent' })
+            Get-Exit | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $script:McAfeeDir 'agent.db') | Should -BeTrue
+        }
+        It 'still removes the Norton folder' {
+            Get-Exit | Should -Be 0
+            Test-Path -LiteralPath $script:NortonDir | Should -BeFalse
+        }
+        It 'never deletes System32\drivers\RivetNetworks on a Dell' {
+            $script:Mfr = 'Dell Inc.'
+            Get-Exit | Should -Be 0
+            Should -Invoke Remove-Item -Times 0 -Exactly -ParameterFilter { "$Path" -like '*RivetNetworks*' }
+        }
+        It 'never deletes System32\drivers\RivetNetworks on any other manufacturer' {
+            Get-Exit | Should -Be 0
+            Should -Invoke Remove-Item -Times 0 -Exactly -ParameterFilter { "$Path" -like '*RivetNetworks*' }
+        }
+    }
 }
