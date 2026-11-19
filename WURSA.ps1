@@ -838,8 +838,10 @@ function New-WursaDispatchMutex {
 
 function Test-WursaDispatchActive {
     # A feature-upgrade dispatch is active when its task is running, or when its status file (read only from
-    # a protected directory) says a reboot is needed and was written since the last boot. Any other state
-    # with no running task is a stale leftover and may be recovered.
+    # a protected directory) says a runner or a Windows Update handoff is current. WU_HANDOFF and
+    # VERIFY_PENDING mean the runner has finished but the upgrade is still in flight, so they stay active
+    # across reboots; RUNNING, DOWNLOADING and REPAIRING and REBOOT_REQUIRED count only when written since
+    # the last boot (a runner that died with a reboot is recoverable). Anything else is a stale leftover.
     param([string]$TaskName, [string]$WorkDir, [string]$StatusFile)
     $res = [pscustomobject]@{ Active = $false; Reason = '' }
     if ((Get-WursaTaskState -TaskName $TaskName) -eq 'Running') {
@@ -848,14 +850,43 @@ function Test-WursaDispatchActive {
     }
     try {
         if (-not (Get-WursaDirectoryProblem -Path $WorkDir) -and [System.IO.File]::Exists($StatusFile)) {
-            $first = [string]([System.IO.File]::ReadAllLines($StatusFile) | Select-Object -First 1)
-            $boot = Get-WursaLastBoot
-            if ($first.Trim() -match '^REBOOT_REQUIRED' -and $boot -and [System.IO.File]::GetLastWriteTime($StatusFile) -gt $boot) {
-                $res.Active = $true; $res.Reason = 'an upgrade is staged and waiting for a reboot'
+            $first = ([string]([System.IO.File]::ReadAllLines($StatusFile) | Select-Object -First 1)).Trim()
+            if ($first -match '^(WU_HANDOFF|VERIFY_PENDING)(\s|$)') {
+                $res.Active = $true; $res.Reason = 'a Windows Update handoff or verification is in progress'
+            } elseif ($first -match '^(REBOOT_REQUIRED|RUNNING|DOWNLOADING|REPAIRING)(\s|$)') {
+                $boot = Get-WursaLastBoot
+                if ($boot -and [System.IO.File]::GetLastWriteTime($StatusFile) -gt $boot) {
+                    $res.Active = $true; $res.Reason = 'an upgrade is in progress or staged and waiting for a reboot'
+                }
             }
         }
     } catch {}
     $res
+}
+
+function Enter-WursaDispatchLock {
+    # Takes the machine-wide dispatch lock. Returns @{ Mutex; Held }; the caller releases with
+    # Exit-WursaDispatchLock. A previous owner that died holding it still leaves us the owner.
+    $lock = [pscustomobject]@{ Mutex = (New-WursaDispatchMutex); Held = $false }
+    try {
+        $lock.Held = [bool]$lock.Mutex.WaitOne(15000)
+    } catch {
+        # PowerShell wraps the .NET exception, so walk the chain instead of relying on a typed catch.
+        $e = $_.Exception
+        while ($e) {
+            if ($e -is [System.Threading.AbandonedMutexException]) { $lock.Held = $true; break }
+            $e = $e.InnerException
+        }
+        if (-not $lock.Held) { try { $lock.Mutex.Dispose() } catch {}; throw }
+    }
+    $lock
+}
+
+function Exit-WursaDispatchLock {
+    param($Lock)
+    if (-not $Lock) { return }
+    if ($Lock.Held) { try { $Lock.Mutex.ReleaseMutex() } catch {} }
+    try { $Lock.Mutex.Dispose() } catch {}
 }
 
 function Invoke-WursaDispatch {
@@ -864,21 +895,10 @@ function Invoke-WursaDispatch {
     # live runner's files are never overwritten. Returns @{ State = DISPATCHED | FAILED | ALREADY_ACTIVE; Message }.
     param([string]$TaskName, [string]$RunnerPath, [string]$StatusFile, [string]$WorkDir, [scriptblock]$Prepare)
     $res = [pscustomobject]@{ State = 'FAILED'; Message = '' }
-    $mutex = New-WursaDispatchMutex
-    $held = $false
+    $lock = $null
     try {
-        try {
-            $held = [bool]$mutex.WaitOne(15000)
-        } catch {
-            # A previous owner died holding the lock: that still means we own it now. PowerShell wraps the
-            # .NET exception, so walk the chain instead of relying on a typed catch.
-            $e = $_.Exception
-            while ($e) {
-                if ($e -is [System.Threading.AbandonedMutexException]) { $held = $true; break }
-                $e = $e.InnerException
-            }
-            if (-not $held) { throw }
-        }
+        $lock = Enter-WursaDispatchLock
+        $held = $lock.Held
         if (-not $held) {
             $res.State = 'ALREADY_ACTIVE'; $res.Message = 'another WURSA run is dispatching the upgrade'
             return $res
@@ -907,8 +927,7 @@ function Invoke-WursaDispatch {
         $res.State = 'DISPATCHED'
         return $res
     } finally {
-        if ($held) { try { $mutex.ReleaseMutex() } catch {} }
-        try { $mutex.Dispose() } catch {}
+        Exit-WursaDispatchLock -Lock $lock
     }
 }
 
@@ -946,16 +965,35 @@ function Open-WursaUpdatePolicy {
 }
 
 function Undo-WursaOwnedPolicy {
-    # Rolls back the policy changes this run made, unless the detached runner now owns them (DISPATCHED) or
-    # the record is not ours. Uses the verified restore; if it does not stick the record is kept for the
-    # next run to adopt and retry.
+    # Rolls back the policy changes this run made, unless the detached runner now owns them (DISPATCHED), the
+    # run lost the race to another dispatch (ALREADY_ACTIVE) or the record is not ours. The rollback happens
+    # under the dispatch lock after a fresh active check, so a run that became active meanwhile is never
+    # undone. Uses the verified restore; if it does not stick the record is kept for the next run to retry.
     if (-not $script:PolicyOwned) { return }
-    if ($script:FeatureUpgradeState -eq 'DISPATCHED') { return }
-    if (Restore-WursaPolicyRecord -RecordFile $IPU_AURestoreFile) {
-        $script:PolicyOwned = $false
-        Write-Host "      Windows Update policy returned to its original values (the upgrade was not dispatched)." -ForegroundColor $DimCol
-    } else {
-        Write-Host "      [!] Could not fully restore the Windows Update policy values; the record is kept and the next run will retry." -ForegroundColor $WarnCol
+    if ($script:FeatureUpgradeState -eq 'DISPATCHED' -or $script:FeatureUpgradeState -eq 'ALREADY_ACTIVE') { return }
+    $lock = $null
+    try {
+        $lock = Enter-WursaDispatchLock
+        if (-not $lock.Held) {
+            Write-Host "      [!] Another WURSA run holds the dispatch lock; the Windows Update policy was left as is and the record is kept." -ForegroundColor $WarnCol
+            return
+        }
+        $act = Test-WursaDispatchActive -TaskName $IPU_TaskName -WorkDir $IPU_WorkDir -StatusFile $IPU_StatusFile
+        if ($act.Active) {
+            $script:PolicyOwned = $false
+            Write-Host "      Windows Update policy left open: $($act.Reason)." -ForegroundColor $DimCol
+            return
+        }
+        if (Restore-WursaPolicyRecord -RecordFile $IPU_AURestoreFile) {
+            $script:PolicyOwned = $false
+            Write-Host "      Windows Update policy returned to its original values (the upgrade was not dispatched)." -ForegroundColor $DimCol
+        } else {
+            Write-Host "      [!] Could not fully restore the Windows Update policy values; the record is kept and the next run will retry." -ForegroundColor $WarnCol
+        }
+    } catch {
+        Write-Host "      [!] Could not roll back the Windows Update policy: $($_.Exception.Message). The record is kept." -ForegroundColor $WarnCol
+    } finally {
+        Exit-WursaDispatchLock -Lock $lock
     }
 }
 

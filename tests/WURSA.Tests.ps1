@@ -32,6 +32,14 @@ BeforeAll {
         return $null
     }
 
+    function New-FakeMutexObject {
+        $m = [pscustomobject]@{}
+        $m | Add-Member -MemberType ScriptMethod -Name WaitOne -Value { param($ms) [void]$script:Events.Add('wait'); if ($script:WaitThrows) { throw (New-Object System.Threading.AbandonedMutexException) } $script:WaitResult }
+        $m | Add-Member -MemberType ScriptMethod -Name ReleaseMutex -Value { [void]$script:Events.Add('release') }
+        $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+        $m
+    }
+
     # In-memory stand-in for the Windows Update policy values. Keys are "path|name".
     function Initialize-FakePolicyRegistry {
         param([hashtable]$Initial = @{})
@@ -919,9 +927,59 @@ Describe 'Dispatch gate (finding 32)' {
         (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeTrue
     }
 
-    It 'does not treat a stale in-progress status with no running task as active' {
-        Set-Content -LiteralPath $script:StatusFile -Value 'RUNNING DOWNLOADING 2026-01-01 00:00:00'
+    It 'does not treat a stale FAILED or DISPATCHED status with no running task as active' -ForEach @(@{ Text = 'FAILED TASK_START x' }, @{ Text = 'DISPATCHED 2026-01-01 00:00:00' }) {
+        Set-Content -LiteralPath $script:StatusFile -Value $Text
         $script:TaskState = 'Ready'
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeFalse
+    }
+
+    It 'treats <Text> as active even though the task has finished (the runner is waiting on Windows Update or the verifier)' -ForEach @(
+        @{ Text = 'WU_HANDOFF 2026-01-01 00:00:00' }
+        @{ Text = 'VERIFY_PENDING VERSION_25H2 BUILD_26200.1 x' }
+        @{ Text = 'RUNNING IA_INPROGRESS x' }
+        @{ Text = 'DOWNLOADING 50 x' }
+        @{ Text = 'REPAIRING x' }
+    ) {
+        Set-Content -LiteralPath $script:StatusFile -Value $Text
+        $script:TaskState = 'Ready'
+        $script:Boot = (Get-Date).AddMinutes(-30)
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeTrue
+    }
+
+    It 'keeps a WU_HANDOFF or VERIFY_PENDING status active across a reboot' -ForEach @(@{ Text = 'WU_HANDOFF x' }, @{ Text = 'VERIFY_PENDING x' }) {
+        Set-Content -LiteralPath $script:StatusFile -Value $Text
+        $script:Boot = (Get-Date).AddMinutes(10)
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeTrue
+    }
+
+    It 'lets a RUNNING status that predates the last boot be recovered, since that runner died with the reboot' {
+        Set-Content -LiteralPath $script:StatusFile -Value 'RUNNING IA_INPROGRESS x'
+        $script:Boot = (Get-Date).AddMinutes(10)
+        (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeFalse
+    }
+
+    It 'does not adopt or undo the record while a WU_HANDOFF is current (unmocked active check)' {
+        $script:Events = New-Object System.Collections.ArrayList; $script:WaitResult = $true; $script:WaitThrows = $false
+        Set-Content -LiteralPath $script:StatusFile -Value 'WU_HANDOFF x'
+        $rec = Join-Path $script:Work 'au_restore.txt'
+        Set-Content -LiteralPath $rec -Value @('NoAutoUpdate=1')
+        Initialize-FakePolicyRegistry -Initial @{ "$script:Auk|NoAutoUpdate" = 0; "$script:Auk|AUOptions" = 4 }
+        Mock Write-Host { }
+        Mock Restart-Service { }
+        Mock New-WursaDispatchMutex { New-FakeMutexObject }
+        $IPU_AURestoreFile = $rec; $IPU_TaskName = 'T'; $IPU_WorkDir = $script:Work; $IPU_StatusFile = $script:StatusFile
+        $busy = Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile
+        $o = Open-WursaUpdatePolicy -RecordFile $rec -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting (-not $busy.Active)
+        $o.Owned | Should -BeFalse
+        $script:PolicyOwned = $o.Owned; $script:FeatureUpgradeState = 'NOT_STARTED'
+        Undo-WursaOwnedPolicy
+        $script:Reg["$script:Auk|NoAutoUpdate"] | Should -Be 0
+        [System.IO.File]::Exists($rec) | Should -BeTrue
+    }
+
+    It 'ignores an active-looking status in a directory that is not protected' {
+        Set-Content -LiteralPath $script:StatusFile -Value 'WU_HANDOFF x'
+        Mock Get-WursaDirectoryProblem { 'acl: Users can write' }
         (Test-WursaDispatchActive -TaskName 'T' -WorkDir $script:Work -StatusFile $script:StatusFile).Active | Should -BeFalse
     }
 
@@ -1038,6 +1096,10 @@ Describe 'Policy ownership and rollback (finding 29)' {
         Initialize-FakePolicyRegistry -Initial $script:Original
         Mock Write-Host { }
         Mock Restart-Service { }
+        $script:Events = New-Object System.Collections.ArrayList; $script:WaitResult = $true; $script:WaitThrows = $false
+        $IPU_TaskName = 'T'; $IPU_WorkDir = $script:Work; $IPU_StatusFile = Join-Path $script:Work 'ipu_status.txt'
+        Mock New-WursaDispatchMutex { New-FakeMutexObject }
+        Mock Test-WursaDispatchActive { [pscustomobject]@{ Active = $false; Reason = '' } }
     }
 
     It 'records the originals once, opens the policy, and owns the record it created' {
@@ -1098,6 +1160,55 @@ Describe 'Policy ownership and rollback (finding 29)' {
     }
 }
 
+Describe 'Rollback races with another run (finding 29, review fix)' {
+    BeforeEach {
+        $script:Work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:Work | Out-Null
+        $IPU_AURestoreFile = Join-Path $script:Work 'au_restore.txt'
+        $IPU_TaskName = 'T'; $IPU_WorkDir = $script:Work; $IPU_StatusFile = Join-Path $script:Work 'ipu_status.txt'
+        Initialize-FakePolicyRegistry -Initial @{ "$script:Auk|NoAutoUpdate" = 1; "$script:Auk|AUOptions" = 2 }
+        Mock Write-Host { }
+        $script:Events = New-Object System.Collections.ArrayList; $script:WaitResult = $true; $script:WaitThrows = $false
+        Mock New-WursaDispatchMutex { New-FakeMutexObject }
+        Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart 7 -ActiveHoursEnd 19 -AdoptExisting $false | Out-Null
+        $script:PolicyOwned = $true
+    }
+
+    It 'does not undo when another run became active between the early check and the rollback' {
+        $script:FeatureUpgradeState = 'NOT_STARTED'
+        Mock Test-WursaDispatchActive { [void]$script:Events.Add('active-check'); [pscustomobject]@{ Active = $true; Reason = 'run A dispatched meanwhile' } }
+        Undo-WursaOwnedPolicy
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 4
+        [System.IO.File]::Exists($IPU_AURestoreFile) | Should -BeTrue
+        $script:PolicyOwned | Should -BeFalse
+    }
+
+    It 'checks for an active dispatch inside the lock, before restoring, and releases afterwards' {
+        $script:FeatureUpgradeState = 'NOT_STARTED'
+        Mock Test-WursaDispatchActive { [void]$script:Events.Add('active-check'); [pscustomobject]@{ Active = $false; Reason = '' } }
+        Undo-WursaOwnedPolicy
+        ($script:Events -join ',') | Should -Be 'wait,active-check,release'
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 2
+    }
+
+    It 'does not undo when the lock cannot be taken' {
+        $script:FeatureUpgradeState = 'NOT_STARTED'
+        $script:WaitResult = $false
+        Mock Test-WursaDispatchActive { [pscustomobject]@{ Active = $false; Reason = '' } }
+        Undo-WursaOwnedPolicy
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 4
+        $script:Events | Should -Not -Contain 'release'
+    }
+
+    It 'never undoes on ALREADY_ACTIVE, even when the active check would say idle' {
+        $script:FeatureUpgradeState = 'ALREADY_ACTIVE'
+        Mock Test-WursaDispatchActive { [pscustomobject]@{ Active = $false; Reason = '' } }
+        Undo-WursaOwnedPolicy
+        $script:Reg["$script:Auk|AUOptions"] | Should -Be 4
+        [System.IO.File]::Exists($IPU_AURestoreFile) | Should -BeTrue
+    }
+}
+
 Describe 'Policy rollback in a full run (finding 29)' {
     BeforeEach {
         Set-MainMocks -Build 26100 -Version '24H2'
@@ -1108,6 +1219,8 @@ Describe 'Policy rollback in a full run (finding 29)' {
         Mock Get-WursaDirectoryProblem { $null }
         Mock Test-WursaDispatchActive { [pscustomobject]@{ Active = $false; Reason = '' } }
         Mock Get-WursaPowerState { 'AC' }
+        $script:Events = New-Object System.Collections.ArrayList; $script:WaitResult = $true; $script:WaitThrows = $false
+        Mock New-WursaDispatchMutex { New-FakeMutexObject }
         Initialize-FakePolicyRegistry -Initial @{ "$script:Auk|NoAutoUpdate" = 1; "$script:Auk|AUOptions" = 2 }
         $script:Rec = Join-Path $script:Work 'au_restore.txt'
         $InplaceUpgrade = [switch]$true; $No3rdParty = [switch]$true; $NoUpgrade = [switch]$false
