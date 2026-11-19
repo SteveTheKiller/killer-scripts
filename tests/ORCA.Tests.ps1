@@ -346,6 +346,79 @@ Describe 'ORCA' {
         }
     }
 
+    Context 'New Outlook reinstall verification (53, 54)' {
+        BeforeEach {
+            $script:AliceSid = 'S-1-5-21-1000-2000-3000-1001'
+            $script:Started = @()
+            $script:WingetCalls = @()
+            $script:Order = @()
+            $script:MakeMsix = $true
+            $script:AddThrows = $false
+            Mock Invoke-OrcaWinget {
+                $script:WingetCalls += $Arguments
+                if ($Arguments -like 'download*' -and $script:MakeMsix) {
+                    $m = [regex]::Match($Arguments, '--download-directory "([^"]+)"')
+                    New-Item -ItemType Directory -Path $m.Groups[1].Value -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $m.Groups[1].Value 'Outlook.msix') -Value 'synthetic package'
+                }
+                0
+            }
+            Mock Remove-AppxProvisionedPackage { $script:Order += 'remove'; $script:Provisioned = @() }
+            Mock Add-AppxProvisionedPackage {
+                $script:Order += 'add'
+                if ($script:AddThrows) { throw 'add failed' }
+                $script:Provisioned = @([pscustomobject]@{ DisplayName = 'Microsoft.OutlookForWindows'; PackageName = 'Microsoft.OutlookForWindows_2.0_neutral_~_8wekyb3d8bbwe' })
+            }
+        }
+
+        It 'All Users: a failed download with an old package present exits 1 and changes nothing (53)' {
+            $script:MakeMsix = $false
+            Mock Get-OrcaProfile {
+                @([pscustomobject]@{ Name = 'alice'; Account = 'CONTOSO\alice'; Sid = 'S-1-5-21-1000-2000-3000-1001'; Path = (Join-Path $script:UsersRoot 'alice') })
+            }
+            Invoke-OrcaRun -Silent
+            $script:Code | Should -Be 1
+            $script:Text | Should -Match 'ORCA RESULT: exit code 1 '
+            Assert-MockCalled Add-AppxProvisionedPackage -Times 0 -Exactly
+            Assert-MockCalled Remove-AppxProvisionedPackage -Times 0 -Exactly
+        }
+
+        It 'All Users: a good download removes the old package, then provisions the new one (53)' {
+            Mock Get-OrcaProfile {
+                @([pscustomobject]@{ Name = 'alice'; Account = 'CONTOSO\alice'; Sid = 'S-1-5-21-1000-2000-3000-1001'; Path = (Join-Path $script:UsersRoot 'alice') })
+            }
+            Invoke-OrcaRun -Silent
+            $script:Code | Should -Be 0
+            ($script:Order -join ',') | Should -Be 'remove,add'
+        }
+
+        It 'All Users: Add-AppxProvisionedPackage failing exits 1 (53)' {
+            $script:AddThrows = $true
+            Mock Get-OrcaProfile {
+                @([pscustomobject]@{ Name = 'alice'; Account = 'CONTOSO\alice'; Sid = 'S-1-5-21-1000-2000-3000-1001'; Path = (Join-Path $script:UsersRoot 'alice') })
+            }
+            Invoke-OrcaRun -Silent
+            $script:Code | Should -Be 1
+            $script:Text | Should -Match 'ORCA RESULT: exit code 1 '
+        }
+
+        It 'an admin repairing a different single user skips the install and exits 3 (54)' {
+            foreach ($a in @(@('D1', '1'), @('D1', '1'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Invoke-OrcaRun
+            $script:Code | Should -Be 3
+            $script:Text | Should -Match 'New Outlook was not reinstalled for bob'
+            Assert-MockCalled Start-Process -Times 0 -Exactly -ParameterFilter { "$ArgumentList" -like '*winget install*' }
+            Assert-MockCalled Invoke-OrcaWinget -Times 0 -Exactly
+        }
+
+        It 'a single user run for the invoking user still installs New Outlook (54)' {
+            foreach ($a in @(@('D0', '0'), @('D1', '1'))) { $script:Keys.Enqueue((New-OrcaKey -Key $a[0] -Char $a[1])) }
+            Invoke-OrcaRun
+            $script:Code | Should -Be 0
+            Assert-MockCalled Invoke-OrcaWinget -Times 1 -Exactly -ParameterFilter { $Arguments -like 'install*' }
+        }
+    }
+
     Context 'Get-OrcaProfile' {
         BeforeEach {
             New-Item -Path 'TestRegistry:\ProfileList' -Force | Out-Null

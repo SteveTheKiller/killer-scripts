@@ -88,6 +88,18 @@ function Read-OrcaKey {
 
 function Get-OrcaTempRoot { $env:TEMP }
 
+function Invoke-OrcaWinget {
+    # Runs winget through cmd.exe and returns its exit code, or $null when it could not be started.
+    param([string]$Arguments, [switch]$AnswerYes)
+    $prefix = if ($AnswerYes) { 'echo Y | ' } else { '' }
+    try {
+        $cmdLine = "/c ${prefix}winget $Arguments"
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -WindowStyle Hidden -Wait -PassThru
+        if ($proc) { return $proc.ExitCode }
+    } catch { }
+    return $null
+}
+
 function Test-OrcaWingetPresent {
     [bool](Get-Command "winget" -ErrorAction SilentlyContinue)
 }
@@ -655,6 +667,7 @@ function Invoke-OrcaMain {
         #region [3] - MAIN LOGIC
         # ============================================================================
         $script:skipReinstall = $false
+        $script:ReinstallError = $null
 
         # Step counts per mode (WinGet is a pre-step outside the user loop)
         # New:     4 steps - [1] Kill/remove  [2] Registry  [3] Auth  [4] Reinstall
@@ -781,8 +794,10 @@ function Invoke-OrcaMain {
 
             $installed = $false
 
-            # If running as SYSTEM and targeting a single, non-SYSTEM user, skip winget install
-            if (-not $script:AllUsers -and ($env:USERNAME -eq "SYSTEM") -and ($TargetUsers[0].Name -ne "SYSTEM")) {
+            # winget installs for the account that runs it. When one other user is targeted (SYSTEM, or an
+            # admin repairing someone else), installing would give the wrong account the app and the
+            # verification below would read the wrong account's packages, so skip and say so.
+            if (-not $script:AllUsers -and ($TargetUsers[0].Sid -ne (Get-OrcaCurrentSid))) {
                 $script:skipReinstall = $true
                 $status = "[SKIPPED]"
                 $pad = " " * [math]::Max(1, $script:Width - "[$reinstallStepNum/$T] $stepMsg".Length - $status.Length)
@@ -790,9 +805,9 @@ function Invoke-OrcaMain {
                 Write-Host "[$reinstallStepNum/$T]" -ForegroundColor $DimCol -NoNewline
                 Write-Host " $stepMsg$pad" -ForegroundColor $DimCol -NoNewline
                 Write-Host $status -ForegroundColor $WarnCol
-                Write-Host "Cannot install New Outlook for '$($TargetUsers[0].Name)' from SYSTEM context." -ForegroundColor $WarnCol
+                Write-Host "Cannot install New Outlook for '$($TargetUsers[0].Name)' from another account." -ForegroundColor $WarnCol
                 Write-Host "Please run as the target user or select 'All Users' for provisioning." -ForegroundColor $WarnCol
-                [void]$script:Problems.Add("New Outlook was not reinstalled for $($TargetUsers[0].Name)")
+                [void]$script:Problems.Add("New Outlook was not reinstalled for $($TargetUsers[0].Name), run ORCA as that user or choose All Users")
             }
             
             if (-not $script:skipReinstall) {
@@ -800,22 +815,33 @@ function Invoke-OrcaMain {
                     $dlDir = Join-Path (Get-OrcaTempRoot) "ORCA_DL"
                     New-Item -Path $dlDir -ItemType Directory -Force | Out-Null
                     $wingetDLArgs = "download --id 9NRX63209R7B --source msstore --accept-package-agreements --silent --download-directory `"$dlDir`""
-                    Start-Process -FilePath "cmd.exe" -ArgumentList "/c winget $wingetDLArgs" -WindowStyle Hidden -Wait
-                    
-                    $packagePath = Get-ChildItem -Path $dlDir -Filter "*.msix" -Recurse | Select-Object -First 1
-                    if ($packagePath) {
-                        Add-AppxProvisionedPackage -Online -PackagePath $packagePath.FullName -SkipLicense | Out-Null
+                    $dlCode = Invoke-OrcaWinget -Arguments $wingetDLArgs
+
+                    # Download first and require a package. The existing provisioned package is removed only
+                    # once a replacement is in hand, so a failed download cannot pass the check below.
+                    $packagePath = Get-ChildItem -Path $dlDir -Filter "*.msix" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if (-not $packagePath) {
+                        $script:ReinstallError = "winget download produced no .msix package (exit code $dlCode)"
+                    } else {
+                        try {
+                            foreach ($old in @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.OutlookForWindows" })) {
+                                Remove-AppxProvisionedPackage -Online -PackageName $old.PackageName -ErrorAction Stop | Out-Null
+                            }
+                            Add-AppxProvisionedPackage -Online -PackagePath $packagePath.FullName -SkipLicense -ErrorAction Stop | Out-Null
+                        } catch {
+                            $script:ReinstallError = "provisioning failed: $($_.Exception.Message)"
+                        }
                     }
-                    Remove-Item $dlDir -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $dlDir -Recurse -Force -ErrorAction SilentlyContinue
                 } else {
                     # Single-user install logic
                     $wingetArgs = 'install -e --id 9NRX63209R7B --source msstore --accept-package-agreements --accept-source-agreements --silent --force --disable-interactivity'
-                    Start-Process -FilePath "cmd.exe" -ArgumentList "/c echo Y | winget $wingetArgs" -WindowStyle Hidden -Wait
+                    [void](Invoke-OrcaWinget -Arguments $wingetArgs -AnswerYes)
                 }
 
                 # Verification
                 $Timer = 0; $Timeout = 60
-                while (-not $installed -and $Timer -lt $Timeout) {
+                while (-not $installed -and -not $script:ReinstallError -and $Timer -lt $Timeout) {
                     if ($script:AllUsers) {
                         $installed = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.OutlookForWindows" }
                     } else {
@@ -836,7 +862,8 @@ function Invoke-OrcaMain {
                 Write-Host " $stepMsg$pad" -ForegroundColor $DimCol -NoNewline
                 Write-Host $status -ForegroundColor "Red"
                 Write-Host "      > Winget/Provisioning failed. Try manual install from Store." -ForegroundColor $WarnCol
-                Exit-OrcaRun $EXIT_ERROR "New Outlook was not reinstalled, winget or provisioning failed. Install it from the Store."
+                $why = if ($script:ReinstallError) { ": $($script:ReinstallError)" } else { "" }
+                Exit-OrcaRun $EXIT_ERROR "New Outlook was not reinstalled, winget or provisioning failed$why. Install it from the Store."
             }
         }
         #endregion
