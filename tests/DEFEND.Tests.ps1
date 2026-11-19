@@ -333,5 +333,47 @@ Describe 'DEFEND findings 56, 57, 58, 10 and 11' {
             $r.Code | Should -Be 3
         }
     }
-}
 
+    Context 'finding 57: definition update result' {
+        BeforeEach {
+            $script:Ps7Json = {
+                param($Command, $UpdateExit)
+                if ($Command -like '*Update-MpSignature*') { return [pscustomobject]@{ ExitCode = $UpdateExit; Output = $(if ($UpdateExit -ne 0) { 'update server unreachable' } else { '' }) } }
+                $o = switch -Wildcard ($Command) {
+                    '*Get-MpPreference*'     { '{"DisableRealtimeMonitoring":false,"PUAProtection":1,"MAPSReporting":2,"EnableNetworkProtection":1,"EnableControlledFolderAccess":1,"CloudBlockLevel":2,"ExclusionPath":[]}' }
+                    '*Get-MpComputerStatus*' { '{"AntivirusSignatureVersion":"1.2.3.4"}' }
+                    default { '' }
+                }
+                [pscustomobject]@{ ExitCode = 0; Output = $o }
+            }
+        }
+        It 'prints Definitions Updated and exits 0 when the update works' {
+            $r = Get-Run
+            $r.Text | Should -Match 'Definitions Updated'
+            $r.Code | Should -Be 0
+        }
+        It 'reports Update Failed with the reason and exits 3 when Update-MpSignature throws' {
+            Mock Update-MpSignature { throw 'update server unreachable' }
+            $r = Get-Run
+            $r.Text | Should -Match 'Update Failed'
+            $r.Text | Should -Not -Match 'Definitions Updated'
+            $r.Text | Should -Match 'update server unreachable'
+            $r.Code | Should -Be 3
+        }
+        It 'checks the child exit code under PowerShell 7: nonzero is Update Failed, exit 3' {
+            Mock Get-DefendPSMajor { 7 }
+            Mock Invoke-DefendWinPS { & $script:Ps7Json $Command 1 }
+            $r = Get-Run
+            $r.Text | Should -Match 'Update Failed'
+            $r.Text | Should -Not -Match 'Definitions Updated'
+            $r.Code | Should -Be 3
+        }
+        It 'under PowerShell 7 a zero child exit is Definitions Updated and exit 0' {
+            Mock Get-DefendPSMajor { 7 }
+            Mock Invoke-DefendWinPS { & $script:Ps7Json $Command 0 }
+            $r = Get-Run
+            $r.Text | Should -Match 'Definitions Updated'
+            $r.Code | Should -Be 0
+        }
+    }
+}

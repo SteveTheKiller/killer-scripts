@@ -156,9 +156,19 @@ function Set-DefendPreferences {
         Set-MpPreference -DisableRealtimeMonitoring $false -PUAProtection Enabled -MAPSReporting Advanced -EnableNetworkProtection Enabled -EnableControlledFolderAccess Enabled -CloudBlockLevel 2 -ErrorAction Stop
         $null
     } catch { $_.Exception.Message }
-}function Get-DefendPreferences {
+}# Update-DefendSignatures returns $null on success, or the error text.
+function Update-DefendSignatures {
     if ((Get-DefendPSMajor) -ge 6) {
-        (Invoke-DefendWinPS 'Get-MpPreference | ConvertTo-Json -Depth 3').Output | ConvertFrom-Json
+        $r = Invoke-DefendWinPS 'try { Update-MpSignature -ErrorAction Stop; exit 0 } catch { Write-Output $_.Exception.Message; exit 1 }'
+        if ($r.ExitCode -ne 0) { return ("exit {0}: {1}" -f $r.ExitCode, $r.Output) }
+        return $null
+    }
+    try { Update-MpSignature -ErrorAction Stop; $null } catch { $_.Exception.Message }
+}
+function Get-DefendPreferences {
+    if ((Get-DefendPSMajor) -ge 6) {
+        $o = (Invoke-DefendWinPS 'Get-MpPreference | ConvertTo-Json -Depth 3').Output
+        if (-not [string]::IsNullOrWhiteSpace($o)) { $o | ConvertFrom-Json }
     } else {
         Get-MpPreference
     }
@@ -350,15 +360,13 @@ function Invoke-DefendMain {
     # --------------------------------------------------------------------------
     Write-Host "[>] Syncing Threat Intelligence..." -ForegroundColor DarkCyan
 
-    try {
-        if ($PSVer -ge 6) {
-            Invoke-DefendWinPS 'Update-MpSignature -ErrorAction Stop' | Out-Null
-        } else {
-            Update-MpSignature -ErrorAction Stop
-        }
-        Write-Field "Status" "Definitions Updated" "Green"
-    } catch {
+    $UpdateError = Update-DefendSignatures
+    if ($UpdateError) {
         Write-Field "Status" "Update Failed" "Red"
+        Write-Host "                               $UpdateError" -ForegroundColor Gray
+        [void]$script:DefendFailures.Add("definition update failed: $UpdateError")
+    } else {
+        Write-Field "Status" "Definitions Updated" "Green"
     }
     #endregion
 
