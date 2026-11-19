@@ -214,13 +214,30 @@ function Start-Installer {
     if ($null -eq $proc.ExitCode) { return -2 }
     return [int]$proc.ExitCode
 }
+function Write-DepotStatus {
+    # Prints the status tag and records the same outcome for the current step, so the final exit code,
+    # the footer and the run log all come from what actually happened.
+    param([string]$Status, [string]$Tag, [string]$Color, [string]$Detail = '')
+    Write-StatusTag $Tag $Color
+    $step = if ($script:DepotStep) { $script:DepotStep } else { 'Unnamed step' }
+    if (-not $Detail) { $Detail = $Tag.Trim('[', ']') }
+    Add-DepotResult $step $Status $Detail
+}
+
 function Show-Result {
     param($ExitCode)
-    if ($null -eq $ExitCode)                          { Write-StatusTag "[SKIPPED]" "Yellow" }
-    elseif ($ExitCode -in 0, 3010)                    { Write-StatusTag "[DONE]" "Green" }
-    elseif ($ExitCode -in 1638, 1641, -1978335189)    { Write-StatusTag "[ALREADY INSTALLED]" "Cyan" }
-    elseif ($ExitCode -eq -2)                         { Write-StatusTag "[FAILED - exit code unavailable]" "Red" }
-    else                                              { Write-StatusTag "[FAILED - exit $ExitCode]" "Red" }
+    if ($null -eq $ExitCode)                          { Write-DepotStatus Skipped "[SKIPPED]" "Yellow" "skipped by technician" }
+    elseif ($ExitCode -in 0, 3010)                    {
+        Write-DepotStatus Done "[DONE]" "Green" "exit $ExitCode"
+        if ($ExitCode -eq 3010) { $script:RebootRequired = $true }
+    }
+    elseif ($ExitCode -in 1638, 1641, -1978335189)    {
+        Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan" "exit $ExitCode"
+        if ($ExitCode -eq 1641) { $script:RebootRequired = $true }
+    }
+    elseif ($ExitCode -eq -2)                         { Write-DepotStatus Failed "[FAILED - exit code unavailable]" "Red" "exit code unavailable" }
+    elseif ($ExitCode -eq -1)                         { Write-DepotStatus Failed "[FAILED - exit -1]" "Red" "timed out or killed" }
+    else                                              { Write-DepotStatus Failed "[FAILED - exit $ExitCode]" "Red" "exit $ExitCode" }
 }
 
 function Write-Installing {
@@ -361,8 +378,27 @@ function Invoke-DepotPreflight {
     Remove-DepotStaleFile
 }
 
+function Test-DepotInteractive {
+    # True only when a person can answer a prompt: a real console host with keyboard input. RMM consoles
+    # (LiveConnect), -EncodedCommand runs, redirected input and SYSTEM sessions are not interactive.
+    try {
+        if (-not [Environment]::UserInteractive) { return $false }
+        if ([Console]::IsInputRedirected) { return $false }
+        return ($Host.Name -eq 'ConsoleHost')
+    } catch { return $false }
+}
+
+function Clear-DepotScreen {
+    try { Clear-Host } catch { }
+}
+
 function Read-DepotChoice {
     param([string]$Prompt)
+    if (-not (Test-DepotInteractive)) {
+        # Every prompt defaults to N, so an unattended run takes the safe answer.
+        Write-Host "$Prompt[no console, defaulting to N]" -ForegroundColor DarkGray
+        return 'N'
+    }
     Write-Host $Prompt -ForegroundColor Black -BackgroundColor Red -NoNewline
     $_k = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     $choice = $_k.Character.ToString()
@@ -486,7 +522,7 @@ function Invoke-DepotAdminPurge {
 }
 
 function Invoke-DepotInteractiveSetup {
-    Clear-Host
+    Clear-DepotScreen
     Write-Host "[*] Interactive Pre-Deployment Setup..." -ForegroundColor DarkRed -BackgroundColor Black
     Write-Host ""
     Write-Host "    Note: All prompts default to 'N' if Enter is pressed." -ForegroundColor DarkRed -BackgroundColor Black
@@ -506,7 +542,7 @@ function Invoke-DepotInteractiveSetup {
 }
 
 function Show-DepotBanner {
-    Clear-Host
+    Clear-DepotScreen
     $_fillW = $script:Width - $script:ArtPfx.Length - $script:ArtW
     $_title = "DEPLOYMENT & ENDPOINT PROVISIONING OPERATIONS TOOL"
     $_tpad  = " " * ($_fillW - $_title.Length)
@@ -534,7 +570,7 @@ function Show-DepotBanner {
 
 function Invoke-DepotWindowsUpdate {
     Write-Host "[*] Deploying Windows & Microsoft Updates..." -ForegroundColor DarkRed
-    $script:RebootRequired = $true
+    $script:DepotStep = "Windows Update"
 
     try {
         # Reset WU service state first to clear any stuck session
@@ -545,16 +581,19 @@ function Invoke-DepotWindowsUpdate {
         Start-Sleep -Seconds 3
 
         # Kick off the full WU cycle via Update Session Orchestrator - fire and forget
-        Start-Process "UsoClient.exe" -ArgumentList "StartScan"    -WindowStyle Hidden
+        Start-Process "UsoClient.exe" -ArgumentList "StartScan"     -WindowStyle Hidden -ErrorAction Stop
         Start-Sleep -Seconds 2
-        Start-Process "UsoClient.exe" -ArgumentList "StartDownload" -WindowStyle Hidden
+        Start-Process "UsoClient.exe" -ArgumentList "StartDownload" -WindowStyle Hidden -ErrorAction Stop
         Start-Sleep -Seconds 2
-        Start-Process "UsoClient.exe" -ArgumentList "StartInstall"  -WindowStyle Hidden
+        Start-Process "UsoClient.exe" -ArgumentList "StartInstall"  -WindowStyle Hidden -ErrorAction Stop
+        $script:RebootRequired = $true
+        Add-DepotResult $script:DepotStep "Done" "triggered"
 
         Write-Host "      > Windows Update triggered in background." -ForegroundColor Gray
         Write-Host "      > Updates will continue in background after script exit." -ForegroundColor Gray
     } catch {
         Write-Host "      > Failed to trigger Windows Update: $_" -ForegroundColor Red
+        Add-DepotResult $script:DepotStep "Failed" "UsoClient trigger failed: $_"
         Write-Host "      > Run Windows Update manually after reboot." -ForegroundColor Yellow
     }
 }
@@ -587,13 +626,14 @@ function Test-DepotMsiOffice {
 }
 
 function Install-DepotOffice {
+    $script:DepotStep = 'Office'
     # --- Microsoft 365 via Office Deployment Tool ---
     Write-Host "      > Installing: Microsoft 365..." -NoNewline -ForegroundColor Gray
     $OfficeInstalled = (Test-Path "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE") -or
                        (Test-Path "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE") -or
                        (Get-Service -Name "ClickToRunSvc" -ErrorAction SilentlyContinue)
     if ($OfficeInstalled) {
-        Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
+        Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan"
     } else {
         $ODTDir  = Join-Path $script:DepotTemp "ODT"
         $ODTExe  = Join-Path $script:DepotTemp "ODT.exe"
@@ -613,7 +653,7 @@ function Install-DepotOffice {
             if (Get-Installer -Url $url -Dest $ODTExe) { $downloaded = $true; break }
         }
         if (-not $downloaded) {
-            Write-StatusTag "[FAILED - download]" "Red"
+            Write-DepotStatus Failed "[FAILED - download]" "Red"
         } else {
             if (-not (Test-Path $ODTDir)) { New-Item -ItemType Directory -Path $ODTDir | Out-Null }
             # Extract ODT - spawns a child process internally so we poll for setup.exe rather than trusting -Wait
@@ -628,7 +668,7 @@ function Install-DepotOffice {
                 Stop-DepotProcessTree -RootId $extractProc.Id
             }
             if (-not (Test-Path $setup)) {
-                Write-StatusTag "[FAILED - ODT extract]" "Red"
+                Write-DepotStatus Failed "[FAILED - ODT extract]" "Red"
             } else {
                 @"
 <Configuration>
@@ -680,32 +720,33 @@ function Install-DepotOffice {
 }
 
 function Install-DepotOneDrive {
+    $script:DepotStep = 'OneDrive'
     Write-Host "      > Installing: OneDrive..." -NoNewline -ForegroundColor Gray
     $OneDriveInstalled = (Test-Path "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe") -or
                          (Test-Path "$env:ProgramFiles (x86)\Microsoft OneDrive\OneDrive.exe") -or
                          (Test-Path "$env:SystemRoot\SysWOW64\OneDriveSetup.exe")
     if ($OneDriveInstalled) {
-        Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
+        Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan"
     } else {
         $dest = Join-Path $script:DepotTemp "OneDriveSetup.exe"
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
         if (Get-Installer -Url "https://go.microsoft.com/fwlink/?linkid=844652" -Dest $dest) {
             Write-Installing
-            Write-Installing
             $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/allusers /silent"
             Show-Result $ExitCode
-        } else { Write-StatusTag "[FAILED - download]" "Red" }
+        } else { Write-DepotStatus Failed "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Install-DepotTeams {
+    $script:DepotStep = 'Teams'
     Write-Host "      > Installing: Microsoft Teams..." -NoNewline -ForegroundColor Gray
     $TeamsInstalled = (Test-Path "$env:ProgramFiles\WindowsApps\MSTeams*\ms-teams.exe") -or
                       (Test-Path "$env:ProgramFiles (x86)\Microsoft\Teams\current\Teams.exe") -or
                       (Test-Path "$env:ProgramFiles\Microsoft\Teams\current\Teams.exe")
     if ($TeamsInstalled) {
-        Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
+        Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan"
     } else {
         $dest = Join-Path $script:DepotTemp "TeamsSetup.exe"
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
@@ -713,17 +754,18 @@ function Install-DepotTeams {
             Write-Installing
             $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/silent"
             Show-Result $ExitCode
-        } else { Write-StatusTag "[FAILED - download]" "Red" }
+        } else { Write-DepotStatus Failed "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Install-DepotChrome {
+    $script:DepotStep = 'Chrome'
     Write-Host "      > Installing: Google Chrome..." -NoNewline -ForegroundColor Gray
     $ChromeInstalled = (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe") -or
                        (Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe")
     if ($ChromeInstalled) {
-        Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
+        Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan"
     } else {
         $dest = Join-Path $script:DepotTemp "ChromeEnterprise.msi"
         $ChromeUrls = @(
@@ -740,18 +782,19 @@ function Install-DepotChrome {
             Write-Installing
             $ExitCode = Start-Installer "msiexec.exe" -ArgumentList "/i `"$dest`" /qn /norestart ALLUSERS=1"
             Show-Result $ExitCode
-        } else { Write-StatusTag "[FAILED - download]" "Red" }
+        } else { Write-DepotStatus Failed "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Install-DepotAcrobat {
+    $script:DepotStep = 'Acrobat'
     Write-Host "      > Installing: Adobe Acrobat Reader..." -NoNewline -ForegroundColor Gray
     $AcrobatInstalled = (Test-Path "C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe") -or
                         (Test-Path "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe") -or
                         (Test-Path "C:\Program Files (x86)\Adobe\Acrobat DC\Acrobat\Acrobat.exe")
     if ($AcrobatInstalled) {
-        Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
+        Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan"
     } else {
         $dest = Join-Path $script:DepotTemp "AcrobatReader.exe"
         $AcrobatUrls = @(
@@ -766,17 +809,18 @@ function Install-DepotAcrobat {
             Write-Installing
             $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/sAll /rs /msi EULA_ACCEPT=YES /qn REBOOT=ReallySuppress"
             Show-Result $ExitCode
-        } else { Write-StatusTag "[FAILED - download]" "Red" }
+        } else { Write-DepotStatus Failed "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Install-DepotZoom {
+    $script:DepotStep = 'Zoom'
     Write-Host "      > Installing: Zoom..." -NoNewline -ForegroundColor Gray
     $ZoomInstalled = (Test-Path "C:\Program Files\Zoom\bin\Zoom.exe") -or
                      (Test-Path "C:\Program Files (x86)\Zoom\bin\Zoom.exe")
     if ($ZoomInstalled) {
-        Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
+        Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan"
     } else {
         $dest = Join-Path $script:DepotTemp "ZoomInstaller.msi"
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
@@ -784,17 +828,18 @@ function Install-DepotZoom {
             Write-Installing
             $ExitCode = Start-Installer "msiexec.exe" -ArgumentList "/i `"$dest`" /qn /norestart ALLUSERS=1 REBOOT=ReallySuppress"
             Show-Result $ExitCode
-        } else { Write-StatusTag "[FAILED - download]" "Red" }
+        } else { Write-DepotStatus Failed "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Install-Depot7Zip {
+    $script:DepotStep = '7-Zip'
     Write-Host "      > Installing: 7-Zip..." -NoNewline -ForegroundColor Gray
     $7ZipInstalled = (Test-Path "C:\Program Files\7-Zip\7z.exe") -or
                      (Test-Path "C:\Program Files (x86)\7-Zip\7z.exe")
     if ($7ZipInstalled) {
-        Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
+        Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan"
     } else {
         $dest = Join-Path $script:DepotTemp "7zip.exe"
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
@@ -802,12 +847,13 @@ function Install-Depot7Zip {
             Write-Installing
             $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/S"
             Show-Result $ExitCode
-        } else { Write-StatusTag "[FAILED - download]" "Red" }
+        } else { Write-DepotStatus Failed "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Install-DepotBrowserExtensions {
+    $script:DepotStep = 'BrowserExtensions'
     # --- Browser Extension Policy Keys ---
     Write-Host "      > Adding uBlock adblocker extensions..." -NoNewline -ForegroundColor Gray
     $IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")
@@ -818,7 +864,7 @@ function Install-DepotBrowserExtensions {
             $EdgeInstalled   = (Test-Path $EdgePref) -and ((Get-Item $EdgePref -ErrorAction SilentlyContinue).Property | ForEach-Object { (Get-ItemProperty $EdgePref).$_ }) -match "odfafepnkmbhccpbejgmiehpchacaeak"
             $ChromeInstalled = (Test-Path $ChromePref) -and ((Get-Item $ChromePref -ErrorAction SilentlyContinue).Property | ForEach-Object { (Get-ItemProperty $ChromePref).$_ }) -match "ddmmnachommbenpoecpkehpconingflb"
             if ($EdgeInstalled -and $ChromeInstalled) {
-                Write-StatusTag "[ALREADY INSTALLED]" "Cyan"
+                Write-DepotStatus AlreadyInstalled "[ALREADY INSTALLED]" "Cyan"
             } else {
                 # Edge - uBlock Origin
                 if (!(Test-Path $EdgePref)) { New-Item -Path $EdgePref -Force | Out-Null }
@@ -832,11 +878,11 @@ function Install-DepotBrowserExtensions {
                     $ChromeCount = ((Get-Item $ChromePref).Property | Measure-Object).Count
                     Set-ItemProperty -Path $ChromePref -Name ($ChromeCount + 1).ToString() -Value "ddmmnachommbenpoecpkehpconingflb;https://clients2.google.com/service/update2/crx" -ErrorAction Stop
                 }
-                Write-StatusTag "[DONE]" "Green"
+                Write-DepotStatus Done "[DONE]" "Green"
             }
-        } catch { Write-StatusTag "[FAILED]" "Red" }
+        } catch { Write-DepotStatus Failed "[FAILED]" "Red" }
     } else {
-        Write-StatusTag "[SKIPPED - not elevated]" "Yellow"
+        Write-DepotStatus Skipped "[SKIPPED - not elevated]" "Yellow"
     }
 }
 
@@ -863,8 +909,15 @@ function Invoke-DepotCleanup {
     Write-Host "      > Update Cache..." -NoNewline -ForegroundColor Gray
     Write-StatusTag "[LEFT IN PLACE - updates running]" "Yellow"
     Write-Host "      > Purging Temp Folders..." -NoNewline -ForegroundColor Gray
-    $TempPaths = @(
-        "C:\Windows\Temp\*", 
+    $script:DepotStep = 'Cleanup'
+    $TempPaths = @()
+    if (Test-DepotAnyFailed) {
+        # Installer logs and leftovers in C:\Windows\Temp are the evidence for the failed step, keep them.
+        Write-Host " (a step failed, keeping C:\Windows\Temp for troubleshooting)" -NoNewline -ForegroundColor Yellow
+    } else {
+        $TempPaths += "C:\Windows\Temp\*"
+    }
+    $TempPaths += @(
         "C:\Windows\Prefetch\*",
         "$env:LocalAppData\Microsoft\Windows\Explorer\thumbcache_*.db"
     )
@@ -1014,32 +1067,77 @@ function Invoke-DepotPrivacy {
     Write-Host "    Privacy & UI settings applied to $($script:UserHives.Count) user profile(s)." -ForegroundColor Cyan
 }
 
+function Test-DepotAnyFailed {
+    return (@($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0)
+}
+
+function Get-DepotExitCode {
+    # 0 clean, 3010 clean with a reboot needed, 3 some steps failed but others worked, 1 nothing worked.
+    # A failure outranks a pending reboot: the technician must see that something went wrong.
+    $failed = @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count
+    $worked = @($script:DepotResults | Where-Object { $_.Status -in 'Done', 'AlreadyInstalled' }).Count
+    if ($failed -gt 0) { if ($worked -gt 0) { return 3 } else { return 1 } }
+    if ($script:RebootRequired) { return 3010 }
+    return 0
+}
+
+function Write-DepotRunLog {
+    # Keeps the per-step results where a technician can read them after the window is gone.
+    param([int]$Code)
+    try {
+        $dir = Join-Path $env:ProgramData 'DEPOT'
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $lines = @("DEPOT run $(Get-Date -Format 's') on $($env:COMPUTERNAME), exit code $Code")
+        foreach ($r in $script:DepotResults) { $lines += ("{0,-18} {1,-16} {2}" -f $r.Step, $r.Status, $r.Detail) }
+        Set-Content -LiteralPath (Join-Path $dir 'LastRun.txt') -Value $lines -Encoding UTF8 -ErrorAction Stop
+    } catch { }
+}
+
 function Complete-Depot {
-    $RebootPending = if ($script:RebootRequired) { $true } else { $false }
-    $RebootStatus = if ($RebootPending) { "REBOOT REQUIRED" } else { "SYSTEM READY" }
-    $StatusColor = if ($RebootPending) { "Red" } else { "Green" }
+    $Code      = Get-DepotExitCode
+    $Failures  = @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' })
+    $RebootPending = [bool]$script:RebootRequired
+    if ($Failures.Count -gt 0)  { $RebootStatus = "COMPLETED WITH FAILURES"; $StatusColor = "Red" }
+    elseif ($RebootPending)     { $RebootStatus = "REBOOT REQUIRED";         $StatusColor = "Red" }
+    else                        { $RebootStatus = "SYSTEM READY";            $StatusColor = "Green" }
     Write-HLine -Style "dashed"
     Write-Host "[>] Status  : " -NoNewline -ForegroundColor $script:LineCol
     Write-Host $RebootStatus -ForegroundColor $StatusColor -BackgroundColor Black
+    foreach ($f in $Failures) {
+        Write-Host "    [!] $($f.Step): $($f.Detail)" -ForegroundColor Red
+    }
+    if ($Failures.Count -gt 0 -and $RebootPending) {
+        Write-Host "    [!] A reboot is also pending." -ForegroundColor Yellow
+    }
     # Footer
     $_sfx    = "█"
     $_ftrW   = $script:ArtW + 1
-    $_ffillW = $script:Width - $_ftrW - $_sfx.Length
-    $_footer = "  ENDPOINT PROVISIONING SEQUENCE COMPLETE"
+    $_ffillW = [Math]::Max(0, $script:Width - $_ftrW - $_sfx.Length)
+    $_footer = if ($Failures.Count -gt 0) { "  ENDPOINT PROVISIONING SEQUENCE FINISHED WITH FAILURES" } else { "  ENDPOINT PROVISIONING SEQUENCE COMPLETE" }
     $_ver    = "| v1.2"
-    $_fpad   = " " * ($_ffillW - $_footer.Length - $_ver.Length)
+    $_fpad   = " " * [Math]::Max(0, $_ffillW - $_footer.Length - $_ver.Length)
     Write-Host ("-" * $_ffillW) -ForegroundColor $script:LineCol -NoNewline; Write-Host " $($script:Art1)" -ForegroundColor $script:AccentCol -NoNewline; Write-Host $_sfx -ForegroundColor $script:LineCol
     Write-Host "$_footer$_fpad$_ver" -ForegroundColor $script:MainCol -NoNewline; Write-Host " $($script:Art2)" -ForegroundColor $script:AccentCol -NoNewline; Write-Host $_sfx -ForegroundColor $script:LineCol
     Write-Host ("-" * $_ffillW) -ForegroundColor $script:LineCol -NoNewline; Write-Host " $($script:Art3)" -ForegroundColor $script:AccentCol -NoNewline; Write-Host $_sfx -ForegroundColor $script:LineCol
-    $Choice = Read-Host -Prompt "`nPress ENTER to exit, or type 'RESTART' to reboot"
-    # Self-delete always runs regardless of reboot choice
+
+    # One plain line for an RMM console or a log, always in agreement with the exit code.
+    $FinalLine = "DEPOT RESULT: exit code $Code - $RebootStatus"
+    if ($Failures.Count -gt 0) { $FinalLine += " (" + (($Failures | ForEach-Object { "$($_.Step): $($_.Detail)" }) -join '; ') + ")" }
+    Write-Output $FinalLine
+    Write-DepotRunLog -Code $Code
+
+    # Only a person at a console is asked anything. Unattended, there is no prompt and no reboot.
+    $Choice = ''
+    if (Test-DepotInteractive) {
+        $Choice = Read-Host -Prompt "`nPress ENTER to exit, or type 'RESTART' to reboot"
+    }
+    # Self-delete only after a good run (0 or 3010). After a failure the script stays so it can be rerun.
     $selfPath = $script:DepotScriptPath
-    if ($selfPath -and (Test-Path $selfPath)) {
+    if (($Code -eq 0 -or $Code -eq 3010) -and $selfPath -and (Test-Path $selfPath)) {
         Start-Process powershell -ArgumentList "-NoProfile -Command `"Start-Sleep 5; Remove-Item -Path '$selfPath' -Force`"" -WindowStyle Hidden
     }
     if ($Choice -eq "RESTART") { Restart-Computer -Force }
-    if ($RebootPending) { Exit-KillerScript 3010 }
-    Exit-KillerScript 0
+    Exit-KillerScript $Code
 }
 
 function Invoke-DepotMain {

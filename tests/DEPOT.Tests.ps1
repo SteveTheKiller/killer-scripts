@@ -403,3 +403,189 @@ Describe 'Finding 13: only DEPOT-owned processes are stopped' {
         } finally { $script:DepotTemp = $script:SavedTemp }
     }
 }
+
+Describe 'Finding 14: unattended runs, honest results and exit codes' {
+    BeforeEach {
+        Reset-DepotState
+        Mock Start-Sleep { }
+        Mock Write-Host { }
+        Mock Write-HLine { }
+        Mock Write-StatusTag { }
+        Mock Clear-Host { }
+        Mock Read-Host { throw 'a prompt was shown' }
+        Mock Restart-Computer { }
+        Mock Start-Process { }
+        Mock Remove-Item { } -ParameterFilter { $true }
+        Mock Test-Path { $false } -ParameterFilter { "$Path" -notlike "$TestDrive*" }
+        Mock Write-DepotRunLog { }
+        $script:DepotScriptPath = $null
+    }
+
+    Context 'no console, no technician' {
+        It 'Read-DepotChoice answers N without reading a key when the host is not interactive' {
+            Mock Test-DepotInteractive { $false }
+            Read-DepotChoice 'Rename? ' | Should -Be 'N'
+        }
+
+        It 'the interactive setup does nothing destructive when the host is not interactive' {
+            Mock Test-DepotInteractive { $false }
+            Mock Invoke-DepotRename { }
+            Mock New-DepotLocalAdmin { }
+            Mock Invoke-DepotAdminPurge { }
+            Invoke-DepotInteractiveSetup
+            Should -Invoke Invoke-DepotRename -Times 0 -Exactly
+            Should -Invoke New-DepotLocalAdmin -Times 0 -Exactly
+            Should -Invoke Invoke-DepotAdminPurge -Times 0 -Exactly
+        }
+
+        It 'a console that cannot be cleared does not stop the run' {
+            Mock Test-DepotInteractive { $false }
+            Mock Clear-Host { throw 'The handle is invalid' }
+            { Invoke-DepotInteractiveSetup } | Should -Not -Throw
+        }
+
+        It 'the final prompt is skipped and nothing restarts when the host is not interactive' {
+            Mock Test-DepotInteractive { $false }
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:0'
+            Should -Invoke Read-Host -Times 0 -Exactly
+            Should -Invoke Restart-Computer -Times 0 -Exactly
+        }
+
+        It 'a narrow width does not make the footer padding negative' {
+            Mock Test-DepotInteractive { $false }
+            $w = $script:Width
+            $script:Width = 30
+            try { { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:0' } finally { $script:Width = $w }
+        }
+    }
+
+    Context 'results decide the exit code' {
+        BeforeEach { Mock Test-DepotInteractive { $false } }
+
+        It 'exits 3 when some steps worked and one failed' {
+            Add-DepotResult 'Chrome' 'Done'
+            Add-DepotResult 'Zoom' 'Failed' 'download'
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:3'
+        }
+
+        It 'exits 1 when every step that ran failed' {
+            Add-DepotResult 'Chrome' 'Failed' 'exit 1603'
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:1'
+        }
+
+        It 'a failure outranks a pending reboot' {
+            Add-DepotResult 'Chrome' 'Done'
+            Add-DepotResult 'Zoom' 'Failed' 'download'
+            $script:RebootRequired = $true
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:3'
+        }
+
+        It 'exits 3010 for a clean run that needs a reboot, and 0 for a clean run that does not' {
+            Add-DepotResult 'Chrome' 'Done'
+            $script:RebootRequired = $true
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:3010'
+            $script:RebootRequired = $false
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:0'
+        }
+
+        It 'skipped and already-installed steps are not failures' {
+            Add-DepotResult 'Chrome' 'AlreadyInstalled'
+            Add-DepotResult 'Zoom' 'Skipped' 'ESC'
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:0'
+        }
+
+        It 'writes a plain final line whose code matches the exit code' {
+            Add-DepotResult 'Chrome' 'Done'
+            Add-DepotResult 'Zoom' 'Failed' 'download'
+            Mock Write-Output { }
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:3'
+            Should -Invoke Write-Output -Times 1 -Exactly -ParameterFilter { "$InputObject" -match 'exit code 3\b' -and "$InputObject" -match 'FAILURES' }
+        }
+
+        It 'the footer only says COMPLETE for a clean run' {
+            Add-DepotResult 'Zoom' 'Failed' 'download'
+            Mock Write-Host { } -ParameterFilter { "$Object" -match 'SEQUENCE COMPLETE' }
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:1'
+            Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { "$Object" -match 'SEQUENCE COMPLETE' }
+        }
+
+        It 'writes the run log' {
+            Add-DepotResult 'Zoom' 'Failed' 'download'
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:1'
+            Should -Invoke Write-DepotRunLog -Times 1 -Exactly
+        }
+    }
+
+    Context 'self-delete only after a good run' {
+        BeforeEach {
+            Mock Test-DepotInteractive { $false }
+            $script:DepotScriptPath = Join-Path $TestDrive 'DEPOT.ps1'
+            Set-Content -LiteralPath $script:DepotScriptPath -Value '# x'
+        }
+
+        It 'does not delete the script after a failed run, so the technician can rerun it' {
+            Add-DepotResult 'Zoom' 'Failed' 'download'
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:1'
+            Should -Invoke Start-Process -Times 0 -Exactly
+        }
+
+        It 'deletes the script after a clean run' {
+            Add-DepotResult 'Zoom' 'Done'
+            { Complete-Depot } | Should -Throw 'KILLERSCRIPT_EXIT:0'
+            Should -Invoke Start-Process -Times 1 -Exactly
+        }
+    }
+
+    Context 'steps record what really happened' {
+        It 'Show-Result records Failed for a failing exit code and Done for success' {
+            $script:DepotStep = 'Zoom'
+            Show-Result 1603
+            Show-Result 0
+            Show-Result $null
+            @($script:DepotResults | ForEach-Object { $_.Status }) -join ',' | Should -Be 'Failed,Done,Skipped'
+            @($script:DepotResults | ForEach-Object { $_.Step } | Select-Object -Unique) | Should -Be 'Zoom'
+        }
+
+        It 'Show-Result with 3010 marks a reboot as required' {
+            $script:DepotStep = 'Teams'
+            Show-Result 3010
+            $script:RebootRequired | Should -BeTrue
+        }
+
+        It 'a Windows Update trigger that fails records Failed and does not claim a reboot' {
+            Mock Stop-Service { }
+            Mock Start-Service { }
+            Mock Start-Process { throw 'UsoClient not found' }
+            Invoke-DepotWindowsUpdate
+            $script:RebootRequired | Should -BeFalse
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Failed' }).Count | Should -Be 1
+        }
+
+        It 'a Windows Update trigger that works records Done and a reboot' {
+            Mock Stop-Service { }
+            Mock Start-Service { }
+            Mock Start-Process { }
+            Invoke-DepotWindowsUpdate
+            $script:RebootRequired | Should -BeTrue
+            @($script:DepotResults | Where-Object { $_.Status -eq 'Done' }).Count | Should -Be 1
+        }
+    }
+
+    Context 'cleanup after a failed step keeps the evidence' {
+        BeforeEach {
+            Mock Clear-RecycleBin { }
+        }
+
+        It 'does not purge C:\Windows\Temp when a step failed' {
+            Add-DepotResult 'Zoom' 'Failed' 'download'
+            Invoke-DepotCleanup
+            Should -Invoke Remove-Item -Times 0 -Exactly -ParameterFilter { "$Path" -like 'C:\Windows\Temp*' }
+        }
+
+        It 'purges C:\Windows\Temp after a clean run' {
+            Add-DepotResult 'Zoom' 'Done'
+            Invoke-DepotCleanup
+            Should -Invoke Remove-Item -Times 1 -ParameterFilter { "$Path" -like 'C:\Windows\Temp*' }
+        }
+    }
+}
