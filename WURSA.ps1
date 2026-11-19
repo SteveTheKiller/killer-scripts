@@ -29,6 +29,23 @@ param(
     [switch]$No3rdParty,       # Skip Chocolatey / third-party app updates entirely
     [switch]$NoUpgrade         # Skip the feature upgrade check entirely (region 5)
 )
+# RMM agents often run 32-bit PowerShell, where System32 and HKLM\SOFTWARE are redirected to their
+# 32-bit copies. Relaunch in 64-bit PowerShell with the same arguments so tools and registry writes land.
+if ([IntPtr]::Size -eq 4 -and $env:PROCESSOR_ARCHITEW6432 -and $PSCommandPath -and -not $global:KillerScriptsTestMode) {
+    $ksArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    foreach ($ksKey in $PSBoundParameters.Keys) {
+        $ksVal = $PSBoundParameters[$ksKey]
+        if ($ksVal -is [System.Management.Automation.SwitchParameter]) { if ($ksVal.IsPresent) { $ksArgs += "-$ksKey" } }
+        else { $ksArgs += "-$ksKey"; $ksArgs += [string]$ksVal }
+    }
+    $ksArgs += $args
+    $ksPs = "$env:windir\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+    $ksNoInput = $true
+    try { $ksNoInput = [Console]::IsInputRedirected -or -not [Environment]::UserInteractive } catch { }
+    # With no real keyboard, hand the child a closed stdin so its prompts fail closed instead of hanging.
+    if ($ksNoInput) { $null | & $ksPs @ksArgs } else { & $ksPs @ksArgs }
+    exit $LASTEXITCODE
+}
 
 $_ver    = "| v4.0"
 

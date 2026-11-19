@@ -10,6 +10,23 @@
 #>
 
 # Captured at script level: $MyInvocation.MyCommand.Path is empty inside a function.
+# RMM agents often run 32-bit PowerShell, where System32 and HKLM\SOFTWARE are redirected to their
+# 32-bit copies. Relaunch in 64-bit PowerShell with the same arguments so tools and registry writes land.
+if ([IntPtr]::Size -eq 4 -and $env:PROCESSOR_ARCHITEW6432 -and $PSCommandPath -and -not $global:KillerScriptsTestMode) {
+    $ksArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    foreach ($ksKey in $PSBoundParameters.Keys) {
+        $ksVal = $PSBoundParameters[$ksKey]
+        if ($ksVal -is [System.Management.Automation.SwitchParameter]) { if ($ksVal.IsPresent) { $ksArgs += "-$ksKey" } }
+        else { $ksArgs += "-$ksKey"; $ksArgs += [string]$ksVal }
+    }
+    $ksArgs += $args
+    $ksPs = "$env:windir\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+    $ksNoInput = $true
+    try { $ksNoInput = [Console]::IsInputRedirected -or -not [Environment]::UserInteractive } catch { }
+    # With no real keyboard, hand the child a closed stdin so its prompts fail closed instead of hanging.
+    if ($ksNoInput) { $null | & $ksPs @ksArgs } else { & $ksPs @ksArgs }
+    exit $LASTEXITCODE
+}
 $script:DepotScriptPath = $MyInvocation.MyCommand.Path
 
 $script:Width     = 85
@@ -597,11 +614,14 @@ function Invoke-DepotWindowsUpdate {
         Start-Sleep -Seconds 3
 
         # Kick off the full WU cycle via Update Session Orchestrator - fire and forget
-        Start-Process "UsoClient.exe" -ArgumentList "StartScan"     -WindowStyle Hidden -ErrorAction Stop
+        # UsoClient only exists in the 64-bit System32. A 32-bit RMM host sees SysWOW64 there, so use Sysnative.
+        $sysDir = if ([IntPtr]::Size -eq 4 -and $env:PROCESSOR_ARCHITEW6432) { 'Sysnative' } else { 'System32' }
+        $uso = Join-Path $env:windir "$sysDir\UsoClient.exe"
+        Start-Process $uso -ArgumentList "StartScan"     -WindowStyle Hidden -ErrorAction Stop
         Start-Sleep -Seconds 2
-        Start-Process "UsoClient.exe" -ArgumentList "StartDownload" -WindowStyle Hidden -ErrorAction Stop
+        Start-Process $uso -ArgumentList "StartDownload" -WindowStyle Hidden -ErrorAction Stop
         Start-Sleep -Seconds 2
-        Start-Process "UsoClient.exe" -ArgumentList "StartInstall"  -WindowStyle Hidden -ErrorAction Stop
+        Start-Process $uso -ArgumentList "StartInstall"  -WindowStyle Hidden -ErrorAction Stop
         $script:RebootRequired = $true
         Add-DepotResult $script:DepotStep "Done" "triggered"
 

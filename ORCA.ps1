@@ -26,6 +26,23 @@ param(
     [switch]$Silent,
     [switch]$FullSignOut
 )
+# RMM agents often run 32-bit PowerShell, where System32 and HKLM\SOFTWARE are redirected to their
+# 32-bit copies. Relaunch in 64-bit PowerShell with the same arguments so tools and registry writes land.
+if ([IntPtr]::Size -eq 4 -and $env:PROCESSOR_ARCHITEW6432 -and $PSCommandPath -and -not $global:KillerScriptsTestMode) {
+    $ksArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    foreach ($ksKey in $PSBoundParameters.Keys) {
+        $ksVal = $PSBoundParameters[$ksKey]
+        if ($ksVal -is [System.Management.Automation.SwitchParameter]) { if ($ksVal.IsPresent) { $ksArgs += "-$ksKey" } }
+        else { $ksArgs += "-$ksKey"; $ksArgs += [string]$ksVal }
+    }
+    $ksArgs += $args
+    $ksPs = "$env:windir\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+    $ksNoInput = $true
+    try { $ksNoInput = [Console]::IsInputRedirected -or -not [Environment]::UserInteractive } catch { }
+    # With no real keyboard, hand the child a closed stdin so its prompts fail closed instead of hanging.
+    if ($ksNoInput) { $null | & $ksPs @ksArgs } else { & $ksPs @ksArgs }
+    exit $LASTEXITCODE
+}
 $EXIT_SUCCESS = 0   # Completed successfully
 $EXIT_ERROR   = 1   # Failure, or a precondition failed
 $EXIT_CANCEL  = 2   # User cancelled
@@ -706,12 +723,12 @@ function Invoke-OrcaMain {
             $WinGetTemp = Join-Path (Get-OrcaTempRoot) "WinGet"
             if (Test-Path $WinGetTemp) { Remove-Item $WinGetTemp -Recurse -Force -ErrorAction SilentlyContinue }
             if (-not (Test-OrcaWingetPresent)) {
-                if (-not (Get-Module -ListAvailable Microsoft.WinGet.Client)) {
-                    Install-PackageProvider -Name NuGet -Force | Out-Null
-                    Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser -AllowClobber | Out-Null
-                }
-                Import-Module Microsoft.WinGet.Client
-                Start-Process powershell.exe -ArgumentList "-NoProfile -Command `"Import-Module Microsoft.WinGet.Client; Repair-WinGetPackageManager -Latest`"" -WindowStyle Hidden -Wait
+                # Install, import and repair all run in one 64-bit child. A 32-bit RMM host can't load the module
+                # from its redirected profile, and Repair-WinGetPackageManager needs the 64-bit host anyway.
+                $psDir = if ([IntPtr]::Size -eq 4 -and $env:PROCESSOR_ARCHITEW6432) { 'Sysnative' } else { 'System32' }
+                $ps64  = Join-Path $env:windir "$psDir\WindowsPowerShell\v1.0\powershell.exe"
+                $wgCmd = "`$ProgressPreference='SilentlyContinue'; if (-not (Get-Module -ListAvailable Microsoft.WinGet.Client)) { Install-PackageProvider -Name NuGet -Force | Out-Null; Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope AllUsers -AllowClobber | Out-Null }; Import-Module Microsoft.WinGet.Client; Repair-WinGetPackageManager -Latest -AllUsers"
+                Start-Process $ps64 -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"$wgCmd`"" -WindowStyle Hidden -Wait
             } else {
                 Start-Process -FilePath "cmd.exe" -ArgumentList "/c winget source reset --force && winget source update --silent" -WindowStyle Hidden -Wait
             }
