@@ -770,7 +770,7 @@ exit `$c
 "@
 }
 
-function Invoke-IntuneInstall {
+function Invoke-BeamPublish {
     param(
         [string[]]$Targets,
         [string]$Url,
@@ -781,7 +781,8 @@ function Invoke-IntuneInstall {
         [string]$AppName,
         [string]$Publisher,
         [string]$TenantId,
-        [string]$RunId
+        [string]$RunId,
+        [string]$RunRoot
     )
     $runId = $RunId
     $intuneWorkDir = Join-Path (Get-BeamWorkRoot) "IntuneWork"
@@ -811,16 +812,26 @@ function Invoke-IntuneInstall {
     }
 
     $safeName = ($AppName -replace '[\\/:*?"<>|]', '_')
-    $srcDir = Join-Path $intuneWorkDir "src\$safeName"
-    $outDir = Join-Path $intuneWorkDir "out\$safeName"
-    @($intuneWorkDir, $srcDir, $outDir) | ForEach-Object { if (-not (Test-Path $_)) { New-Item -ItemType Directory -Path $_ -Force | Out-Null } }
+    # Every run packages from folders it creates itself, named for the run ID, so nothing left by an
+    # earlier or concurrent run (or by another app whose name sanitizes to the same text) can end up
+    # in the package. A folder that already exists is not ours: refuse it instead of reusing it.
+    if (-not $RunRoot) { $RunRoot = Join-Path $intuneWorkDir ("run-" + ($RunId -replace '[^A-Za-z0-9._-]', '_')) }
+    if (Test-Path -LiteralPath $RunRoot) {
+        Write-StepUpdate "Staging folder $RunRoot already exists, so it is not this run's: refusing to reuse it." FAIL
+        return $false
+    }
+    $srcDir = Join-Path $RunRoot "src"
+    $outDir = Join-Path $RunRoot "out"
+    try {
+        New-Item -ItemType Directory -Path $srcDir -Force -ErrorAction Stop | Out-Null
+        New-Item -ItemType Directory -Path $outDir -Force -ErrorAction Stop | Out-Null
+    } catch { Write-StepUpdate "Could not create the staging folder: $_" FAIL; return $false }
 
     $localExe = Join-Path $srcDir $SetupFile
 
     # Stage a fresh copy of the installer on every run (no caching): a re-run against a tenant where
     # the app/group already exist must still replace the content, so we re-stage, re-package, and
-    # upload a new content version each time. Remove any stale copy first.
-    if (Test-Path $localExe) { Remove-Item $localExe -Force -ErrorAction SilentlyContinue }
+    # upload a new content version each time.
     if ($Url) {
         Write-StepUpdate "Downloading $SetupFile..." INFO
         try {
@@ -869,11 +880,17 @@ function Invoke-IntuneInstall {
         }
     }
 
+    # The package source must hold exactly the one installer BEAM staged and nothing else.
+    if (-not (Test-BeamStagingManifest -Dir $srcDir -SetupFile $SetupFile)) {
+        Write-StepUpdate "The staging folder does not contain exactly ${SetupFile}: refusing to package it." FAIL
+        return $false
+    }
+
     Write-StepUpdate "Packaging with IntuneWinAppUtil..." INFO
-    Get-ChildItem $outDir | Remove-Item -Force
     Invoke-BeamPackager -Tool $script:BeamToolPath -SourceDir $srcDir -SetupFile $SetupFile -OutDir $outDir
-    $intunewinFile = Get-ChildItem $outDir -Filter "*.intunewin" | Select-Object -First 1
-    if (-not $intunewinFile) { Write-StepUpdate "Packaging failed: no .intunewin output" FAIL; return $false }
+    $intunewinFiles = @(Get-ChildItem -LiteralPath $outDir -Filter "*.intunewin")
+    if ($intunewinFiles.Count -ne 1) { Write-StepUpdate "Packaging failed: expected one .intunewin output, found $($intunewinFiles.Count)" FAIL; return $false }
+    $intunewinFile = $intunewinFiles[0]
     Write-StepUpdate "Packaged: $($intunewinFile.Name) ($([math]::Round($intunewinFile.Length/1MB,1)) MB)" OK
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1143,6 +1160,47 @@ exit 1
     Write-StepUpdate "Group: $groupName ($($group.id))" INFO
     Write-Host ""
     return $true
+}
+
+function Test-BeamStagingManifest {
+    # True only when the folder holds exactly one file and it is the expected installer.
+    param([string]$Dir, [string]$SetupFile)
+    $items = @(Get-ChildItem -LiteralPath $Dir -Force -ErrorAction SilentlyContinue)
+    return ($items.Count -eq 1 -and -not $items[0].PSIsContainer -and $items[0].Name -ieq $SetupFile)
+}
+
+function Invoke-IntuneInstall {
+    # Publishes the app and returns $true or $false. The run's own staging folder is removed when the
+    # run ends, success or not. A folder that already existed is never ours, so it is left alone.
+    # Any unexpected error is a failed run with a message, never an unhandled throw.
+    param(
+        [string[]]$Targets,
+        [string]$Url,
+        [string]$LocalPath,
+        [string]$SetupFile,
+        [bool]$IsMsi,
+        [string]$InstallArgs,
+        [string]$AppName,
+        [string]$Publisher,
+        [string]$TenantId,
+        [string]$RunId
+    )
+    $runRoot = Join-Path (Join-Path (Get-BeamWorkRoot) "IntuneWork") ("run-" + ($RunId -replace '[^A-Za-z0-9._-]', '_'))
+    $existed = Test-Path -LiteralPath $runRoot
+    $res = $false
+    try {
+        $out = @(Invoke-BeamPublish -Targets $Targets -Url $Url -LocalPath $LocalPath -SetupFile $SetupFile -IsMsi $IsMsi -InstallArgs $InstallArgs `
+            -AppName $AppName -Publisher $Publisher -TenantId $TenantId -RunId $RunId -RunRoot $runRoot)
+        $res = [bool]($out | Select-Object -Last 1)
+    } catch {
+        Write-StepUpdate "Unexpected error: $($_.Exception.Message)" FAIL
+        $res = $false
+    } finally {
+        if (-not $existed -and (Test-Path -LiteralPath $runRoot)) {
+            try { Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction Stop } catch { }
+        }
+    }
+    return $res
 }
 
 function Invoke-BeamMain {

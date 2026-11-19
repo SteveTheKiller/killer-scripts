@@ -478,4 +478,64 @@ Context 'Finding 64: a failed or timed-out Graph wait is reported, not fatal' {
         ($script:Log -join "`n") | Should -Match '\[FAIL\] PC01'
     }
 }
+
+Context 'Finding 46: every run packages from its own staging folder' {
+    BeforeEach { Add-FakeDevice 'PC01' }
+
+    It 'packages only the staged installer, never a stale file left by an earlier run' {
+        $legacy = Join-Path $script:WorkRoot 'IntuneWork\src\Contoso Agent'
+        New-Item -ItemType Directory -Path $legacy -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $legacy 'old-installer.exe') -Value 'MZ stale'
+        Invoke-Deploy -RunId 'RUN-AAAA' -KeepWork | Out-Null
+        $call = $script:PackagerCalls[0]
+        $call.Files | Should -Be @('setup.exe')
+        $call.SourceDir | Should -Match 'RUN-AAAA'
+        $call.OutDir | Should -Match 'RUN-AAAA'
+    }
+
+    It 'gives two runs whose app names sanitize to the same text separate folders' {
+        Invoke-Deploy -AppName 'Tool:One' -RunId 'RUN-1' -KeepWork | Out-Null
+        Invoke-Deploy -AppName 'Tool?One' -RunId 'RUN-2' -KeepWork | Out-Null
+        $script:PackagerCalls.Count | Should -Be 2
+        $script:PackagerCalls[0].SourceDir | Should -Not -Be $script:PackagerCalls[1].SourceDir
+        $script:PackagerCalls[0].OutDir | Should -Not -Be $script:PackagerCalls[1].OutDir
+    }
+
+    It 'refuses to reuse a staging folder that already exists for the same run ID' {
+        $taken = Join-Path $script:WorkRoot 'IntuneWork\run-RUN-TAKEN'
+        New-Item -ItemType Directory -Path $taken -Force | Out-Null
+        $r = Invoke-Deploy -RunId 'RUN-TAKEN' -KeepWork
+        ($r | Select-Object -Last 1) | Should -BeFalse
+        $script:PackagerCalls.Count | Should -Be 0
+        Test-Path -LiteralPath $taken | Should -BeTrue
+    }
+
+    It 'removes its own staging folder when the run ends, and nothing else' {
+        $other = Join-Path $script:WorkRoot 'IntuneWork\run-OTHER'
+        New-Item -ItemType Directory -Path $other -Force | Out-Null
+        Invoke-Deploy -RunId 'RUN-CLEAN' -KeepWork | Out-Null
+        Test-Path -LiteralPath (Join-Path $script:WorkRoot 'IntuneWork\run-RUN-CLEAN') | Should -BeFalse
+        Test-Path -LiteralPath $other | Should -BeTrue
+    }
+
+    It 'rejects a staging manifest with an extra or missing file' {
+        $d = Join-Path $TestDrive 'manifest'
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $d 'setup.exe') -Value 'MZ'
+        Test-BeamStagingManifest -Dir $d -SetupFile 'setup.exe' | Should -BeTrue
+        Set-Content -LiteralPath (Join-Path $d 'extra.dll') -Value 'x'
+        Test-BeamStagingManifest -Dir $d -SetupFile 'setup.exe' | Should -BeFalse
+        Remove-Item -LiteralPath (Join-Path $d 'extra.dll') -Force
+        Remove-Item -LiteralPath (Join-Path $d 'setup.exe') -Force
+        Test-BeamStagingManifest -Dir $d -SetupFile 'setup.exe' | Should -BeFalse
+    }
+
+    It 'reports a corrupt package as a failed run, not a crash' {
+        Mock Invoke-BeamPackager { Set-Content -LiteralPath (Join-Path $OutDir 'bad.intunewin') -Value 'not a zip' }
+        $r = $null
+        { $script:r = Invoke-Deploy } | Should -Not -Throw
+        ($script:r | Select-Object -Last 1) | Should -BeFalse
+        ($script:Log -join "`n") | Should -Match 'FAIL\].*Unexpected error'
+    }
+}
 }
