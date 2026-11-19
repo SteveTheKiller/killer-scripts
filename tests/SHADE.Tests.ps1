@@ -170,3 +170,71 @@ Describe 'SHADE' {
         }
     }
 }
+
+Describe 'SHADE console guard' {
+    BeforeEach {
+        # Only the console boundaries throw. Write-StepUpdate and Write-Host stay real so the
+        # step lines are observable, exactly as in a redirected RMM or LiveConnect session.
+        Mock Get-ShadeConsoleValue { throw 'The handle is invalid.' }
+        Mock Set-ShadeConsolePosition { throw 'The handle is invalid.' }
+        Mock Set-ShadeConsoleUtf8 { throw 'The handle is invalid.' }
+        Mock Clear-Host { throw 'The handle is invalid.' }
+        Mock Get-CimInstance { $null }
+        Mock Get-ItemProperty { [pscustomobject]@{ DisplayVersion = '23H2' } }
+        Mock Test-IsAdmin { $true }
+        Mock Test-IsSystem { $false }
+        Mock Get-LoadedUserSids { @() }
+        Mock Test-Path { $true }
+        Mock New-Item {} -ParameterFilter { $true }
+        Mock Set-ItemProperty {} -ParameterFilter { $true }
+        Mock Get-Service { [pscustomobject]@{ Name = $Name } }
+        Mock Stop-Service {}
+        Mock Set-Service {}
+        Mock Invoke-ScDisable {}
+        Mock Remove-Item {} -ParameterFilter { $true }
+
+        function Get-GuardRun {
+            $code = -1
+            $script:GuardErrors = 0
+            $script:GuardLines = New-Object System.Collections.ArrayList
+            try {
+                Invoke-ShadeMain *>&1 | ForEach-Object {
+                    if ($_ -is [System.Management.Automation.ErrorRecord]) { $script:GuardErrors++ }
+                    [void]$script:GuardLines.Add([string]$_)
+                }
+            } catch {
+                if ($_.Exception.Message -match 'KILLERSCRIPT_EXIT:(\d+)') { $code = [int]$Matches[1] } else { throw }
+            }
+            [pscustomobject]@{ Code = $code; Lines = @($script:GuardLines); Errors = $script:GuardErrors }
+        }
+    }
+
+    It 'prints every step line, writes no errors and keeps exit 0 and the PASS line' {
+        $r = Get-GuardRun
+        $r.Errors | Should -Be 0
+        $r.Code | Should -Be 0
+        $text = $r.Lines -join "`n"
+        foreach ($n in 1..8) {
+            $tag = '[{0:D2}/08]' -f $n
+            $text | Should -Match ([regex]::Escape($tag))
+        }
+        @($r.Lines | Where-Object { $_ -match '\[SUCCESS\]' }).Count | Should -Be 8
+        $text | Should -Not -Match 'handle is invalid'
+        $r.Lines[-1] | Should -Match '\[PASS\] SHADE.*\(exit 0\)'
+    }
+
+    It 'keeps exit 3 and the FAIL line when a value fails and the console throws' {
+        Mock Set-ItemProperty { throw 'access denied' } -ParameterFilter { $Name -eq 'DisableLocation' }
+        $r = Get-GuardRun
+        $r.Errors | Should -Be 0
+        $r.Code | Should -Be 3
+        $r.Lines[-1] | Should -Match '\(exit 3\)'
+    }
+
+    It 'still exits 2 without errors when not elevated and the console throws' {
+        Mock Test-IsAdmin { $false }
+        $r = Get-GuardRun
+        $r.Code | Should -Be 2
+        $r.Lines[-1] | Should -Match '\(exit 2\)'
+    }
+}
