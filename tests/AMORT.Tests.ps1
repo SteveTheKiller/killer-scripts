@@ -55,6 +55,7 @@ Describe 'AMORT' {
         $script:ExistingPaths = @()
         $script:TiService  = [pscustomobject]@{ Name = 'TrustedInstaller'; Status = 'Stopped'; StartType = 'Manual' }
         $script:StartedProcs = New-Object System.Collections.ArrayList
+        $script:StartedFiles = New-Object System.Collections.ArrayList
 
         Mock Test-AmortElevated { $script:Elevated }
         Mock Test-AmortConsole { $false }
@@ -99,6 +100,7 @@ Describe 'AMORT' {
         }
         Mock Start-AmortProcess {
             [void]$script:StartedProcs.Add($StartInfo.Arguments)
+            [void]$script:StartedFiles.Add($StartInfo.FileName)
             $code = 0
             foreach ($k in $script:ExitCodes.Keys) { if ($StartInfo.Arguments -like "*$k*") { $code = $script:ExitCodes[$k] } }
             New-FakeProc -ExitCode $code
@@ -413,6 +415,26 @@ Describe 'AMORT' {
             Mock Test-Path { $false } -ParameterFilter { "$Path" -like 'C:*' }
             & ([scriptblock]::Create($script:RealRemoveWindowsOldText))
             Should -Invoke Invoke-AmortTool -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'DISM.exe' -and ($ArgumentList -contains '/Remove-OSUninstall') }
+        }
+    }
+
+    Describe 'Native tools on a 32-bit host' {
+        It 'Get-AmortNativePath returns the plain name on a 64-bit host' {
+            Mock Test-AmortWow64 { $false }
+            Get-AmortNativePath 'vssadmin.exe' | Should -Be 'vssadmin.exe'
+        }
+
+        It 'Get-AmortNativePath goes through Sysnative on a 32-bit host so System32 is not redirected' {
+            Mock Test-AmortWow64 { $true }
+            Get-AmortNativePath 'vssadmin.exe' | Should -Be (Join-Path $env:windir 'Sysnative\vssadmin.exe')
+        }
+
+        It 'launches repair through the native cmd.exe on a 32-bit host' {
+            Mock Test-AmortWow64 { $true }
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 0
+            $script:StartedFiles.Count | Should -Be 3
+            @($script:StartedFiles | Where-Object { $_ -ne (Join-Path $env:windir 'Sysnative\cmd.exe') }).Count | Should -Be 0
         }
     }
 }

@@ -68,9 +68,20 @@ function Start-AmortProcess {
     param([System.Diagnostics.ProcessStartInfo]$StartInfo)
     [System.Diagnostics.Process]::Start($StartInfo)
 }
+# A 32-bit host on 64-bit Windows (some RMM agents launch one) sees a redirected System32.
+# Sysnative reaches the real one, so DISM, vssadmin and cmd act on the running system.
+function Test-AmortWow64 {
+    [Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess
+}
+function Get-AmortNativePath {
+    param([string]$Name)
+    if (Test-AmortWow64) { return (Join-Path $env:windir ("Sysnative" + [IO.Path]::DirectorySeparatorChar + $Name)) }
+    $Name
+}
 # Runs a native tool and returns its exit code and output, so callers can check the result.
 function Invoke-AmortTool {
     param([string]$FilePath, [string[]]$ArgumentList = @())
+    if ($FilePath -notmatch '[\\/]') { $FilePath = Get-AmortNativePath $FilePath }
     $out = & $FilePath @ArgumentList 2>&1
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = (@($out) -join [Environment]::NewLine) }
 }
@@ -873,7 +884,7 @@ if (-not $SkipRepair -and -not $DryRun) {
                 # Use .NET Process directly; Start-Process -PassThru returns $null ExitCode
                 # when combined with -RedirectStandardOutput. Wrap in cmd.exe for file redirection.
                 $psi1 = New-Object System.Diagnostics.ProcessStartInfo
-                $psi1.FileName               = "cmd.exe"
+                $psi1.FileName               = Get-AmortNativePath "cmd.exe"
                 $psi1.Arguments              = "/c dism.exe /Online /Cleanup-Image /RestoreHealth /NoRestart > `"$DismTmp1`" 2>&1"
                 $psi1.UseShellExecute        = $false
                 $psi1.CreateNoWindow         = $true
@@ -952,7 +963,7 @@ if (-not $SkipRepair -and -not $DryRun) {
                 $DismTmp2 = New-AmortTempFile
 
                 $psi2 = New-Object System.Diagnostics.ProcessStartInfo
-                $psi2.FileName               = "cmd.exe"
+                $psi2.FileName               = Get-AmortNativePath "cmd.exe"
                 $psi2.Arguments              = "/c dism.exe /Online /Cleanup-Image /StartComponentCleanup /NoRestart > `"$DismTmp2`" 2>&1"
                 $psi2.UseShellExecute        = $false
                 $psi2.CreateNoWindow         = $true
@@ -1027,7 +1038,7 @@ if (-not $SkipRepair -and -not $DryRun) {
 
                 # sfc.exe writes Unicode; capture via cmd redirection for reliable exit code
                 $psi3 = New-Object System.Diagnostics.ProcessStartInfo
-                $psi3.FileName               = "cmd.exe"
+                $psi3.FileName               = Get-AmortNativePath "cmd.exe"
                 $psi3.Arguments              = "/c sfc.exe /scannow > `"$SfcTmp`" 2>&1"
                 $psi3.UseShellExecute        = $false
                 $psi3.CreateNoWindow         = $true
