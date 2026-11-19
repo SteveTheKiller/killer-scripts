@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    System Hardening Against Data Exposure (SHADE) v2.0
+    System Hardening Against Data Exposure (SHADE) v2.1
     Developed by Steve the Killer | Updated: 2026-11-18
 .DESCRIPTION
     Comprehensive Windows 10/11 privacy hardening for security-conscious
@@ -10,7 +10,7 @@
     phone-home behavior. Safe for MSP deployment on Pro, Business, and
     Enterprise SKUs. A reboot is recommended after running.
 #>
-$_fver = "| v2.0"
+$_fver = "| v2.1"
 
 function Exit-KillerScript {
     param([int]$Code)
@@ -52,6 +52,33 @@ function Get-SystemData {
 $script:StepRow = 0
 $script:LastStepMessage = ""
 
+# Console access is guarded. With output redirected (RMM, Kaseya LiveConnect) the console handle
+# is invalid, so every call falls back to plain line output instead of printing errors.
+function Get-ShadeConsoleValue {
+    param([string]$Name)
+    [Console]::$Name
+}
+function Set-ShadeConsolePosition {
+    param([int]$Left, [int]$Top)
+    [Console]::SetCursorPosition($Left, $Top)
+}
+function Set-ShadeConsoleUtf8 {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+}
+function Get-ShadeCursorTop   { try { [int](Get-ShadeConsoleValue 'CursorTop') }   catch { -1 } }
+function Get-ShadeCursorLeft  { try { [int](Get-ShadeConsoleValue 'CursorLeft') }  catch { -1 } }
+function Get-ShadeWindowWidth { try { [int](Get-ShadeConsoleValue 'WindowWidth') } catch { $script:Width + 1 } }
+function Set-ShadeCursor {
+    param([int]$Left, [int]$Top)
+    try { Set-ShadeConsolePosition $Left $Top; $true } catch { $false }
+}
+function Set-ShadeUtf8Output { try { Set-ShadeConsoleUtf8 } catch { } }
+function Clear-ShadeScreen   { try { Clear-Host -ErrorAction Stop } catch { } }
+
+# Standardized Console Output
+$script:StepRow = 0
+$script:LastStepMessage = ""
+
 function Write-StepUpdate {
     param([string]$Message, [switch]$Success, [string]$CustomInfo)
     $isDone = $Success -or ($CustomInfo -eq "[SKIPPED]")
@@ -70,43 +97,51 @@ function Write-StepUpdate {
     }
 
     if ($Message -and -not $isDone) {
-        $script:StepRow = [Console]::CursorTop
+        $script:StepRow = Get-ShadeCursorTop
         & $writeMsg $printMsg $false
         Write-Host ""
     }
     elseif ($isDone) {
-        $currentPos = [Console]::CursorTop
-        [Console]::SetCursorPosition(0, $script:StepRow)
-        Write-Host (" " * ([Console]::WindowWidth - 1)) -NoNewline
-        [Console]::SetCursorPosition(0, $script:StepRow)
+        $currentPos = Get-ShadeCursorTop
+        # Rewrite the pending line in place when the console allows it. Otherwise print the
+        # completed line on a new line, so every step still shows in a redirected session.
+        $inPlace = ($currentPos -ge 0) -and ($script:StepRow -ge 0)
+        if ($inPlace) { $inPlace = Set-ShadeCursor 0 $script:StepRow }
+        if ($inPlace) {
+            Write-Host (" " * [Math]::Max(0, (Get-ShadeWindowWidth) - 1)) -NoNewline
+            [void](Set-ShadeCursor 0 $script:StepRow)
+        }
         & $writeMsg $printMsg $true
+        $col = $printMsg.Length
 
         if ($CustomInfo) {
             if ($CustomInfo -eq "[SKIPPED]") {
                 $tag = "[SKIPPED]"
-                $currentCol = [Console]::CursorLeft
+                $currentCol = if ($inPlace) { Get-ShadeCursorLeft } else { -1 }
+                if ($currentCol -lt 0) { $currentCol = $col }
                 $targetCol  = $script:Width - $tag.Length
                 if ($targetCol -gt $currentCol) { Write-Host (" " * ($targetCol - $currentCol)) -NoNewline }
                 Write-Host $tag -ForegroundColor Yellow
             } else {
                 Write-Host " $CustomInfo" -NoNewline -ForegroundColor Gray
+                $col += 1 + $CustomInfo.Length
             }
         }
 
         if ($Success) {
             $tag = "[SUCCESS]"
-            $currentCol = [Console]::CursorLeft
+            $currentCol = if ($inPlace) { Get-ShadeCursorLeft } else { -1 }
+            if ($currentCol -lt 0) { $currentCol = $col }
             $targetCol  = $script:Width - $tag.Length
             if ($targetCol -gt $currentCol) { Write-Host (" " * ($targetCol - $currentCol)) -NoNewline }
             Write-Host $tag -ForegroundColor Green
         }
 
-        if ($currentPos -gt $script:StepRow) {
-            [Console]::SetCursorPosition(0, $currentPos)
+        if ($inPlace -and $currentPos -gt $script:StepRow) {
+            [void](Set-ShadeCursor 0 $currentPos)
         }
     }
 }
-
 function Write-HLine {
     param(
         [string]$Style = "dashed",
@@ -210,7 +245,7 @@ function Invoke-ShadeMain {
 #region Pre-Flight Checks
 # ============================================================================
     # Force UTF-8 output so box-drawing characters render correctly
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Set-ShadeUtf8Output
     $OutputEncoding            = [System.Text.Encoding]::UTF8
 
 
@@ -232,7 +267,7 @@ function Invoke-ShadeMain {
     $OS     = Get-SystemData Win32_OperatingSystem
     $WinVer = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).DisplayVersion
 
-    Clear-Host
+    Clear-ShadeScreen
     $script:Width = 85
     $LineCol   = "DarkMagenta"
     $MainCol   = "DarkCyan"
