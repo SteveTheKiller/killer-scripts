@@ -77,6 +77,43 @@ function Remove-StareTask {
     $null
 }
 
+function Test-StareWritableByNonAdmin {
+    # True when someone other than SYSTEM, Administrators or TrustedInstaller can change or replace
+    # the file: through its own access list, its owner, or a folder above it. Anything that cannot
+    # be read counts as writable, so an unverified script is warned about.
+    param([string]$Path)
+    $fileMask = 0x2 -bor 0x4 -bor 0x10000 -bor 0x40000 -bor 0x80000   # WriteData, AppendData, Delete, ChangePermissions, TakeOwnership
+    $dirMask  = 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000           # DeleteSubdirectoriesAndFiles (replace a child), Delete, ChangePermissions, TakeOwnership
+    $sidType  = [System.Security.Principal.SecurityIdentifier]
+    $isTrusted = {
+        param([string]$Sid)
+        ($Sid -eq 'S-1-5-18') -or ($Sid -eq 'S-1-5-32-544') -or ($Sid -eq 'S-1-3-0') -or $Sid.StartsWith('S-1-5-80-')
+    }
+    try {
+        $current = $Path
+        $isFile  = $true
+        for ($depth = 0; $current -and $depth -lt 64; $depth++) {
+            $acl = Get-Acl -LiteralPath $current -ErrorAction Stop
+            if (-not (& $isTrusted $acl.GetOwner($sidType).Value)) { return $true }
+            $mask = if ($isFile) { $fileMask } else { $dirMask }
+            foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
+                if ([string]$rule.AccessControlType -ne 'Allow') { continue }
+                if (([int]$rule.PropagationFlags -band 2) -ne 0) { continue }   # InheritOnly: not this object
+                if (([int]$rule.FileSystemRights -band $mask) -eq 0) { continue }
+                if (& $isTrusted $rule.IdentityReference.Value) { continue }
+                return $true
+            }
+            $parent = Split-Path -Path $current -Parent
+            if ($parent -eq $current) { break }
+            $current = $parent
+            $isFile  = $false
+        }
+        return $false
+    } catch {
+        return $true
+    }
+}
+
 function Get-StareScheduleService {
     $svc = New-Object -ComObject "Schedule.Service"
     $svc.Connect()
@@ -346,10 +383,27 @@ function Invoke-TaskCreationWizard {
                     if ($selected.PSIsContainer) {
                         $currentDir = $selected.FullName
                     } else {
-                        $scriptPathForHeader = $selected.FullName
-                        $execPath = "powershell.exe"
-                        $execArgs = "-ExecutionPolicy Bypass -File `"$($selected.FullName)`""
-                        $action = New-ScheduledTaskAction -Execute $execPath -Argument $execArgs
+                        # The task runs as SYSTEM with -ExecutionPolicy Bypass. If non-administrators can
+                        # change this file, they can run code as SYSTEM, so the technician must confirm.
+                        $approved = $true
+                        if (Test-StareWritableByNonAdmin -Path $selected.FullName) {
+                            Write-Host "[!] WARNING: '$($selected.FullName)' can be changed by non-administrators." -ForegroundColor $script:WarnFG
+                            Write-Host "    The task would run it as SYSTEM with -ExecutionPolicy Bypass, so anyone who can edit it gets SYSTEM." -ForegroundColor $script:WarnFG
+                            Write-Host "    Move it somewhere only administrators can write, or schedule it anyway." -ForegroundColor $script:MutedFG
+                            Write-Host " Schedule it anyway? [Y/N]: " -ForegroundColor $script:WarnFG -NoNewline
+                            $riskKey = Read-StareKey
+                            if ($riskKey.Key -ne [ConsoleKey]::Y) {
+                                $approved = $false
+                                Write-Host "Not scheduled." -ForegroundColor $script:MutedFG
+                                Start-Sleep -Seconds 1
+                            }
+                        }
+                        if ($approved) {
+                            $scriptPathForHeader = $selected.FullName
+                            $execPath = "powershell.exe"
+                            $execArgs = "-ExecutionPolicy Bypass -File `"$($selected.FullName)`""
+                            $action = New-ScheduledTaskAction -Execute $execPath -Argument $execArgs
+                        }
                     }
                 }
             }

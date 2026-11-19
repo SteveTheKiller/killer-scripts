@@ -79,8 +79,8 @@ Describe 'STARE' {
         # Identity and console boundaries
         Mock Test-StareElevated { $true }
         Mock Test-StareConsole { $true }
-        Mock Read-StareKey { $script:KeyQueue.Dequeue() }
-        Mock Read-Esc { $script:LineQueue.Dequeue() }
+        Mock Read-StareKey { if ($script:KeyQueue.Count -gt 0) { $script:KeyQueue.Dequeue() } else { New-TestKey 'ESC' } }
+        Mock Read-Esc { if ($script:LineQueue.Count -gt 0) { $script:LineQueue.Dequeue() } else { $null } }
         Mock Get-StareCursor { [pscustomobject]@{ X = 0; Y = 0 } }
         Mock Move-StareCursor {}
         Mock Clear-Host {}
@@ -261,6 +261,94 @@ Describe 'STARE' {
             @($script:Fake.Folder.Calls) | Should -Be @('Register:Nightly:6')
             $r.Code | Should -Be 0 -Because $r.All
             $r.Host | Should -Match "Task 'Nightly' Created Successfully"
+        }
+    }
+
+    Context 'finding 72: a script that non-administrators can edit is not scheduled as SYSTEM without a warning' {
+        BeforeEach {
+            $script:Picked = [pscustomobject]@{ Name = 'fix.ps1'; FullName = 'C:\Users\Public\fix.ps1'; PSIsContainer = $false; Extension = '.ps1' }
+            Mock Get-ChildItem { @($script:Picked) }
+        }
+        It 'warns, schedules nothing and returns to the browser when the technician declines' {
+            Mock Test-StareWritableByNonAdmin { $true }
+            Set-Script -Keys 'C', '2', 'N', 'ESC', 'Q' -Lines 'FixJob', '1', $null
+            $r = Get-Run
+            $r.Host | Should -Match 'WARNING.*can be changed by non-administrators'
+            $r.Host | Should -Match 'SYSTEM'
+            Should -Invoke Register-ScheduledTask -Times 0 -Exactly
+            $r.Code | Should -Be 0 -Because $r.All
+        }
+        It 'schedules it only after the technician confirms the warning' {
+            Mock Test-StareWritableByNonAdmin { $true }
+            Set-Script -Keys 'C', '2', 'Y', '4', 'X', 'Q' -Lines 'FixJob', '1'
+            $r = Get-Run
+            $r.Host | Should -Match 'WARNING.*can be changed by non-administrators'
+            Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter { $Action.Arguments -like '*C:\Users\Public\fix.ps1*' }
+            $r.Code | Should -Be 0 -Because $r.All
+        }
+        It 'asks nothing and warns about nothing when only administrators can change the script' {
+            Mock Test-StareWritableByNonAdmin { $false }
+            Set-Script -Keys 'C', '2', '4', 'X', 'Q' -Lines 'FixJob', '1'
+            $r = Get-Run
+            $r.Host | Should -Not -Match 'WARNING'
+            Should -Invoke Register-ScheduledTask -Times 1 -Exactly
+            $script:KeyQueue.Count | Should -Be 0
+            $r.Code | Should -Be 0 -Because $r.All
+        }
+    }
+
+    Context 'finding 72: Test-StareWritableByNonAdmin reads the real access list' {
+        BeforeAll {
+            function New-TestAcl {
+                param([string]$Owner = 'S-1-5-32-544', [object[]]$Allow = @(), [switch]$Directory)
+                $acl = if ($Directory) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
+                $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier($Owner)))
+                foreach ($a in $Allow) {
+                    $sid = New-Object System.Security.Principal.SecurityIdentifier($a.Sid)
+                    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, [System.Security.AccessControl.FileSystemRights]$a.Rights, [System.Security.AccessControl.AccessControlType]'Allow')))
+                }
+                $acl
+            }
+            function New-AdminOnlyAcls {
+                # SYSTEM and Administrators full control, Users read only, on the script, its folder and the drive root.
+                $allow = @(
+                    @{ Sid = 'S-1-5-18';     Rights = 'FullControl' },
+                    @{ Sid = 'S-1-5-32-544'; Rights = 'FullControl' },
+                    @{ Sid = 'S-1-5-32-545'; Rights = 'ReadAndExecute' }
+                )
+                @{
+                    'C:\Tools\fix.ps1' = (New-TestAcl -Allow $allow)
+                    'C:\Tools'         = (New-TestAcl -Allow $allow -Directory)
+                    'C:\'              = (New-TestAcl -Allow $allow -Directory)
+                }
+            }
+        }
+        BeforeEach {
+            $script:Acls = New-AdminOnlyAcls
+            Mock Get-Acl { $key = [string]$LiteralPath; if ($script:Acls.ContainsKey($key)) { $script:Acls[$key] } else { throw "no access list for $key" } }
+        }
+        It 'is false when only SYSTEM and Administrators can change the file and its folders' {
+            Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeFalse
+        }
+        It 'is true when Authenticated Users can modify the file' {
+            $script:Acls['C:\Tools\fix.ps1'] = New-TestAcl -Allow @(@{ Sid = 'S-1-5-18'; Rights = 'FullControl' }, @{ Sid = 'S-1-5-11'; Rights = 'Modify' })
+            Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeTrue
+        }
+        It 'is true when Users have full control of a folder above the file, because they can replace it' {
+            $script:Acls['C:\Tools'] = New-TestAcl -Directory -Allow @(@{ Sid = 'S-1-5-18'; Rights = 'FullControl' }, @{ Sid = 'S-1-5-32-545'; Rights = 'FullControl' })
+            Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeTrue
+        }
+        It 'is true when a standard user owns the file, because an owner can rewrite its permissions' {
+            $script:Acls['C:\Tools\fix.ps1'] = New-TestAcl -Owner 'S-1-5-21-1111-2222-3333-1001' -Allow @(@{ Sid = 'S-1-5-18'; Rights = 'FullControl' })
+            Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeTrue
+        }
+        It 'is false when Users can only create new files in the folder, which does not replace the script' {
+            $script:Acls['C:\Tools'] = New-TestAcl -Directory -Allow @(@{ Sid = 'S-1-5-18'; Rights = 'FullControl' }, @{ Sid = 'S-1-5-32-545'; Rights = 'CreateFiles' })
+            Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeFalse
+        }
+        It 'is true when the access list cannot be read, so an unverified script is warned about' {
+            $script:Acls.Remove('C:\Tools')
+            Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeTrue
         }
     }
 }
