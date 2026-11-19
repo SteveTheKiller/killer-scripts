@@ -10,15 +10,22 @@
     pollution. Supports an interactive per-user or system-wide scope
     selection with ESC-to-abort.
 
-    Scope is never assumed. Set $MaceScope = 'AllUsers' (or a profile folder
-    name such as 'jsmith') before running unattended; without it a
-    non-interactive run stops with exit 2 and changes nothing. A single
-    profile only loses its own processes, user-scope apps and files; Office,
-    machine-wide Teams, system folders and HKLM keys need AllUsers. The
-    OneDrive sync folder is never deleted.
+    Scope defaults to All Users, so the apps are removed from the computer.
+    Optionally set $MaceScope = 'jsmith' (a profile folder name) before
+    running to limit the cleanup to one profile. A single profile only loses
+    its own processes, user-scope apps, files and registry; Office,
+    machine-wide Teams, system folders and HKLM keys are All Users work.
+    An unrecognized $MaceScope or an invalid menu key stops with exit 2.
 
-    Exit codes: 0 success, 1 failure, 2 not elevated or no scope chosen,
-    3 partial success.
+    Microsoft app settings, caches and profile data are wiped for a clean
+    slate. User documents are never deleted: Documents, Desktop and
+    Pictures, OneDrive sync folders and .pst mail archives are left in
+    place (other files in the same folders are still removed). A shell
+    folder that points into OneDrive is only repaired when its target is
+    missing and no files sit in another OneDrive folder.
+
+    Exit codes: 0 success, 1 failure, 2 not elevated or invalid scope,
+    3 partial success (for example a kept .pst or an uncleared credential).
 #>
 
 #region 0: HELPERS
@@ -182,6 +189,62 @@ function Write-Banner {
     }
 }
 
+$UserRegKeys   = @(
+    "Software\Microsoft\OneDrive",
+    "Software\Microsoft\Office",
+    "Software\Microsoft\Teams",
+    "Software\Microsoft\Olk",
+    "Software\Microsoft\Office\16.0\Outlook"
+)
+$UserRunValues = @("OneDrive", "Teams", "com.squirrel.Teams.Teams")
+$ShellFixes    = @(
+    @{ Name = "Personal";    Default = "%USERPROFILE%\Documents"; Dir = "Documents" },
+    @{ Name = "Desktop";     Default = "%USERPROFILE%\Desktop";   Dir = "Desktop"   },
+    @{ Name = "My Pictures"; Default = "%USERPROFILE%\Pictures";  Dir = "Pictures"  },
+    @{ Name = "My Music";    Default = "%USERPROFILE%\Music";     Dir = "Music"     },
+    @{ Name = "My Video";    Default = "%USERPROFILE%\Videos";    Dir = "Videos"    }
+)
+
+
+function Test-MaceUnderOrOver {
+    param([string]$A, [string]$B)
+    $a = $A.TrimEnd('\'); $b = $B.TrimEnd('\')
+    ($a -eq $b) -or $a.StartsWith("$b\", [StringComparison]::OrdinalIgnoreCase) -or $b.StartsWith("$a\", [StringComparison]::OrdinalIgnoreCase)
+}
+function Get-MaceProtectedRoots {
+    # User document locations that cleanup must never delete, inside or above.
+    param([string[]]$Profiles)
+    foreach ($p in $Profiles) {
+        foreach ($n in "Documents", "Desktop", "Pictures") { Join-Path $p $n }
+        foreach ($d in @(Get-ChildItem -LiteralPath $p -Directory -Force -Filter "OneDrive*" -ErrorAction SilentlyContinue)) { $d.FullName }
+    }
+}
+function Find-MaceProtectedFiles {
+    param([string]$Path)
+    @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -Filter "*.pst" -ErrorAction SilentlyContinue)
+}
+function Remove-MaceTree {
+    # Deletes a folder unless it is, holds or sits inside a user document location. A folder that
+    # holds a .pst mail archive is wiped around the archive, which stays where it is.
+    param([string]$Path, [string[]]$ProtectedRoots)
+    foreach ($root in $ProtectedRoots) {
+        if (Test-MaceUnderOrOver $Path $root) {
+            [void]$script:MacePartial.Add("left $Path in place (user documents)")
+            return
+        }
+    }
+    $pst = @(Find-MaceProtectedFiles -Path $Path)
+    if ($pst.Count -eq 0) {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        return
+    }
+    foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        if ($child.PSIsContainer) { Remove-MaceTree -Path $child.FullName -ProtectedRoots $ProtectedRoots }
+        elseif ($child.Extension -ne ".pst") { Remove-Item -LiteralPath $child.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    foreach ($f in $pst) { [void]$script:MacePartial.Add("kept mail archive $($f.FullName)") }
+}
+
 function Invoke-PerUserRegistry {
     param([string]$HiveRoot, [string]$ProfilePath)
     foreach ($key in $UserRegKeys) {
@@ -199,6 +262,18 @@ function Invoke-PerUserRegistry {
     foreach ($fix in $ShellFixes) {
         $current = (Get-ItemProperty -Path $USFPath -Name $fix.Name -ErrorAction SilentlyContinue).$($fix.Name)
         if ($current -like "*OneDrive*") {
+            # Only repair a folder whose target is gone. Never point the user at a new empty folder
+            # while their files sit in OneDrive.
+            $expanded = [Environment]::ExpandEnvironmentVariables(([string]$current).Replace('%USERPROFILE%', $ProfilePath))
+            if ($expanded -match '%') { continue }
+            if (Test-Path -LiteralPath $expanded) { continue }
+            $elsewhere = $false
+            if ($ProfilePath) {
+                foreach ($od in @(Get-ChildItem -LiteralPath $ProfilePath -Directory -Force -Filter "OneDrive*" -ErrorAction SilentlyContinue)) {
+                    if (Test-Path -LiteralPath (Join-Path $od.FullName $fix.Dir)) { $elsewhere = $true }
+                }
+            }
+            if ($elsewhere) { continue }
             Set-ItemProperty -Path $USFPath -Name $fix.Name -Value $fix.Default -ErrorAction SilentlyContinue
             if ($ProfilePath) {
                 $absPath = Join-Path $ProfilePath $fix.Dir
@@ -265,9 +340,7 @@ function Invoke-MaceRun {
     Write-Host "[>] Device  : " -NoNewline -ForegroundColor $LineCol
     Write-Host $env:COMPUTERNAME -ForegroundColor $MainCol
 
-    # Scope is never assumed. It comes from $MaceScope ('AllUsers' or a profile folder name, set
-    # before running the script) or from an explicit menu choice. Anything else stops the script
-    # before it changes anything.
+    # Scope is All Users unless $MaceScope names one profile or the menu picks one.
     $PresetScope = Get-Variable -Name MaceScope -ValueOnly -ErrorAction SilentlyContinue
     $Choice = $null      # 'All' | 'Profile' | 'Abort' | 'Invalid'
     $SelectedProfile = $null
@@ -292,7 +365,8 @@ function Invoke-MaceRun {
         }
         Write-Host "    " -NoNewline
         Write-Host '[A]' -NoNewline -ForegroundColor $AccentCol
-        Write-Host " All Users (system-wide, removes Office and Teams for every account)" -ForegroundColor White
+        Write-Host " All Users (system-wide) " -NoNewline -ForegroundColor White
+        Write-Host '[Default, press Enter]' -ForegroundColor $DimCol
         Write-Host "    " -NoNewline
         Write-Host '[ESC]' -NoNewline -ForegroundColor $DimCol
         Write-Host " Exit" -ForegroundColor $DimCol
@@ -303,6 +377,8 @@ function Invoke-MaceRun {
             $Choice = 'Invalid'
         } elseif ($key.VirtualKeyCode -eq 27) {
             $Choice = 'Abort'
+        } elseif ($key.VirtualKeyCode -eq 13) {
+            $Choice = 'All'
         } else {
             $ScopeChoice = $key.Character.ToString()
             if ($ScopeChoice -match '^\d+$' -and [int]$ScopeChoice -lt $DetectedProfiles.Count) {
@@ -314,6 +390,9 @@ function Invoke-MaceRun {
                 $Choice = 'Invalid'
             }
         }
+    } else {
+        $Choice = 'All'
+        Write-Host "[>] Non-interactive session: using All Users scope." -ForegroundColor Yellow
     }
 
     if ($menuShown -and $menuRow -ge 0) {
@@ -336,12 +415,9 @@ function Invoke-MaceRun {
         if ($PresetScope) {
             Write-Host "[!] `$MaceScope '$PresetScope' does not match AllUsers or a profile folder under C:\Users. Nothing was changed." -ForegroundColor Yellow
             $script:MaceNote = "scope '$PresetScope' not recognized; nothing was changed"
-        } elseif ($IsInteractive) {
+        } else {
             Write-Host "[!] No valid scope was chosen. Nothing was changed." -ForegroundColor Yellow
             $script:MaceNote = "no valid scope chosen; nothing was changed"
-        } else {
-            Write-Host "[!] Non-interactive session and no scope set. Set `$MaceScope = 'AllUsers' (or a profile folder name) before running. Nothing was changed." -ForegroundColor Yellow
-            $script:MaceNote = "no scope set in a non-interactive session; nothing was changed"
         }
         $script:MaceExit = 2
         return
@@ -373,6 +449,8 @@ function Invoke-MaceRun {
     Write-Host $ScopeLabel -ForegroundColor Yellow
     Write-HLine -Style dashed
     $Partial = New-Object System.Collections.ArrayList
+    $script:MacePartial = $Partial
+    $ProtectedRoots = @(Get-MaceProtectedRoots -Profiles $TargetProfiles)
     #endregion
 
     #region 3: PROCESS TERMINATION
@@ -558,8 +636,9 @@ function Invoke-MaceRun {
         "C:\Program Files (x86)\Microsoft\Teams",
         "C:\Program Files (x86)\Microsoft\TeamsMachineInstaller"
     )
-    # Client and cache folders only. The OneDrive sync root (<profile>\OneDrive and any
-    # "OneDrive - <org>" folder) holds user files that may exist nowhere else, so it is never removed.
+    # Microsoft app data is wiped. The OneDrive sync root (<profile>\OneDrive and any
+    # "OneDrive - <org>" folder) holds user files that may exist nowhere else, so it is never
+    # removed, and Remove-MaceTree keeps Documents, Desktop, Pictures and .pst archives.
     $RelUserPaths = @(
         "AppData\Local\Microsoft\OneDrive",
         "AppData\Local\Microsoft\Olk",
@@ -578,13 +657,13 @@ function Invoke-MaceRun {
     )
     if ($AllUsers) {
         foreach ($folder in $SystemFolders) {
-            if (Test-Path $folder) { Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $folder) { Remove-MaceTree -Path $folder -ProtectedRoots $ProtectedRoots }
         }
     }
     foreach ($profilePath in $TargetProfiles) {
         foreach ($rel in $RelUserPaths) {
             $full = Join-Path $profilePath $rel
-            if (Test-Path $full) { Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $full) { Remove-MaceTree -Path $full -ProtectedRoots $ProtectedRoots }
         }
         foreach ($keep in @(Get-ChildItem -LiteralPath $profilePath -Directory -Filter "OneDrive*" -ErrorAction SilentlyContinue)) {
             Write-Host "      Left in place (may hold unsynced user files): $($keep.FullName)" -ForegroundColor $DimCol
@@ -613,22 +692,6 @@ function Invoke-MaceRun {
             if (Test-Path $key) { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue }
         }
     }
-
-    $UserRegKeys   = @(
-        "Software\Microsoft\OneDrive",
-        "Software\Microsoft\Office",
-        "Software\Microsoft\Teams",
-        "Software\Microsoft\Olk",
-        "Software\Microsoft\Office\16.0\Outlook"
-    )
-    $UserRunValues = @("OneDrive", "Teams", "com.squirrel.Teams.Teams")
-    $ShellFixes    = @(
-        @{ Name = "Personal";    Default = "%USERPROFILE%\Documents"; Dir = "Documents" },
-        @{ Name = "Desktop";     Default = "%USERPROFILE%\Desktop";   Dir = "Desktop"   },
-        @{ Name = "My Pictures"; Default = "%USERPROFILE%\Pictures";  Dir = "Pictures"  },
-        @{ Name = "My Music";    Default = "%USERPROFILE%\Music";     Dir = "Music"     },
-        @{ Name = "My Video";    Default = "%USERPROFILE%\Videos";    Dir = "Videos"    }
-    )
 
     # Match selected profiles to ProfileList entries for hive loading
     $HiveProfiles = $ProfileList | Where-Object {

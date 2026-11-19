@@ -58,6 +58,8 @@ Describe 'MACE' {
         Mock Start-Sleep { }
         Mock Wait-Process { }
         Mock Write-MaceFile { }
+        # Never scan the real machine's Office folders; TestDrive paths use the real scan.
+        Mock Find-MaceProtectedFiles { @() } -ParameterFilter { "$Path" -notlike "$script:TestRoot*" }
         Mock Read-MaceKey { $null }
         Mock Get-MaceProfileDirs { Get-ChildItem -LiteralPath $script:UsersRoot -Directory }
         Mock Get-MaceProfileList {
@@ -140,20 +142,25 @@ Describe 'MACE' {
     }
 
     Context 'Finding 16a: scope selection' {
-        It '16a: stops with exit 2 before changing anything when non-interactive and no scope is set' {
+        It '16a: runs all users when non-interactive and no scope is set' {
             $r = Invoke-MaceCapture
-            $r.Code | Should -Be 2
-            $r.Output | Should -Match 'MACE RESULT: NOT RUN \(exit 2\)'
-            $script:Stopped.Count | Should -Be 0
-            $script:Started.Count | Should -Be 0
-            $script:Removed.Count | Should -Be 0
-            $script:Appx.Count | Should -Be 0
-            $script:CmdKey.Count | Should -Be 0
+            $r.Code | Should -Be 0
+            $script:Stopped | Should -Contain 101
+            $script:Stopped | Should -Contain 202
         }
 
-        It '16a: stops with exit 2 before changing anything when an interactive choice is invalid' {
+        It '16a: Enter at the menu runs all users' {
             Mock Test-MaceInteractive { $true }
             Mock Read-MaceKey { [pscustomobject]@{ VirtualKeyCode = 13; Character = [char]13 } }
+            $r = Invoke-MaceCapture
+            $r.Code | Should -Be 0
+            $script:Stopped | Should -Contain 101
+            $script:Stopped | Should -Contain 202
+        }
+
+        It '16a: stops with exit 2 before changing anything when an interactive key is invalid' {
+            Mock Test-MaceInteractive { $true }
+            Mock Read-MaceKey { [pscustomobject]@{ VirtualKeyCode = 88; Character = 'x' } }
             $r = Invoke-MaceCapture
             $r.Code | Should -Be 2
             $script:Stopped.Count | Should -Be 0
@@ -178,17 +185,16 @@ Describe 'MACE' {
             $script:Removed.Count | Should -Be 0
         }
 
-        It '16a: runs all users only after a deliberate A choice' {
+        It '16a: A at the menu runs all users' {
             Mock Test-MaceInteractive { $true }
             Mock Read-MaceKey { [pscustomobject]@{ VirtualKeyCode = 65; Character = 'A' } }
             $r = Invoke-MaceCapture
             $r.Code | Should -Be 0
             $r.Output | Should -Match 'MACE RESULT: SUCCESS \(exit 0\)'
-            $script:Stopped | Should -Contain 101
             $script:Stopped | Should -Contain 202
         }
 
-        It '16a: runs all users non-interactively when $MaceScope is AllUsers' {
+        It '16a: $MaceScope = AllUsers runs all users' {
             $global:MaceScope = 'AllUsers'
             $r = Invoke-MaceCapture
             $r.Code | Should -Be 0
@@ -241,6 +247,101 @@ Describe 'MACE' {
             $null = Invoke-MaceCapture
             @($script:Removed | Where-Object { $_ -like 'C:\Program Files*' }).Count | Should -BeGreaterThan 0
             @($script:Started | Where-Object { $_ -match 'msiexec' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    Context 'User data is never deleted' {
+        BeforeEach {
+            foreach ($d in $AliceDir, $BobDir) {
+                foreach ($rel in 'Documents', 'Desktop', 'Pictures') {
+                    New-Item -ItemType Directory -Path (Join-Path $d $rel) -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $d "$rel\keep.txt") -Value 'user file'
+                }
+                $ol = Join-Path $d 'AppData\Roaming\Microsoft\Outlook'
+                New-Item -ItemType Directory -Path $ol -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path $ol 'archive.pst') -Value 'mail archive'
+                Set-Content -LiteralPath (Join-Path $ol 'cache.ost') -Value 'cache'
+                Set-Content -LiteralPath (Join-Path $ol 'old.nk2') -Value 'autocomplete'
+            }
+            $script:Protected = @()
+            foreach ($d in $AliceDir, $BobDir) {
+                $script:Protected += @('Documents', 'Desktop', 'Pictures', 'OneDrive', 'OneDrive - Contoso' | ForEach-Object { Join-Path $d $_ })
+                $script:Protected += (Join-Path $d 'AppData\Roaming\Microsoft\Outlook\archive.pst')
+            }
+        }
+
+        It 'no delete target is, contains or sits inside Documents, Desktop, Pictures, a OneDrive root or a .pst' {
+            $global:MaceScope = 'AllUsers'
+            $null = Invoke-MaceCapture
+            $script:Removed.Count | Should -BeGreaterThan 0
+            foreach ($prot in $script:Protected) {
+                $hits = @($script:Removed | Where-Object { $_ -eq $prot -or $prot -like "$_\*" -or $_ -like "$prot\*" })
+                $hits.Count | Should -Be 0 -Because "$prot must survive"
+            }
+        }
+
+        It 'still wipes the other Outlook data around a .pst and reports partial success' {
+            $global:MaceScope = 'alice'
+            $r = Invoke-MaceCapture
+            $ol = Join-Path $AliceDir 'AppData\Roaming\Microsoft\Outlook'
+            $script:Removed | Should -Contain (Join-Path $ol 'old.nk2')
+            $script:Removed | Should -Contain (Join-Path $ol 'cache.ost')
+            $script:Removed | Should -Not -Contain $ol
+            $script:Removed | Should -Not -Contain (Join-Path $ol 'archive.pst')
+            $r.Code | Should -Be 3
+            $r.Output | Should -Match 'archive\.pst'
+        }
+
+        It 'removes the whole tree when it holds no .pst' {
+            $global:MaceScope = 'alice'
+            [IO.File]::Delete((Join-Path $AliceDir 'AppData\Roaming\Microsoft\Outlook\archive.pst'))
+            $null = Invoke-MaceCapture
+            $script:Removed | Should -Contain (Join-Path $AliceDir 'AppData\Roaming\Microsoft\Outlook')
+        }
+    }
+
+    Context 'Shell folder repair' {
+        BeforeEach {
+            $script:Hive = 'TestRegistry:\MaceHive'
+            $script:USF = "$Hive\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            $script:SF  = "$Hive\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+            New-Item -Path $USF -Force | Out-Null
+            New-Item -Path $SF -Force | Out-Null
+            $script:UserRegKeys = @()
+            $script:UserRunValues = @()
+            $script:ShellFixes = @(
+                @{ Name = 'Personal';    Default = '%USERPROFILE%\Documents'; Dir = 'Documents' },
+                @{ Name = 'Desktop';     Default = '%USERPROFILE%\Desktop';   Dir = 'Desktop'   },
+                @{ Name = 'My Pictures'; Default = '%USERPROFILE%\Pictures';  Dir = 'Pictures'  }
+            )
+        }
+
+        It 'leaves a folder alone when its OneDrive target exists' {
+            $target = Join-Path $AliceDir 'OneDrive\Documents'
+            New-Item -ItemType Directory -Path $target -Force | Out-Null
+            Set-ItemProperty -Path $USF -Name Personal -Value $target
+            Invoke-PerUserRegistry -HiveRoot $Hive -ProfilePath $AliceDir
+            (Get-ItemProperty -Path $USF).Personal | Should -Be $target
+            Test-Path (Join-Path $AliceDir 'Documents') | Should -BeFalse
+        }
+
+        It 'repairs a folder whose OneDrive target is missing' {
+            $target = Join-Path $AliceDir 'OneDrive\Desktop'
+            Set-ItemProperty -Path $USF -Name Desktop -Value $target
+            Invoke-PerUserRegistry -HiveRoot $Hive -ProfilePath $AliceDir
+            (Get-ItemProperty -Path $USF).Desktop | Should -Be '%USERPROFILE%\Desktop'
+            Test-Path (Join-Path $AliceDir 'Desktop') | Should -BeTrue
+        }
+
+        It 'does not point the user at a new empty folder while files sit in another OneDrive folder' {
+            $missing = Join-Path $AliceDir 'OneDrive\Pictures'
+            $other = Join-Path $AliceDir 'OneDrive - Contoso\Pictures'
+            New-Item -ItemType Directory -Path $other -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $other 'p.jpg') -Value 'x'
+            Set-ItemProperty -Path $USF -Name 'My Pictures' -Value $missing
+            Invoke-PerUserRegistry -HiveRoot $Hive -ProfilePath $AliceDir
+            (Get-ItemProperty -Path $USF).'My Pictures' | Should -Be $missing
+            Test-Path (Join-Path $AliceDir 'Pictures') | Should -BeFalse
         }
     }
 }
