@@ -252,3 +252,86 @@ Describe 'DEFEND finding 55: active threats only' {
         $r.Text | Should -Not -Match 'Trojan:Win32/Old'
     }
 }
+
+Describe 'DEFEND findings 56, 57, 58, 10 and 11' {
+    BeforeEach {
+        $script:TestPrefs = [pscustomobject]@{ DisableRealtimeMonitoring = $false; PUAProtection = 1; MAPSReporting = 2; EnableNetworkProtection = 1; EnableControlledFolderAccess = 1; CloudBlockLevel = 2; ExclusionPath = @() }
+        $script:TestStatus = [pscustomobject]@{ IsTamperProtected = $true; RealTimeProtectionEnabled = $true; AntivirusSignatureVersion = '1.2.3.4' }
+        Mock Test-IsAdmin { $true }
+        Mock Get-DefendPSMajor { 5 }
+        Mock Test-DefendInteractive { $false }
+        Mock Clear-DefendScreen {}
+        Mock Import-Module {}
+        Mock Start-Sleep {}
+        Mock Get-CimInstance {
+            switch ($ClassName) {
+                'Win32_Processor'      { [pscustomobject]@{ VirtualizationFirmwareEnabled = $true } }
+                'Win32_ComputerSystem' { [pscustomobject]@{ PartOfDomain = $false } }
+                'MSFT_MpComputerStatus' { $script:TestStatus }
+            }
+        }
+        Mock Get-WindowsOptionalFeature { [pscustomobject]@{ State = 'Enabled' } }
+        Mock Confirm-SecureBootUEFI { $true }
+        Mock Get-Tpm { [pscustomobject]@{ TpmPresent = $true; ManufacturerVersion = '2.0' } }
+        Mock Get-DefendRegValue { 1 }
+        Mock Test-DefendRegKey { $false }
+        Mock Get-DefendHvciBlockers { @() }
+        Mock Get-MpPreference { $script:TestPrefs }
+        Mock Set-MpPreference {}
+        Mock Get-MpComputerStatus { $script:TestStatus }
+        Mock Get-MpThreat { @() }
+        Mock Get-MpThreatDetection { @() }
+        Mock Update-MpSignature {}
+        Mock Get-WinEvent { @() }
+        Mock Invoke-DefendWinPS { [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Mock Set-NetFirewallProfile {}
+        Mock Get-NetFirewallProfile { 'Domain', 'Private', 'Public' | ForEach-Object { [pscustomobject]@{ Name = $_; Enabled = 'True' } } }
+        Mock Get-NetConnectionProfile { @() }
+        Mock Set-NetConnectionProfile {}
+    }
+
+    Context 'finding 56: real-time monitoring is read back, not assumed' {
+        It 'reports ENFORCED when the readback confirms it' {
+            $r = Get-Run
+            $r.Text | Should -Match 'RealTimeMonitoring\s+:\s+ENFORCED'
+            $r.Code | Should -Be 0
+        }
+        It 'reports NOT ENFORCED and exits 3 when the setting stays off (Tamper Protection, policy or another AV)' {
+            $script:TestPrefs.DisableRealtimeMonitoring = $true
+            $r = Get-Run
+            $r.Text | Should -Match 'RealTimeMonitoring\s+:\s+NOT ENFORCED'
+            $r.Text | Should -Not -Match 'RealTimeMonitoring\s+:\s+ENFORCED'
+            $r.Code | Should -Be 3
+            $r.Lines[-1] | Should -Match '\[WARN\] DEFEND.*real-time.*\(exit 3\)'
+        }
+        It 'reports NOT ENFORCED when the engine says real-time protection is off even though the setting reads on' {
+            $script:TestStatus.RealTimeProtectionEnabled = $false
+            $r = Get-Run
+            $r.Text | Should -Match 'RealTimeMonitoring\s+:\s+NOT ENFORCED'
+            $r.Code | Should -Be 3
+        }
+        It 'surfaces the Set-MpPreference error instead of swallowing it' {
+            Mock Set-MpPreference { throw 'Operation blocked by Tamper Protection' }
+            $script:TestPrefs.DisableRealtimeMonitoring = $true
+            $r = Get-Run
+            $r.Text | Should -Match 'Tamper Protection'
+            $r.Code | Should -Be 3
+        }
+        It 'surfaces a failed Windows PowerShell child under PowerShell 7' {
+            Mock Get-DefendPSMajor { 7 }
+            Mock Invoke-DefendWinPS {
+                if ($Command -like '*Set-MpPreference*') { return [pscustomobject]@{ ExitCode = 1; Output = 'Set denied by policy' } }
+                $o = switch -Wildcard ($Command) {
+                    '*Get-MpPreference*'     { '{"DisableRealtimeMonitoring":false,"PUAProtection":1,"MAPSReporting":2,"EnableNetworkProtection":1,"EnableControlledFolderAccess":1,"CloudBlockLevel":2,"ExclusionPath":[]}' }
+                    '*Get-MpComputerStatus*' { '{"AntivirusSignatureVersion":"1.2.3.4"}' }
+                    default { '' }
+                }
+                [pscustomobject]@{ ExitCode = 0; Output = $o }
+            }
+            $r = Get-Run
+            $r.Text | Should -Match 'Set denied by policy'
+            $r.Code | Should -Be 3
+        }
+    }
+}
+

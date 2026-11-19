@@ -144,14 +144,19 @@ function Write-Field {
 }
 
 # Defender preference helpers. Under PowerShell 7 they run in a Windows PowerShell child.
+# Set-DefendPreferences returns $null on success, or the error text when the change was refused.
 function Set-DefendPreferences {
     if ((Get-DefendPSMajor) -ge 6) {
-        Invoke-DefendWinPS 'Set-MpPreference -DisableRealtimeMonitoring $false -PUAProtection 1 -MAPSReporting 2 -EnableNetworkProtection 1 -EnableControlledFolderAccess 1 -CloudBlockLevel 2 -ErrorAction SilentlyContinue' | Out-Null
-    } else {
-        Set-MpPreference -DisableRealtimeMonitoring $false -PUAProtection Enabled -MAPSReporting Advanced -EnableNetworkProtection Enabled -EnableControlledFolderAccess Enabled -CloudBlockLevel 2 -ErrorAction SilentlyContinue
+        $cmd = 'try { Set-MpPreference -DisableRealtimeMonitoring $false -PUAProtection 1 -MAPSReporting 2 -EnableNetworkProtection 1 -EnableControlledFolderAccess 1 -CloudBlockLevel 2 -ErrorAction Stop; exit 0 } catch { Write-Output $_.Exception.Message; exit 1 }'
+        $r = Invoke-DefendWinPS $cmd
+        if ($r.ExitCode -ne 0) { return ("exit {0}: {1}" -f $r.ExitCode, $r.Output) }
+        return $null
     }
-}
-function Get-DefendPreferences {
+    try {
+        Set-MpPreference -DisableRealtimeMonitoring $false -PUAProtection Enabled -MAPSReporting Advanced -EnableNetworkProtection Enabled -EnableControlledFolderAccess Enabled -CloudBlockLevel 2 -ErrorAction Stop
+        $null
+    } catch { $_.Exception.Message }
+}function Get-DefendPreferences {
     if ((Get-DefendPSMajor) -ge 6) {
         (Invoke-DefendWinPS 'Get-MpPreference | ConvertTo-Json -Depth 3').Output | ConvertFrom-Json
     } else {
@@ -228,7 +233,8 @@ function Invoke-DefendMain {
     # --------------------------------------------------------------------------
     Write-Host "[>] Auditing Security Protocols..." -ForegroundColor DarkCyan
 
-    Set-DefendPreferences
+    $SetError = Set-DefendPreferences
+    if ($SetError) { [void]$script:DefendFailures.Add("Set-MpPreference was refused: $SetError") }
 
     # 1. HARDWARE & FEATURE FOUNDATION
     $VTx = (Get-CimInstance Win32_Processor | Select-Object -First 1).VirtualizationFirmwareEnabled
@@ -278,6 +284,13 @@ function Invoke-DefendMain {
         Default { "Standard" }
     }
 
+    # Real-time monitoring is judged by what the engine reports after the change, not by what was asked.
+    $RtLive     = $LiveStatus.RealTimeProtectionEnabled
+    $RtEnforced = ($Prefs.DisableRealtimeMonitoring -eq $false) -and (($null -eq $RtLive) -or ($RtLive -eq $true))
+    $RtReport   = if ($RtEnforced) { "ENFORCED" } else { "NOT ENFORCED (blocked by Tamper Protection, policy or another AV?)" }
+    $RtColor    = if ($RtEnforced) { "Green" } else { "Red" }
+    if (-not $RtEnforced) { [void]$script:DefendFailures.Add("real-time monitoring is not enforced") }
+
     # 4. EXCLUSION FILTER
     $RawExclusions = $Prefs.ExclusionPath
     $FilteredExclusions = $RawExclusions | Where-Object { $_ -notlike "*Huntress*" -and $_ -notlike "*Rio*" }
@@ -292,7 +305,7 @@ function Invoke-DefendMain {
     Write-Field "Secure Boot Status" $SBReport $SBColor
     Write-Field "Memory Integrity (HVCI)" $HVCIReport $HVCIColor
     Write-Field "Driver Compatibility" $BlockerReport $BlockerColor
-    Write-Field "RealTimeMonitoring" "ENFORCED" "Green"
+    Write-Field "RealTimeMonitoring" $RtReport $RtColor
     Write-Field "Tamper Protection" $TamperReport $TamperColor
     Write-Field "Controlled Folder Access" $CFAReport $CFAColor
     Write-Field "Cloud Block Level" $CloudReport "Cyan"
