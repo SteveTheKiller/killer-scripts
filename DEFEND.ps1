@@ -158,7 +158,38 @@ function Get-DefendPreferences {
         Get-MpPreference
     }
 }
-#endregion
+
+function ConvertFrom-DefendJson {
+    # JSON text from a child process to an array of objects. Empty output is an empty array.
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    $x = $Text | ConvertFrom-Json
+    @($x | ForEach-Object { $_ })
+}
+
+# Get-MpThreat is threat HISTORY and still lists cleaned and quarantined items. The detections carry
+# the status. ThreatStatusID: 1 Detected, 2 Cleaned, 3 Quarantined, 4 Removed, 5 Allowed, 6 Blocked,
+# 102 QuarantineFailed, 103 RemoveFailed, 104 AllowFailed, 105 Abandoned, 107 BlockedFailed.
+# A threat is active when it was detected and not remediated, or when remediation failed.
+$script:DefendActiveStatus = @(1, 102, 103, 104, 105, 107)
+
+function Get-DefendActiveThreats {
+    if ((Get-DefendPSMajor) -ge 6) {
+        $det  = ConvertFrom-DefendJson (Invoke-DefendWinPS 'Get-MpThreatDetection | ConvertTo-Json -Depth 3').Output
+        $hist = ConvertFrom-DefendJson (Invoke-DefendWinPS 'Get-MpThreat | ConvertTo-Json -Depth 3').Output
+    } else {
+        $det  = @(Get-MpThreatDetection -ErrorAction SilentlyContinue)
+        $hist = @(Get-MpThreat -ErrorAction SilentlyContinue)
+    }
+    foreach ($d in @($det)) {
+        if ($null -eq $d -or $script:DefendActiveStatus -notcontains [int]$d.ThreatStatusID) { continue }
+        $h = @($hist | Where-Object { $_.ThreatID -eq $d.ThreatID }) | Select-Object -First 1
+        [pscustomobject]@{
+            ThreatName = $(if ($h -and $h.ThreatName) { $h.ThreatName } else { $null })
+            Resources  = @($d.Resources)
+        }
+    }
+}#endregion
 
 function Invoke-DefendMain {
     $script:DefendFailures = New-Object System.Collections.ArrayList
@@ -365,7 +396,7 @@ function Invoke-DefendMain {
 
     #region [5] - THREAT IDENTIFICATION & AUDIT
     # --------------------------------------------------------------------------
-    $Threats   = if ($PSVer -ge 6) { (Invoke-DefendWinPS 'Get-MpThreat | ConvertTo-Json -Depth 3').Output | ConvertFrom-Json } else { Get-MpThreat }
+    $Threats   = @(Get-DefendActiveThreats)
     $ScanStats = if ($PSVer -ge 6) { (Invoke-DefendWinPS 'Get-MpComputerStatus | ConvertTo-Json -Depth 3').Output | ConvertFrom-Json } else { Get-MpComputerStatus }
     Write-Host "[>] Finalizing Security Audit..." -ForegroundColor DarkCyan
     $Log = 'Microsoft-Windows-Windows Defender/Operational'
@@ -378,9 +409,10 @@ function Invoke-DefendMain {
     Write-Field "Last Successful Full Scan" $FullDisplay "Yellow"
     Write-Field "Last Successful Quick Scan" $QuickDisplay "Yellow"
     Write-Field "Antivirus Signature" "v$($ScanStats.AntivirusSignatureVersion)" "Yellow"
-    if ($Threats) {
-        Write-Alert " [!] CRITICAL: $(@($Threats).Count) Threat(s) Detected on $env:COMPUTERNAME "
-        foreach ($T in @($Threats)) {
+    if ($Threats.Count -gt 0) {
+        [void]$script:DefendFailures.Add("$($Threats.Count) active threat(s) detected")
+        Write-Alert " [!] CRITICAL: $($Threats.Count) Threat(s) Detected on $env:COMPUTERNAME "
+        foreach ($T in $Threats) {
             $TName = if ($T.ThreatName) { $T.ThreatName } else { "Unknown Signature" }
             if ($T.Resources) {
                 $TPath = $T.Resources -join ", "
@@ -426,6 +458,15 @@ function Invoke-DefendMain {
     Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $_art3" -ForegroundColor $ArtCol -NoNewline; Write-Host "█" -ForegroundColor $LineCol
     #endregion
 
+    if ($script:DefendFailures.Count -gt 0) {
+        foreach ($m in $script:DefendFailures) { Write-Output "[!] $m" }
+        Write-Output ("[WARN] DEFEND partial: {0} (exit 3)" -f ($script:DefendFailures -join "; "))
+        Exit-KillerScript 3
+    }
+    if ($RebootPending) {
+        Write-Output "[PASS] DEFEND complete, reboot required (exit 3010)"
+        Exit-KillerScript 3010
+    }
     Write-Output "[PASS] DEFEND complete (exit 0)"
     Exit-KillerScript 0
 }

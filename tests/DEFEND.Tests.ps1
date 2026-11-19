@@ -166,3 +166,89 @@ Describe 'DEFEND console guard' {
     }
 }
 
+
+Describe 'DEFEND finding 55: active threats only' {
+    BeforeEach {
+        $script:TestPrefs = [pscustomobject]@{ DisableRealtimeMonitoring = $false; PUAProtection = 1; MAPSReporting = 2; EnableNetworkProtection = 1; EnableControlledFolderAccess = 1; CloudBlockLevel = 2; ExclusionPath = @() }
+        $script:TestStatus = [pscustomobject]@{ IsTamperProtected = $true; RealTimeProtectionEnabled = $true; AntivirusSignatureVersion = '1.2.3.4' }
+        Mock Test-IsAdmin { $true }
+        Mock Get-DefendPSMajor { 5 }
+        Mock Test-DefendInteractive { $false }
+        Mock Clear-DefendScreen {}
+        Mock Import-Module {}
+        Mock Start-Sleep {}
+        Mock Get-CimInstance {
+            switch ($ClassName) {
+                'Win32_Processor'      { [pscustomobject]@{ VirtualizationFirmwareEnabled = $true } }
+                'Win32_ComputerSystem' { [pscustomobject]@{ PartOfDomain = $false } }
+                'MSFT_MpComputerStatus' { $script:TestStatus }
+            }
+        }
+        Mock Get-WindowsOptionalFeature { [pscustomobject]@{ State = 'Enabled' } }
+        Mock Confirm-SecureBootUEFI { $true }
+        Mock Get-Tpm { [pscustomobject]@{ TpmPresent = $true; ManufacturerVersion = '2.0' } }
+        Mock Get-DefendRegValue { 1 }
+        Mock Test-DefendRegKey { $false }
+        Mock Get-DefendHvciBlockers { @() }
+        Mock Get-MpPreference { $script:TestPrefs }
+        Mock Set-MpPreference {}
+        Mock Get-MpComputerStatus { $script:TestStatus }
+        Mock Update-MpSignature {}
+        Mock Get-WinEvent { @() }
+        Mock Set-NetFirewallProfile {}
+        Mock Get-NetFirewallProfile { 'Domain', 'Private', 'Public' | ForEach-Object { [pscustomobject]@{ Name = $_; Enabled = 'True' } } }
+        Mock Get-NetConnectionProfile { @() }
+        # Get-MpThreat is threat HISTORY: it still lists cleaned and quarantined items.
+        Mock Get-MpThreat { @([pscustomobject]@{ ThreatID = 11; ThreatName = 'Trojan:Win32/Old'; IsActive = $false }, [pscustomobject]@{ ThreatID = 22; ThreatName = 'Virus:Win32/Live'; IsActive = $true }) }
+        Mock Get-MpThreatDetection { @() }
+    }
+
+    It 'reports no active threats and exits 0 when history holds only cleaned, quarantined and removed items' {
+        Mock Get-MpThreatDetection {
+            @(2, 3, 4) | ForEach-Object { [pscustomobject]@{ ThreatID = 11; ThreatStatusID = $_; Resources = @('file:_C:\old.exe') } }
+        }
+        $r = Get-Run
+        $r.Text | Should -Not -Match 'CRITICAL'
+        $r.Text | Should -Match 'NO ACTIVE THREATS'
+        $r.Code | Should -Be 0
+    }
+
+    It 'alerts only for the active detection, with its name and path, and exits 3' {
+        Mock Get-MpThreatDetection {
+            @(
+                [pscustomobject]@{ ThreatID = 11; ThreatStatusID = 3; Resources = @('file:_C:\old.exe') },
+                [pscustomobject]@{ ThreatID = 22; ThreatStatusID = 1; Resources = @('file:_C:\live.exe') }
+            )
+        }
+        $r = Get-Run
+        $r.Text | Should -Match 'CRITICAL: 1 Threat\(s\)'
+        $r.Text | Should -Match 'Virus:Win32/Live'
+        $r.Text | Should -Match 'live\.exe'
+        $r.Text | Should -Not -Match 'Trojan:Win32/Old'
+        $r.Code | Should -Be 3
+        $r.Lines[-1] | Should -Match '\[WARN\] DEFEND.*active threat.*\(exit 3\)'
+    }
+
+    It 'treats a failed quarantine as still active' {
+        Mock Get-MpThreatDetection { @([pscustomobject]@{ ThreatID = 22; ThreatStatusID = 102; Resources = @('file:_C:\live.exe') }) }
+        (Get-Run).Text | Should -Match 'CRITICAL: 1 Threat\(s\)'
+    }
+
+    It 'reads active detections through the 5.1 child process under PowerShell 7' {
+        Mock Get-DefendPSMajor { 7 }
+        Mock Invoke-DefendWinPS {
+            $o = switch -Wildcard ($Command) {
+                '*Get-MpThreatDetection*' { '[{"ThreatID":22,"ThreatStatusID":1,"Resources":["file:_C:\\live.exe"]},{"ThreatID":11,"ThreatStatusID":2,"Resources":["file:_C:\\old.exe"]}]' }
+                '*Get-MpThreat *'         { '[{"ThreatID":11,"ThreatName":"Trojan:Win32/Old"},{"ThreatID":22,"ThreatName":"Virus:Win32/Live"}]' }
+                '*Get-MpPreference*'      { '{"DisableRealtimeMonitoring":false,"PUAProtection":1,"MAPSReporting":2,"EnableNetworkProtection":1,"EnableControlledFolderAccess":1,"CloudBlockLevel":2,"ExclusionPath":[]}' }
+                '*Get-MpComputerStatus*'  { '{"AntivirusSignatureVersion":"1.2.3.4"}' }
+                default { '' }
+            }
+            [pscustomobject]@{ ExitCode = 0; Output = $o }
+        }
+        $r = Get-Run
+        $r.Text | Should -Match 'CRITICAL: 1 Threat\(s\)'
+        $r.Text | Should -Match 'Virus:Win32/Live'
+        $r.Text | Should -Not -Match 'Trojan:Win32/Old'
+    }
+}
