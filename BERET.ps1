@@ -71,7 +71,7 @@ function Write-HLine {
 }
 
 function Show-BeretBanner {
-    Clear-Host
+    try { Clear-Host } catch { }
     $_pfx  = "█  "
     $_art1 = "╔╗  ╔═╗ ╦═╗ ╔═╗ ╔╦╗ "
     $_art2 = "╠╩╗ ║╣  ╠╦╝ ║╣   ║  "
@@ -153,6 +153,28 @@ function Show-RecoveryInfo {
     Write-HLine -Style dashed
 }
 
+function Exit-BeretRun {
+    # One exit point. The final line goes to the success stream so an RMM captures it, and it
+    # always agrees with the exit code.
+    param([int]$Code, [string]$Text)
+    Write-Output "BERET RESULT: exit code $Code - $Text"
+    Exit-KillerScript $Code
+}
+
+function Get-BeretMode {
+    # Returns 'FIPS', 'STANDARD', 'NOCONSOLE' or $null when the operator quit. A preset $BeretMode
+    # wins and never prompts. With no console and no preset there is nobody to ask, so the caller
+    # fails closed. Never exits from here: output inside an assigned call would be swallowed.
+    $preset = [string]$global:BeretMode
+    if ($preset -match '^(?i:fips)$') { return 'FIPS' }
+    if ($preset -match '^(?i:standard)$') { return 'STANDARD' }
+    if (-not (Test-BeretConsole)) { return 'NOCONSOLE' }
+    $answer = Read-BeretFipsChoice
+    if ($answer -eq 'ESC') { return $null }
+    if ($answer -match '^(?i:y)') { return 'FIPS' }
+    return 'STANDARD'
+}
+
 function Read-BeretFipsChoice {
     # Returns 'Y', 'N' (or any other typed text), or 'ESC'.
     Write-Host "Does this system require FIPS 140-2 compliance? " -ForegroundColor $BorderCol -NoNewline
@@ -170,16 +192,36 @@ function Read-BeretFipsChoice {
 function Get-BeretDsreg {
     dsregcmd /status | Out-String
 }
+
+function Test-BeretElevated {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Test-BeretConsole {
+    # True only when a person can answer a key prompt. A redirected or absent console cannot.
+    try {
+        return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected)
+    } catch { return $false }
+}
 #endregion
 
 function Invoke-BeretMain {
     Show-BeretBanner
+    if (-not (Test-BeretElevated)) {
+        Exit-BeretRun 2 "not elevated. Run as Administrator or SYSTEM. Nothing was changed."
+    }
 
     #region 1 - Pre-Flight Checks
     # =================================================================================
-    $FipsPrompt = Read-BeretFipsChoice
-    if ($FipsPrompt -eq 'ESC') { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-KillerScript 0 }
-    if ($FipsPrompt -eq "Y" -or $FipsPrompt -eq "y") {
+    $BeretModeChoice = Get-BeretMode
+    if ($BeretModeChoice -eq 'NOCONSOLE') {
+        Exit-BeretRun 2 "no console to ask the FIPS question. Set `$BeretMode = 'FIPS' or 'STANDARD' before running. Nothing was changed."
+    }
+    if ($null -eq $BeretModeChoice) { Write-Host "`nExiting." -ForegroundColor $DimCol; Exit-BeretRun 0 "cancelled by the operator. Nothing was changed." }
+    if ($BeretModeChoice -eq 'FIPS') {
         $EncryptionMethod = "Aes256"
         $ModeLabel = "FIPS"
         $EnforceFipsReg = $true
@@ -197,10 +239,12 @@ function Invoke-BeretMain {
     if ($OSCaption -match "Home") {
         Write-Host "`n![ ERROR ]!: Windows Home Edition Detected ($OSCaption)." -ForegroundColor $BorderCol
         Write-Host "BitLocker management requires Pro, Business, or Enterprise. Upgrade required." -ForegroundColor $AccentCol
-        Exit-KillerScript 1
+        Exit-BeretRun 2 "Windows Home does not support BitLocker management. Nothing was changed."
     }
     # --- TPM Health & Auto-Initialization ---
     $TPM = Get-Tpm
+    $tpmRestart = $false
+    $tpmFailed = $null
     if (-not $TPM.TpmReady) {
         Write-Host "`n[!] TPM is NOT READY. Attempting self-healing..." -ForegroundColor $AccentCol
         $Vendor = (Get-CimInstance -Class Win32_ComputerSystem).Manufacturer
@@ -218,12 +262,14 @@ function Invoke-BeretMain {
             $InitResult = Initialize-Tpm -AllowClear -AllowPhysicalPresence -ErrorAction Stop
             if ($InitResult.RestartRequired) {
                 Write-Host "![ RESTART REQUIRED ]!: TPM ownership initiated. Please reboot." -ForegroundColor $LineCol
-                Exit-KillerScript 0
+                $tpmRestart = $true
             }
         } catch {
-            if ("$($_.Exception.Message)" -like 'KILLERSCRIPT_EXIT*') { throw }
             Write-Host "![ CRITICAL ]!: TPM could not be initialized: $($_.Exception.Message)" -ForegroundColor $BorderCol
+            $tpmFailed = $_.Exception.Message
         }
+        if ($tpmRestart) { Exit-BeretRun 3010 "TPM ownership initiated. Reboot, then run BERET again. Nothing was encrypted." }
+        if ($tpmFailed) { Exit-BeretRun 2 "the TPM could not be initialized ($tpmFailed). Nothing was changed." }
     } else {
         Write-Host "TPM Health: " -ForegroundColor $InfoCol -NoNewline; Write-Host "Ready" -ForegroundColor $OkCol
     }
