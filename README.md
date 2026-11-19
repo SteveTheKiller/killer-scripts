@@ -61,7 +61,7 @@ Interactive scripts never hang without a console. They either refuse with exit 2
 
 ## AMORT.ps1
 
-### Advanced Maintenance, Optimization & Restoration Tool
+### Advanced Maintenance, Optimization & Repair Tool
 
 Disk cleanup and Windows repair for MSP field deployment and remote support. A good first response to a low disk space alert or a sluggish machine.
 

@@ -21,7 +21,7 @@
   },
   "DEPOT.ps1": {
     "name": "Deployment & Endpoint Provisioning Operations Tool",
-    "description": "Full new-machine provisioning with silent app deployment and self-delete on completion."
+    "description": "New-machine provisioning with silent app deployment and hardening that removes itself after a successful run."
   },
   "FACTS.ps1": {
     "name": "Foxit Audit and Control Task Script",
@@ -36,8 +36,8 @@
     "description": "Read-only inventory of physical, USB, and Bluetooth audio devices with the true default device."
   },
   "ORCA.ps1": {
-    "name": "Outlook Reset & Configuration Assistant",
-    "description": "Resets broken Outlook installations for one or all user profiles, classic or new."
+    "name": "Outlook Repair & Configuration Assistant",
+    "description": "Resets New and Classic Outlook for one or all user profiles, keeping OST files as backups."
   },
   "PEEK.ps1": {
     "name": "Patch & Event Examination Kit",
@@ -45,7 +45,7 @@
   },
   "PRINT.ps1": {
     "name": "Printer Response & Interface Network Tool",
-    "description": "Printer management utility with network scanner, driver matching, and UNC path support."
+    "description": "Printer management with a subnet scanner, driver matching, RAW and IPP setup, and UNC path support."
   },
   "PRUNE.ps1": {
     "name": "Profile Removal Utility for Neglected Entries",
@@ -69,7 +69,7 @@
   },
   "VITALS.ps1": {
     "name": "Visual Interface for Technical Asset & Logistics Summary",
-    "description": "Collects and displays a full hardware and network snapshot including BitLocker, TPM, and domain info."
+    "description": "Read-only hardware and network snapshot including every BitLocker protector, TPM, and domain info."
   },
   "WURSA.ps1": {
     "name": "Windows Update, Repair, & System Alignment",
