@@ -800,9 +800,11 @@ Write-Progress -Activity "Cleaning up" -Completed
 # Pre-repair: stability check - warn only, never skip on PendingRename alone
 # (PendingFileRenameOperations is routinely re-created by Windows/installers and
 # does not block DISM or SFC). Dry run, active servicing, and a pending reboot DO skip.
-$SkipRepair = $false
 $PendingRename = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
 $HasPendingRename = $null -ne $PendingRename
+# One decision for every repair step: dry run, active servicing, a pending reboot or a pending
+# rename. TrustedInstaller is only touched when repair will actually run.
+$SkipRepair = [bool]($DryRun -or $PendingReboot -or $ServicingActive -or $HasPendingRename)
 if ($DryRun) {
     Write-Host "        [i] Dry run - DISM and SFC repair steps skipped (no changes)." -ForegroundColor Magenta
 }
@@ -821,17 +823,18 @@ elseif ($HasPendingRename) {
 # Ensure TrustedInstaller is available (prevents DISM Error 87 / SFC failures)
 if (-not $SkipRepair -and -not $DryRun) {
     $TI = Get-Service -Name "TrustedInstaller" -ErrorAction SilentlyContinue
-    if ($TI.StartType -eq 'Disabled') { Set-Service -Name "TrustedInstaller" -StartupType Manual }
-    if ($TI.Status -ne 'Running') { Start-Service -Name "TrustedInstaller" -ErrorAction SilentlyContinue }
+    if ($TI) {
+        if ($TI.StartType -eq 'Disabled') { Set-Service -Name "TrustedInstaller" -StartupType Manual }
+        if ($TI.Status -ne 'Running') { Start-Service -Name "TrustedInstaller" -ErrorAction SilentlyContinue }
+    }
 }
-if (-not $SkipRepair) {
 # --- STEP 5: RestoreHealth ---
             Clear-InputBuffer
             $S72 = "[08/11] DISM RestoreHealth"
             Write-StepUpdate $S72 -CustomInfo "[Press ESC to Skip]"
             $Row72 = try { [Console]::CursorTop - 1 } catch { -1 }
 
-            if ($DryRun -or $PendingReboot -or $HasPendingRename -or $ServicingActive) {
+            if ($SkipRepair) {
                 Clear-AndReprintStep -StartRow $Row72 -Message $S72 -CustomInfo "[SKIPPED]"
             }
             else {
@@ -905,7 +908,7 @@ if (-not $SkipRepair) {
             Write-StepUpdate $S73 -CustomInfo "[Press ESC to Skip]"
             $Row73 = try { [Console]::CursorTop - 1 } catch { -1 }
 
-            if ($DryRun -or $PendingReboot -or $HasPendingRename -or $ServicingActive) {
+            if ($SkipRepair) {
                 Clear-AndReprintStep -StartRow $Row73 -Message $S73 -CustomInfo "[SKIPPED]"
             }
             else {
@@ -986,7 +989,7 @@ if (-not $SkipRepair) {
             Write-StepUpdate $S74 -CustomInfo "[Press ESC to Skip]"
             $Row74 = try { [Console]::CursorTop - 1 } catch { -1 }
 
-            if ($DryRun -or $PendingReboot -or $HasPendingRename -or $ServicingActive) {
+            if ($SkipRepair) {
                 Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[SKIPPED]"
             }
             else {
@@ -1056,7 +1059,6 @@ if (-not $SkipRepair) {
                     Clear-AndReprintStep -StartRow $Row74 -Message $S74 -CustomInfo "[FAILED:0x$($ExitCode3.ToString('X'))]"
                 }
             }
-}
 # Component cleanup can free real space, so report it instead of folding it in silently.
 if (-not $DryRun) {
     $CurrentSpace = Get-FreeBytes

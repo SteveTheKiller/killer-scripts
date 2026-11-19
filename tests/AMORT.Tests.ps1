@@ -301,4 +301,41 @@ Describe 'AMORT' {
             $script:EstYieldBytes | Should -Be ([int64](5GB))
         }
     }
+
+    Describe 'Finding 65: TrustedInstaller is left alone whenever repair is skipped' {
+        BeforeEach {
+            $script:TiService = [pscustomobject]@{ Name = 'TrustedInstaller'; Status = 'Stopped'; StartType = 'Disabled' }
+        }
+
+        It 'does not enable or start TrustedInstaller when a reboot is pending' {
+            Mock Test-Path { $true } -ParameterFilter { "$Path" -like '*RebootPending' }
+            [void](Invoke-AmortCapture)
+            Should -Invoke Set-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' }
+            Should -Invoke Start-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' }
+        }
+
+        It 'does not touch TrustedInstaller when Windows servicing is already active' {
+            Mock Get-Process { @([pscustomobject]@{ Name = 'TiWorker'; Id = 7001 }) } -ParameterFilter { $Name -contains 'TiWorker' }
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 3
+            Should -Invoke Set-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' }
+            Should -Invoke Start-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' }
+            $script:StartedProcs.Count | Should -Be 0
+        }
+
+        It 'does not touch TrustedInstaller when a pending file rename skips repair' {
+            Mock Get-ItemProperty { [pscustomobject]@{ PendingFileRenameOperations = @('a', 'b') } } -ParameterFilter { $Name -eq 'PendingFileRenameOperations' }
+            [void](Invoke-AmortCapture)
+            Should -Invoke Set-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' }
+            Should -Invoke Start-Service -Times 0 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' }
+        }
+
+        It 'still enables and starts TrustedInstaller when repair will run' {
+            $r = Invoke-AmortCapture
+            $r.Code | Should -Be 0
+            Should -Invoke Set-Service -Times 1 -Exactly -ParameterFilter { $Name -eq 'TrustedInstaller' -and $StartupType -eq 'Manual' }
+            Should -Invoke Start-Service -Times 1 -ParameterFilter { $Name -eq 'TrustedInstaller' }
+            $script:StartedProcs.Count | Should -Be 3
+        }
+    }
 }
