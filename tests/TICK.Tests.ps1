@@ -129,4 +129,99 @@ Describe 'TICK' {
             Should -Invoke Start-Service -Times 0 -Exactly
         }
     }
+
+    Context 'finding 26: every step is checked and the result is verified' {
+        It 'reports a failed /register as a failure, not a success' {
+            $script:W32Results['/register'] = New-W32Result 1 @('Access is denied.')
+            $r = Get-Run -Silent -NtpServer 'time.google.com'
+            $r.Code | Should -Be 1
+            $r.Text | Should -Match '\[FAIL\]'
+            $r.Text | Should -Not -Match '\[PASS\]'
+        }
+        It 'reports a failed /config as a failure and still starts the time service again' {
+            $script:W32Results['/config /manualpeerlist:time.google.com,0x8 /syncfromflags:manual /reliable:yes /update'] = New-W32Result 1 @('error')
+            $r = Get-Run -Silent -NtpServer 'time.google.com'
+            $r.Code | Should -Be 1
+            Should -Invoke Start-Service -Times 1 -Exactly
+            $r.HostText | Should -Match '\[FAIL\]'
+        }
+        It 'exits 1 when the time service is not running after the restart' {
+            Mock Get-Service { [pscustomobject]@{ Name = 'w32time'; Status = 'Stopped' } }
+            $r = Get-Run -Silent -NtpServer 'time.google.com'
+            $r.Code | Should -Be 1
+            $r.Text | Should -Match '\[FAIL\]'
+        }
+        It 'exits 3 with a not-confirmed warning when the resync fails' {
+            $script:W32Results['/resync /force'] = New-W32Result 1 @('The computer did not resync because no time data was available.')
+            $r = Get-Run -Silent -NtpServer 'time.google.com'
+            $r.Code | Should -Be 3
+            $r.Text | Should -Match '\[WARN\].*not confirmed.*exit 3'
+        }
+        It 'exits 3 when the reported source is not the requested peer' {
+            $script:SourceReply = 'Local CMOS Clock'
+            $r = Get-Run -Silent -NtpServer 'time.google.com'
+            $r.Code | Should -Be 3
+            $r.Text | Should -Match 'Local CMOS Clock'
+            $r.Text | Should -Not -Match '\[PASS\]'
+        }
+        It 'exits 3 when the last successful sync is not recent' {
+            $script:StatusLines = Get-EnglishStatus -LastSync (Get-Date).AddHours(-3)
+            $r = Get-Run -Silent -NtpServer 'time.google.com'
+            $r.Code | Should -Be 3
+            $r.Text | Should -Match 'last successful sync'
+        }
+        It 'does not throw on non-English status output and reports the sync as unknown with exit 3' {
+            $script:StatusLines = @('Indicateur de saut: 0(aucun avertissement)', 'Strate: 3', 'Precision: -23', 'Dispersion de la racine: 0,0500000s', 'Source: time.google.com,0x8')
+            $r = Get-Run -Silent -NtpServer 'time.google.com'
+            $r.Code | Should -Be 3
+            $r.Text | Should -Match 'UNKNOWN'
+            $r.HostText | Should -Match 'UNKNOWN'
+        }
+        It 'exits 0 with a PASS line naming the verified source on a fully confirmed sync' {
+            $r = Get-Run -Silent -NtpServer 'time.google.com'
+            $r.Code | Should -Be 0
+            $r.Text | Should -Match '\[PASS\].*time\.google\.com.*exit 0'
+        }
+        It 'says the machine is synced to the domain controller only when the source is a domain controller' {
+            Mock Get-TickComputerSystem { [pscustomobject]@{ PartOfDomain = $true; DomainRole = 1; Domain = 'corp.local' } }
+            Mock Get-TickPdcName { 'dc01.corp.local' }
+            $script:SourceReply = 'dc01.corp.local'
+            $script:StatusLines = Get-EnglishStatus -Source 'dc01.corp.local'
+            $r = Get-Run -Silent
+            $r.Code | Should -Be 0
+            $script:W32Calls | Should -Contain '/config /syncfromflags:domhier /update'
+            $r.HostText | Should -Match 'synced to the Domain Controller'
+        }
+        It 'does not claim a domain sync when the source is the local clock' {
+            Mock Get-TickComputerSystem { [pscustomobject]@{ PartOfDomain = $true; DomainRole = 1; Domain = 'corp.local' } }
+            Mock Get-TickPdcName { 'dc01.corp.local' }
+            $script:SourceReply = 'Local CMOS Clock'
+            $r = Get-Run -Silent
+            $r.Code | Should -Be 3
+            $r.HostText | Should -Not -Match 'synced to the Domain Controller'
+        }
+    }
+
+    Context 'finding 26: no console behaves like -Silent and never hangs' {
+        It 'does not read a key or a line when there is no console and no parameters' {
+            Mock Test-TickInteractive { $false }
+            $script:SourceReply = 'time.cloudflare.com,0x8'
+            $r = Get-Run
+            $r.Code | Should -Be 0
+            Should -Invoke Read-TickKey -Times 0 -Exactly
+            Should -Invoke Read-TickLine -Times 0 -Exactly
+        }
+        It 'exits 2 and changes nothing when Other is chosen and no address is typed' {
+            $script:Keys.Enqueue((New-Object System.ConsoleKeyInfo ([char]'8'), ([ConsoleKey]::D8), $false, $false, $false))
+            $r = Get-Run
+            $r.Code | Should -Be 2
+            $r.Text | Should -Match '\[FAIL\].*exit 2'
+            Should -Invoke Stop-Service -Times 0 -Exactly
+        }
+        It 'exits 2 when the given NTP server is not a plausible host name' {
+            $r = Get-Run -Silent -NtpServer 'time.google.com 0x8 evil'
+            $r.Code | Should -Be 2
+            Should -Invoke Invoke-TickW32tm -Times 0 -Exactly
+        }
+    }
 }
