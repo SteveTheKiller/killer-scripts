@@ -82,12 +82,16 @@ function Test-StareWritableByNonAdmin {
     # the file: through its own access list, its owner, or a folder above it. Anything that cannot
     # be read counts as writable, so an unverified script is warned about.
     param([string]$Path)
-    $fileMask = 0x2 -bor 0x4 -bor 0x10000 -bor 0x40000 -bor 0x80000   # WriteData, AppendData, Delete, ChangePermissions, TakeOwnership
-    $dirMask  = 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000           # DeleteSubdirectoriesAndFiles (replace a child), Delete, ChangePermissions, TakeOwnership
+    # Rights are tested as raw bits. GenericAll (0x10000000) and GenericWrite (0x40000000) are included
+    # in case an access list holds them unmapped.
+    $generic  = 0x10000000 -bor 0x40000000
+    $fileMask = $generic -bor 0x2 -bor 0x4 -bor 0x10000 -bor 0x40000 -bor 0x80000   # WriteData, AppendData, Delete, ChangePermissions, TakeOwnership
+    $dirMask  = $generic -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000           # DeleteSubdirectoriesAndFiles (replace a child), Delete, ChangePermissions, TakeOwnership
     $sidType  = [System.Security.Principal.SecurityIdentifier]
     $isTrusted = {
+        # SYSTEM, Administrators, Creator Owner and the TrustedInstaller service
         param([string]$Sid)
-        ($Sid -eq 'S-1-5-18') -or ($Sid -eq 'S-1-5-32-544') -or ($Sid -eq 'S-1-3-0') -or $Sid.StartsWith('S-1-5-80-')
+        ($Sid -eq 'S-1-5-18') -or ($Sid -eq 'S-1-5-32-544') -or ($Sid -eq 'S-1-3-0') -or ($Sid -eq 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     }
     try {
         $current = $Path

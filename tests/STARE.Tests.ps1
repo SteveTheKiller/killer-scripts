@@ -346,6 +346,14 @@ Describe 'STARE' {
             $script:Acls['C:\Tools'] = New-TestAcl -Directory -Allow @(@{ Sid = 'S-1-5-18'; Rights = 'FullControl' }, @{ Sid = 'S-1-5-32-545'; Rights = 'CreateFiles' })
             Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeFalse
         }
+        It 'is true when a service account other than TrustedInstaller can modify the file' {
+            $script:Acls['C:\Tools\fix.ps1'] = New-TestAcl -Allow @(@{ Sid = 'S-1-5-18'; Rights = 'FullControl' }, @{ Sid = 'S-1-5-80-111-222-333-444-555'; Rights = 'Modify' })
+            Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeTrue
+        }
+        It 'is false when TrustedInstaller is the only other principal that can modify the file' {
+            $script:Acls['C:\Tools\fix.ps1'] = New-TestAcl -Allow @(@{ Sid = 'S-1-5-18'; Rights = 'FullControl' }, @{ Sid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'; Rights = 'FullControl' })
+            Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeFalse
+        }
         It 'is true when the access list cannot be read, so an unverified script is warned about' {
             $script:Acls.Remove('C:\Tools')
             Test-StareWritableByNonAdmin -Path 'C:\Tools\fix.ps1' | Should -BeTrue
