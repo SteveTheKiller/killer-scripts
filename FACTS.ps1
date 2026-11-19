@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Foxit Audit and Control Task Script (FACTS) v2.3
-    Developed by SteveTheKiller | Updated: 2026-03-10
+    Foxit Audit and Control Task Script (FACTS) v3.0
+    Developed by SteveTheKiller | Updated: 2026-11-19
 .DESCRIPTION
     Audits for Foxit PDF installations and permanently blocks
     auto-updates via registry hardening, service suppression, and
@@ -159,7 +159,7 @@ $AccentCol = "Green"
 $DimCol    = "DarkGray"
 $OkCol     = "Green"
 $InfoCol   = "Cyan"
-$_ver      = "| v2.5"
+$_ver      = "| v3.0"
 
 function Write-StepUpdate {
     param([string]$Message, [switch]$Success, [string]$CustomInfo)
