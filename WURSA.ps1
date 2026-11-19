@@ -832,6 +832,10 @@ function Get-WursaLastBoot {
     try { return (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { return $null }
 }
 
+function Get-WursaNow {
+    Get-Date
+}
+
 function New-WursaDispatchMutex {
     New-Object System.Threading.Mutex($false, 'Global\WURSA-IPU-Dispatch')
 }
@@ -843,7 +847,7 @@ function Test-WursaDispatchActive {
     # across reboots; RUNNING, DOWNLOADING and REPAIRING and REBOOT_REQUIRED count only when written since
     # the last boot (a runner that died with a reboot is recoverable). Anything else is a stale leftover.
     param([string]$TaskName, [string]$WorkDir, [string]$StatusFile)
-    $res = [pscustomobject]@{ Active = $false; Reason = '' }
+    $res = [pscustomobject]@{ Active = $false; Stale = $false; Reason = '' }
     if ((Get-WursaTaskState -TaskName $TaskName) -eq 'Running') {
         $res.Active = $true; $res.Reason = "task $TaskName is running"
         return $res
@@ -852,7 +856,18 @@ function Test-WursaDispatchActive {
         if (-not (Get-WursaDirectoryProblem -Path $WorkDir) -and [System.IO.File]::Exists($StatusFile)) {
             $first = ([string]([System.IO.File]::ReadAllLines($StatusFile) | Select-Object -First 1)).Trim()
             if ($first -match '^(WU_HANDOFF|VERIFY_PENDING)(\s|$)') {
-                $res.Active = $true; $res.Reason = 'a Windows Update handoff or verification is in progress'
+                # These stay active across reboots, but only for a bounded time: a feature update that
+                # Windows Update never delivers (safeguard hold, WSUS, deferral) must not block dispatch forever.
+                $kind = $Matches[1]
+                $maxDays = if ($kind -eq 'WU_HANDOFF') { 14 } else { 7 }
+                $at = [datetime]::MinValue
+                $ok = $first -match '(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*$' -and [datetime]::TryParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$at)
+                if ($ok -and $at -le (Get-WursaNow) -and ((Get-WursaNow) - $at).TotalDays -lt $maxDays) {
+                    $res.Active = $true; $res.Reason = 'a Windows Update handoff or verification is in progress'
+                } else {
+                    $res.Stale = $true
+                    $res.Reason = "STALE_HANDOFF: the $kind status is older than $maxDays days or has no readable stamp, so Windows Update never finished the upgrade; it can be recovered and re-dispatched"
+                }
             } elseif ($first -match '^(REBOOT_REQUIRED|RUNNING|DOWNLOADING|REPAIRING)(\s|$)') {
                 $boot = Get-WursaLastBoot
                 if ($boot -and [System.IO.File]::GetLastWriteTime($StatusFile) -gt $boot) {
@@ -1851,6 +1866,7 @@ if (-not $NoUpgrade -and $WinBuild -lt $LatestBuild -and -not (Confirm-WursaWork
 } elseif (-not $NoUpgrade -and $WinBuild -lt $LatestBuild) {
     Write-Host "[>] Opening Windows Update policy for the update pass..." -ForegroundColor $LineCol
     $_busy = Test-WursaDispatchActive -TaskName $IPU_TaskName -WorkDir $IPU_WorkDir -StatusFile $IPU_StatusFile
+    if ($_busy.Stale) { Write-Host "      [!] $($_busy.Reason)." -ForegroundColor $WarnCol }
     $_open = Open-WursaUpdatePolicy -RecordFile $IPU_AURestoreFile -ActiveHoursStart $IPU_ActiveHoursStart -ActiveHoursEnd $IPU_ActiveHoursEnd -AdoptExisting (-not $_busy.Active)
     $script:PolicyOwned = [bool]$_open.Owned
     Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
