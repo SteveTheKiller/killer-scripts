@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Trigger Immediate Clock Kickstart (TICK) v1.2
-    Developed by Steve the Killer | Updated: 2026-05-12
+    Trigger Immediate Clock Kickstart (TICK) v2.0
+    Developed by Steve the Killer | Updated: 2026-11-19
 .DESCRIPTION
     Resets and resyncs the Windows Time service against a chosen NTP peer,
     then reports before/after timestamps with a plain-English summary of
@@ -14,6 +14,10 @@
         (Domain Controller if domain-joined, time.cloudflare.com if not.)
     .\TICK.ps1 -Silent -NtpServer time.google.com
         Non-interactive - syncs against the specified NTP server.
+    Without a console the menu is skipped and TICK runs as -Silent.
+    Exit codes: 0 synced and verified, 1 time service not configured,
+    2 not elevated or no usable NTP server, 3 configured but the sync is
+    not confirmed (resync failed, wrong source, or last sync unknown/old).
 #>
 param(
     [switch]$Silent,
