@@ -285,6 +285,71 @@ function Invoke-DepotPreflight {
     }
 }
 
+function Read-DepotChoice {
+    param([string]$Prompt)
+    Write-Host $Prompt -ForegroundColor Black -BackgroundColor Red -NoNewline
+    $_k = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    $choice = $_k.Character.ToString()
+    Write-Host $choice
+    return $choice
+}
+
+function Invoke-DepotRename {
+    $CurrentName = $env:COMPUTERNAME
+    $NewName = Read-Host "   > New Device Name"
+    if ($NewName -and $NewName -ne $CurrentName) {
+        Write-Host "[>] Renaming computer from $CurrentName to $NewName..." -NoNewline
+        Rename-Computer -NewName $NewName -Force -ErrorAction SilentlyContinue
+        Write-Host " Done." -ForegroundColor Green
+        Write-Host "[!] Note: Name change requires a reboot to take effect." -ForegroundColor Red
+    } else {
+        Write-Host "[!] Invalid name or same as current. Skipping." -ForegroundColor Gray
+    }
+}
+
+function New-DepotLocalAdmin {
+    $NewAdminName = Read-Host "   > Local Admin Username"
+    $Password = Read-Host "   > Local Admin Password" -AsSecureString
+    if ($NewAdminName -and $Password) {
+        Write-Host "[>] Creating local account: $NewAdminName..." -NoNewline
+        try {
+            New-LocalUser -Name $NewAdminName -Password $Password -Description "Local Admin created" -ErrorAction Stop
+            Add-LocalGroupMember -Group "Administrators" -Member $NewAdminName -ErrorAction Stop
+            Write-Host " Done." -ForegroundColor Green
+        } catch {
+            Write-Host " Failed." -ForegroundColor Red
+            Write-Warning $_.Exception.Message
+        }
+    } else {
+        Write-Host "[!] Username or Password cannot be empty. Skipping." -ForegroundColor Gray
+    }
+    return $NewAdminName
+}
+
+function Invoke-DepotAdminPurge {
+    param([string]$NewAdminName)
+    Write-Host "[>] Disabling built-in Administrator account..." -NoNewline
+    Disable-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue
+    Write-Host " Done." -ForegroundColor Green
+
+    Write-Host "[>] Scanning for other local administrators to delete..." -NoNewline
+    $AdminsToPurge = Get-LocalGroupMember -Group "Administrators" | Where-Object {
+        $_.Name -notlike "*\Administrator" -and
+        $_.Name -notlike "*\$NewAdminName" -and
+        $_.ObjectClass -eq "User"
+    }
+    if ($AdminsToPurge) {
+        Write-Host " Found $($AdminsToPurge.Count)." -ForegroundColor Cyan
+        foreach ($Admin in $AdminsToPurge) {
+            Write-Host "   [!] Deleting account: $($Admin.Name)..." -NoNewline
+            Remove-LocalUser -Name $Admin.Name -ErrorAction SilentlyContinue
+            Write-Host " Done." -ForegroundColor Green
+        }
+    } else {
+        Write-Host " None found." -ForegroundColor Green
+    }
+}
+
 function Invoke-DepotInteractiveSetup {
     Clear-Host
     Write-Host "[*] Interactive Pre-Deployment Setup..." -ForegroundColor DarkRed -BackgroundColor Black
@@ -292,67 +357,17 @@ function Invoke-DepotInteractiveSetup {
     Write-Host "    Note: All prompts default to 'N' if Enter is pressed." -ForegroundColor DarkRed -BackgroundColor Black
     Write-Host ""
     # 1.1: Machine Renaming
-    Write-Host "1) Do you want to rename the machine? (y/N) " -ForegroundColor Black -BackgroundColor Red -NoNewline
-    $_k = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); $RenameChoice = $_k.Character.ToString(); Write-Host $RenameChoice
-    if ($RenameChoice -eq "Y" -or $RenameChoice -eq "y") {
-        $CurrentName = $env:COMPUTERNAME
-        $NewName = Read-Host "   > New Device Name"
-        if ($NewName -and $NewName -ne $CurrentName) {
-            Write-Host "[>] Renaming computer from $CurrentName to $NewName..." -NoNewline
-            Rename-Computer -NewName $NewName -Force -ErrorAction SilentlyContinue
-            Write-Host " Done." -ForegroundColor Green
-            Write-Host "[!] Note: Name change requires a reboot to take effect." -ForegroundColor Red
-        } else {
-            Write-Host "[!] Invalid name or same as current. Skipping." -ForegroundColor Gray
-        }
-    }
+    $RenameChoice = Read-DepotChoice "1) Do you want to rename the machine? (y/N) "
+    if ($RenameChoice -eq "Y" -or $RenameChoice -eq "y") { Invoke-DepotRename }
     # 1.2: Local Admin Creation
     Write-Host ""
-    Write-Host "2) Do you want to make a local admin account? (y/N) " -ForegroundColor Black -BackgroundColor Red -NoNewline
-    $_k = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); $AdminChoice = $_k.Character.ToString(); Write-Host $AdminChoice
-    if ($AdminChoice -eq "Y" -or $AdminChoice -eq "y") {
-        $NewAdminName = Read-Host "   > Local Admin Username"
-        $Password = Read-Host "   > Local Admin Password" -AsSecureString
-        if ($NewAdminName -and $Password) {
-            Write-Host "[>] Creating local account: $NewAdminName..." -NoNewline
-            try {
-                New-LocalUser -Name $NewAdminName -Password $Password -Description "Local Admin created" -ErrorAction Stop
-                Add-LocalGroupMember -Group "Administrators" -Member $NewAdminName -ErrorAction Stop
-                Write-Host " Done." -ForegroundColor Green
-            } catch {
-                Write-Host " Failed." -ForegroundColor Red
-                Write-Warning $_.Exception.Message
-            }
-        } else {
-            Write-Host "[!] Username or Password cannot be empty. Skipping." -ForegroundColor Gray
-        }
-    }
+    $AdminChoice = Read-DepotChoice "2) Do you want to make a local admin account? (y/N) "
+    $NewAdminName = $null
+    if ($AdminChoice -eq "Y" -or $AdminChoice -eq "y") { $NewAdminName = New-DepotLocalAdmin }
     # 1.3: Purge & Secure Admin Accounts
     Write-Host ""
-    Write-Host "3) Do you want to purge other admins and disable built-in Administrator? (y/N) " -ForegroundColor Black -BackgroundColor Red -NoNewline
-    $_k = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); $PurgeChoice = $_k.Character.ToString(); Write-Host $PurgeChoice
-    if ($PurgeChoice -eq "Y" -or $PurgeChoice -eq "y") {
-        Write-Host "[>] Disabling built-in Administrator account..." -NoNewline
-        Disable-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue
-        Write-Host " Done." -ForegroundColor Green
-
-        Write-Host "[>] Scanning for other local administrators to delete..." -NoNewline
-        $AdminsToPurge = Get-LocalGroupMember -Group "Administrators" | Where-Object { 
-            $_.Name -notlike "*\Administrator" -and 
-            $_.Name -notlike "*\$NewAdminName" -and 
-            $_.ObjectClass -eq "User" 
-        }
-        if ($AdminsToPurge) {
-            Write-Host " Found $($AdminsToPurge.Count)." -ForegroundColor Cyan
-            foreach ($Admin in $AdminsToPurge) {
-                Write-Host "   [!] Deleting account: $($Admin.Name)..." -NoNewline
-                Remove-LocalUser -Name $Admin.Name -ErrorAction SilentlyContinue
-                Write-Host " Done." -ForegroundColor Green
-            }
-        } else {
-            Write-Host " None found." -ForegroundColor Green
-        }
-    }
+    $PurgeChoice = Read-DepotChoice "3) Do you want to purge other admins and disable built-in Administrator? (y/N) "
+    if ($PurgeChoice -eq "Y" -or $PurgeChoice -eq "y") { Invoke-DepotAdminPurge -NewAdminName $NewAdminName }
 }
 
 function Show-DepotBanner {
