@@ -376,4 +376,34 @@ Describe 'DEFEND findings 56, 57, 58, 10 and 11' {
             $r.Code | Should -Be 0
         }
     }
+
+    Context 'finding 58 (D7): exclusions are known-good only under the Huntress install roots' {
+        It 'does not hide Scenarios, Priority or other paths that merely contain Rio or Huntress' {
+            $script:TestPrefs.ExclusionPath = @('C:\Scenarios', 'C:\Users\bob\Priority\', 'C:\Temp\Huntress', 'C:\Windows\Temp\Rio\x', 'C:\Program Files\HuntressEvil\x')
+            $r = Get-Run
+            foreach ($p in 'C:\Scenarios', 'C:\Users\bob\Priority\', 'C:\Temp\Huntress', 'C:\Windows\Temp\Rio\x', 'C:\Program Files\HuntressEvil\x') {
+                $r.Text | Should -Match ([regex]::Escape($p))
+            }
+            $r.Text | Should -Match '5 UNVERIFIED'
+            $r.Text | Should -Not -Match 'MSP Stack'
+        }
+        It 'accepts the three Huntress roots and anything under them, in any case, as known-good' {
+            $script:TestPrefs.ExclusionPath = @('C:\Program Files\Huntress', 'C:\Program Files\Huntress\Rio\Rio.exe', 'c:\program files (x86)\huntress\', 'C:\ProgramData\Huntress\Logs')
+            $r = Get-Run
+            $r.Text | Should -Match 'NONE \(Secure\)'
+            $r.Text | Should -Match 'MSP Stack'
+            $r.Text | Should -Not -Match 'UNVERIFIED'
+        }
+        It 'rejects traversal and wildcard tricks that escape the Huntress roots' {
+            $script:TestPrefs.ExclusionPath = @('C:\Program Files\Huntress\..\Temp', 'C:\Program Files\Huntress*', 'C:\*\Huntress')
+            (Get-Run).Text | Should -Match '3 UNVERIFIED'
+        }
+        It 'counts only the unverified paths when known-good and unknown paths are mixed' {
+            $script:TestPrefs.ExclusionPath = @('C:\ProgramData\Huntress', 'C:\Users\bob\Downloads')
+            $r = Get-Run
+            $r.Text | Should -Match '1 UNVERIFIED'
+            $r.Text | Should -Match 'C:\\Users\\bob\\Downloads'
+            $r.Text | Should -Match 'MSP Stack'
+        }
+    }
 }

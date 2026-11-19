@@ -204,7 +204,28 @@ function Get-DefendActiveThreats {
             Resources  = @($d.Resources)
         }
     }
-}#endregion
+}
+
+# Exclusions treated as known-good (decision D7): the Huntress agent install roots and anything under them.
+# Huntress's Rio component installs under the first root, as C:\Program Files\Huntress\Rio\Rio.exe, so it
+# needs no entry of its own. Source (Huntress allow-list guidance for third-party AV):
+# https://support.huntress.io/hc/en-us/articles/4404005178771-Allow-List-Huntress-in-Third-Party-Software-AV-NGAV-DR
+# Everything else, including a path that merely contains Huntress or Rio, is reported as unverified.
+$script:DefendKnownGoodRoots = @('C:\Program Files\Huntress', 'C:\Program Files (x86)\Huntress', 'C:\ProgramData\Huntress')
+
+function Test-DefendKnownExclusion {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = $Path.Trim().TrimEnd('\', '/')
+    # Wildcards, environment variables and parent-directory hops can point outside the root.
+    if ($p -match '[*?%]' -or $p -match '(^|[\\/])\.\.([\\/]|$)') { return $false }
+    foreach ($root in $script:DefendKnownGoodRoots) {
+        if ($p.Equals($root, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($p.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    $false
+}
+#endregion
 
 function Invoke-DefendMain {
     $script:DefendFailures = New-Object System.Collections.ArrayList
@@ -302,11 +323,12 @@ function Invoke-DefendMain {
     if (-not $RtEnforced) { [void]$script:DefendFailures.Add("real-time monitoring is not enforced") }
 
     # 4. EXCLUSION FILTER
-    $RawExclusions = $Prefs.ExclusionPath
-    $FilteredExclusions = $RawExclusions | Where-Object { $_ -notlike "*Huntress*" -and $_ -notlike "*Rio*" }
-    $StackDetected = if ($RawExclusions -like "*Huntress*" -or $RawExclusions -like "*Rio*") { " (+MSP Stack)" } else { "" }
-    $ExclReport = if (-not $FilteredExclusions) { "NONE (Secure)$StackDetected" } else { "$($FilteredExclusions.Count) Active (Filtered)$StackDetected" }
-    $ExclColor  = if (-not $FilteredExclusions) { "Green" } else { "Yellow" }
+    $RawExclusions = @($Prefs.ExclusionPath | Where-Object { $_ })
+    $Unverified    = @($RawExclusions | Where-Object { -not (Test-DefendKnownExclusion $_) })
+    $KnownGood     = @($RawExclusions | Where-Object { Test-DefendKnownExclusion $_ })
+    $StackDetected = if ($KnownGood.Count -gt 0) { " (+MSP Stack)" } else { "" }
+    $ExclReport = if ($Unverified.Count -eq 0) { "NONE (Secure)$StackDetected" } else { "$($Unverified.Count) UNVERIFIED$StackDetected" }
+    $ExclColor  = if ($Unverified.Count -eq 0) { "Green" } else { "Yellow" }
 
     # 5. CONSOLE OUTPUT
     Write-Field "BIOS Virtualization" $VTxReport $VTxColor
@@ -320,6 +342,8 @@ function Invoke-DefendMain {
     Write-Field "Controlled Folder Access" $CFAReport $CFAColor
     Write-Field "Cloud Block Level" $CloudReport "Cyan"
     Write-Field "Active Exclusions" $ExclReport $ExclColor
+
+    foreach ($x in $Unverified) { Write-Host "                               ! $x" -ForegroundColor Yellow }
 
     # 6. DYNAMIC BLOCKER ANALYSIS & REMEDIATION
     if ($BlockerCount -gt 0) {
