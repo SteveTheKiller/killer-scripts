@@ -86,6 +86,7 @@ BeforeEach {
     $script:BdeResults = New-Object System.Collections.Queue
     $script:BdeDefault = [pscustomobject]@{ ExitCode = 0; Output = 'BitLocker Drive Encryption: Configuration Tool' }
     $script:EncryptNeverStarts = $false
+    $script:EncryptMethodOverride = $null
 
     # The fake clock moves only when the script sleeps, and a runaway loop fails the test fast.
     Mock Start-Sleep {
@@ -123,12 +124,13 @@ BeforeEach {
     }
     Mock Invoke-BeretManageBde {
         [void]$script:BdeCalls.Add(($Arguments -join ' '))
+        Write-Host "BDE-CALL: $($Arguments -join ' ')"
         $r = if ($script:BdeResults.Count -gt 0) { $script:BdeResults.Dequeue() } else { $script:BdeDefault }
         if ($r.ExitCode -eq 0 -and $Arguments -contains '-on' -and -not $script:EncryptNeverStarts) {
             $names = @{ 'aes128' = 'Aes128'; 'aes256' = 'Aes256'; 'xts_aes128' = 'XtsAes128'; 'xts_aes256' = 'XtsAes256' }
             $i = [array]::IndexOf($Arguments, '-EncryptionMethod')
             $v = $script:Vols[$Arguments[1]]
-            $v.EncryptionMethod = $names[[string]$Arguments[$i + 1]]; $v.VolumeStatus = 'EncryptionInProgress'; $v.EncryptionPercentage = 1
+            $v.EncryptionMethod = $(if ($script:EncryptMethodOverride) { $script:EncryptMethodOverride } else { $names[[string]$Arguments[$i + 1]] }); $v.VolumeStatus = 'EncryptionInProgress'; $v.EncryptionPercentage = 1
         }
         $r
     }
@@ -283,6 +285,73 @@ Describe 'Preconditions exit with the contract codes and an honest final line' {
         Invoke-BeretRun
         $script:Text | Should -Match 'FIPS'
         $script:Text | Should -Not -Match 'exit code 2'
+    }
+}
+
+Describe 'Finding 07 and D3: the technician sees the recovery key before encryption and again at the end' {
+    It 'prints the new key before manage-bde -on runs, and again in the final summary' {
+        Invoke-BeretRun
+        $key = '111111-111111-111111-111111-111111-111111-111111-111111'
+        $first = $script:Text.IndexOf($key)
+        $first | Should -BeGreaterThan -1
+        $first | Should -BeLessThan $script:Text.IndexOf('BDE-CALL')
+        [regex]::Matches($script:Text, [regex]::Escape($key)).Count | Should -BeGreaterOrEqual 2
+    }
+
+    It 'prints the key of an already compliant volume at the start and again at the end' {
+        $key = '222222-333333-444444-555555-666666-777777-888888-999999'
+        $script:Vols['C:'] = New-BeretVolume 'C:' 'FullyEncrypted' 'XtsAes128' @((New-BeretProtector 'Tpm'), (New-BeretProtector 'RecoveryPassword' -Password $key))
+        Invoke-BeretRun
+        [regex]::Matches($script:Text, [regex]::Escape($key)).Count | Should -BeGreaterOrEqual 2
+    }
+}
+
+Describe 'Finding 06 and 07: waits are bounded and a timeout is a failure' {
+    It 'prints DONE only after the volume has really finished decrypting' {
+        $script:Vols['C:'] = New-BeretVolume 'C:' 'FullyEncrypted' 'Aes128' @((New-BeretProtector 'Tpm'), (New-BeretProtector 'RecoveryPassword' -Password '111111-222222-333333-444444-555555-666666-777777-888888'))
+        Invoke-BeretRun
+        $script:Text | Should -Match 'Decryption in progress\.\.\.\s+\[DONE\]'
+    }
+
+    It 'exits 1, never prints DONE and builds nothing when decryption does not finish in 30 minutes' {
+        $script:Vols['C:'] = New-BeretVolume 'C:' 'FullyEncrypted' 'Aes128' @((New-BeretProtector 'Tpm'), (New-BeretProtector 'RecoveryPassword' -Password '111111-222222-333333-444444-555555-666666-777777-888888'))
+        $script:DecryptPollsNeeded = [int]::MaxValue
+        Invoke-BeretRun
+        $script:Code | Should -Be 1
+        $script:Text | Should -Match 'BERET RESULT: exit code 1'
+        $script:Text | Should -Match 'still'
+        $script:Text | Should -Not -Match '\[DONE\]'
+        Should -Invoke Add-BitLockerKeyProtector -Times 0 -Exactly
+        $script:BdeCalls.Count | Should -Be 0
+    }
+
+    It 'exits 1 when encryption never starts after manage-bde reports success' {
+        $script:EncryptNeverStarts = $true
+        Invoke-BeretRun
+        $script:Code | Should -Be 1
+        $script:Text | Should -Match 'BERET RESULT: exit code 1'
+    }
+
+    It 'exits 1 when the volume ends up with a different cipher than the mode asks for' {
+        $script:EncryptMethodOverride = 'Aes128'
+        Invoke-BeretRun
+        $script:Code | Should -Be 1
+        $script:Text | Should -Match 'Aes128'
+        $script:Text | Should -Match 'BERET RESULT: exit code 1'
+    }
+
+    It 'exits 1 when the volume state cannot be read' {
+        Mock Get-BitLockerVolume { throw 'WMI provider failure' }
+        Invoke-BeretRun
+        $script:Code | Should -Be 1
+        $script:Text | Should -Match 'BERET RESULT: exit code 1'
+    }
+
+    It 'exits 1 and starts no encryption when the recovery password protector cannot be added' {
+        Mock Add-BitLockerKeyProtector { if ($RecoveryPasswordProtector) { throw 'Group Policy forbids recovery passwords' }; $v = $script:Vols['C:']; $v.KeyProtector = @($v.KeyProtector) + (New-BeretProtector 'Tpm'); $v }
+        Invoke-BeretRun
+        $script:Code | Should -Be 1
+        $script:BdeCalls.Count | Should -Be 0
     }
 }
 }

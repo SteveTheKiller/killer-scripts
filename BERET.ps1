@@ -230,6 +230,136 @@ function Test-BeretConsole {
 }
 #endregion
 
+function Write-BeretStatusLine {
+    param([string]$Message, [string]$Status, [string]$Color)
+    $pad = " " * [math]::Max(1, $script:Width - $Message.Length - $Status.Length)
+    Write-Host $Message -ForegroundColor $DimCol -NoNewline
+    Write-Host "$pad$Status" -ForegroundColor $Color
+}
+
+function Show-BeretFooter {
+    param([string]$Text)
+    $_sfx   = "█"
+    $_ftr1 = " ╔╗  ╔═╗ ╦═╗ ╔═╗ ╔╦╗ "
+    $_ftr2 = " ╠╩╗ ║╣  ╠╦╝ ║╣   ║  "
+    $_ftr3 = " ╚═╝ ╚═╝ ╩╚═ ╚═╝  ╩  "
+    $_ftrW = [Math]::Max($_ftr1.Length, [Math]::Max($_ftr2.Length, $_ftr3.Length))
+    $_ftr1 = $_ftr1.PadRight($_ftrW); $_ftr2 = $_ftr2.PadRight($_ftrW); $_ftr3 = $_ftr3.PadRight($_ftrW)
+    $_ffillW = $script:Width - $_ftrW - $_sfx.Length
+    $_ver    = "| v6.0"
+    $_fpad   = " " * [Math]::Max(0, $_ffillW - $Text.Length - $_ver.Length)
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr1 -ForegroundColor $MainCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+    Write-Host "$Text$_fpad$_ver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $MainCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr3 -ForegroundColor $MainCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
+}
+
+function Get-BeretRecoveryProtectors {
+    param([string]$Drive)
+    try {
+        $v = Get-BitLockerVolume -MountPoint $Drive -ErrorAction Stop
+        return @($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+    } catch { return @() }
+}
+
+function Show-BeretKeys {
+    # Prints every recovery password protector on the volume. The technician needs to see them.
+    param([string]$Drive, [string]$DeviceName)
+    foreach ($k in @(Get-BeretRecoveryProtectors -Drive $Drive)) {
+        Show-RecoveryInfo -Drive $Drive -KeyID $k.KeyProtectorId -RecoveryKey $k.RecoveryPassword -RealName $DeviceName
+    }
+}
+
+function Invoke-BeretDecrypt {
+    # Turns BitLocker off and waits, with a deadline, until the volume is fully decrypted.
+    # Never exits. Returns Ok and a plain Error text.
+    param([string]$Drive, [int]$TimeoutMinutes = 30)
+    $err = $null
+    try {
+        $AutoUnlockDrives = @(Get-BitLockerVolume | Where-Object { $_.AutoUnlockEnabled -eq $true })
+        foreach ($Volume in $AutoUnlockDrives) {
+            Write-Host "Disabling Auto-Unlock on $($Volume.MountPoint) to allow OS decryption..." -ForegroundColor $AccentCol
+            Disable-BitLockerAutoUnlock -MountPoint $Volume.MountPoint | Out-Null
+        }
+        Disable-BitLocker -MountPoint $Drive -ErrorAction Stop | Out-Null
+        Write-Host "Decryption in progress..." -ForegroundColor $MainCol
+        $deadline = (Get-BeretNow).AddMinutes($TimeoutMinutes)
+        $done = $false
+        while (-not $done) {
+            Start-Sleep -Seconds 10
+            $cur = Get-BitLockerVolume -MountPoint $Drive -ErrorAction Stop
+            Write-Host "Decryption in progress...  $($cur.EncryptionPercentage)%" -ForegroundColor $MainCol
+            if ($cur.VolumeStatus -eq 'FullyDecrypted') { $done = $true }
+            elseif ((Get-BeretNow) -gt $deadline) { break }
+        }
+        if (-not $done) {
+            $err = "decryption of $Drive did not finish within $TimeoutMinutes minutes and is still running. Let it finish, then run BERET again."
+        }
+    } catch {
+        $err = "failed to decrypt ${Drive}: $($_.Exception.Message)"
+    }
+    if ($err) { return [pscustomobject]@{ Ok = $false; Error = $err } }
+    Write-BeretStatusLine "Decryption in progress..." "[DONE]" $OkCol
+    [pscustomobject]@{ Ok = $true; Error = $null }
+}
+
+function Invoke-BeretEnable {
+    # Adds the TPM and recovery protectors, shows the key, starts encryption with manage-bde and
+    # proves it started with the right cipher. Never exits. Returns Ok and a plain Error text.
+    param([string]$Drive, [string]$DeviceName, [string]$Method, [string]$BdeMethod, [int]$StartTimeoutSeconds = 120)
+    Write-Host "Enabling BitLocker ($Method)..." -ForegroundColor $InfoCol
+    $err = $null
+    try {
+        $before = Get-BitLockerVolume -MountPoint $Drive -ErrorAction Stop
+        if (-not ($before.KeyProtector | Where-Object {$_.KeyProtectorType -eq 'Tpm'})) {
+            Add-BitLockerKeyProtector -MountPoint $Drive -TpmProtector -ErrorAction Stop | Out-Null
+        }
+        Add-BitLockerKeyProtector -MountPoint $Drive -RecoveryPasswordProtector -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
+        $after = Get-BitLockerVolume -MountPoint $Drive -ErrorAction Stop
+        $rec = @($after.KeyProtector | Where-Object {$_.KeyProtectorType -eq 'RecoveryPassword'})
+        if ($rec.Count -eq 0 -or [string]$rec[0].RecoveryPassword -notmatch '^(\d{6}-){7}\d{6}$') {
+            throw "the new recovery password could not be read back from $Drive"
+        }
+    } catch { $err = $_.Exception.Message }
+    if ($err) { return [pscustomobject]@{ Ok = $false; Error = $err } }
+
+    # The technician sees the key before encryption starts, so it is never lost if the run dies.
+    Show-BeretKeys -Drive $Drive -DeviceName $DeviceName
+
+    $SysInfo = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $IsVM = $SysInfo.Model -match "Virtual|QEMU|VMware"
+    $bdeBase = @('-on', $Drive, '-EncryptionMethod', $BdeMethod)
+    $bdeSkip = @('-SkipHardwareTest')
+    if ($IsVM) {
+        # Full-volume encryption is manage-bde's default, so the used-space switch is simply left out.
+        $Result = Invoke-BeretManageBde -Arguments ($bdeBase + $bdeSkip)
+    } else {
+        $Result = Invoke-BeretManageBde -Arguments ($bdeBase + @('-UsedSpaceOnly') + $bdeSkip)
+        if ($Result.ExitCode -ne 0 -and $Result.Output -match "0x803100a5") {
+            $Result = Invoke-BeretManageBde -Arguments ($bdeBase + $bdeSkip)
+        }
+    }
+    if ($Result.ExitCode -ne 0) {
+        $line = ($Result.Output -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        return [pscustomobject]@{ Ok = $false; Error = "manage-bde -on exited $($Result.ExitCode): $line" }
+    }
+
+    # manage-bde returned 0, but only the volume itself can say encryption really started.
+    $deadline = (Get-BeretNow).AddSeconds($StartTimeoutSeconds)
+    $seen = $null
+    $started = $false
+    do {
+        Start-Sleep -Seconds 3
+        try { $seen = Get-BitLockerVolume -MountPoint $Drive -ErrorAction Stop } catch { $seen = $null }
+        if ($seen -and $seen.VolumeStatus -ne 'FullyDecrypted' -and [string]$seen.EncryptionMethod -notin @('', 'None')) { $started = $true }
+    } while (-not $started -and (Get-BeretNow) -lt $deadline)
+    if (-not $started) {
+        return [pscustomobject]@{ Ok = $false; Error = "encryption of $Drive did not start within $StartTimeoutSeconds seconds. The recovery key above is on the volume." }
+    }
+    if ([string]$seen.EncryptionMethod -ne $Method) {
+        return [pscustomobject]@{ Ok = $false; Error = "encryption started with $($seen.EncryptionMethod) but this mode requires $Method. Check the BitLocker encryption method policy." }
+    }
+    [pscustomobject]@{ Ok = $true; Error = $null }
+}
 function Invoke-BeretMain {
     Show-BeretBanner
     if (-not (Test-BeretElevated)) {
@@ -320,118 +450,62 @@ function Invoke-BeretMain {
         Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy" -Name "Enabled" -Value 1 -Type DWORD -Force -ErrorAction SilentlyContinue
     }
     $DriveLetter = "$env:SystemDrive"
-    $DeviceName = (Get-CimInstance Win32_ComputerSystem).Name
+    $DeviceName = (Get-CimInstance -ClassName Win32_ComputerSystem).Name
     $_blMsg = "Checking BitLocker status on $DriveLetter..."
-    Write-Host $_blMsg -ForegroundColor $InfoCol -NoNewline
-    $BLV = Get-BitLockerVolume -MountPoint $DriveLetter -ErrorAction Stop
-    $RecoveryProtector = $BLV.KeyProtector | Where-Object {$_.KeyProtectorType -eq 'RecoveryPassword'}
+    $readError = $null
+    try { $BLV = Get-BitLockerVolume -MountPoint $DriveLetter -ErrorAction Stop } catch { $readError = $_.Exception.Message }
+    if ($readError -or -not $BLV) {
+        Write-BeretStatusLine $_blMsg '[FAILED]' $BorderCol
+        Exit-BeretRun 1 "could not read the BitLocker state of $DriveLetter ($readError). Nothing was changed."
+    }
+    $RecoveryProtector = @($BLV.KeyProtector | Where-Object {$_.KeyProtectorType -eq 'RecoveryPassword'})
     $IsCompliant = ([string]$BLV.EncryptionMethod -eq $EncryptionMethod)
     $NeedsDecryption = $false
-    $ExplicitKeyID = $null
+    $HaveKey = $false
     if ($BLV.VolumeStatus -ne 'FullyDecrypted') {
         if (-not $IsCompliant) {
-            $_blPad = " " * [math]::Max(1, $script:Width - $_blMsg.Length - "[NON-COMPLIANT]".Length)
-            Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-            Write-Host $_blMsg -ForegroundColor $DimCol -NoNewline; Write-Host "$_blPad[NON-COMPLIANT]" -ForegroundColor $AccentCol
+            Write-BeretStatusLine $_blMsg '[NON-COMPLIANT]' $AccentCol
             Write-Host "  $ModeLabel requires $EncryptionMethod - found $($BLV.EncryptionMethod). Starting decryption..." -ForegroundColor $LineCol
             $NeedsDecryption = $true
-        } elseif (-not $RecoveryProtector) {
-            $_blPad = " " * [math]::Max(1, $script:Width - $_blMsg.Length - "[NO RECOVERY KEY]".Length)
-            Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-            Write-Host $_blMsg -ForegroundColor $DimCol -NoNewline; Write-Host "$_blPad[NO RECOVERY KEY]" -ForegroundColor $LineCol
+        } elseif ($RecoveryProtector.Count -eq 0) {
+            Write-BeretStatusLine $_blMsg '[NO RECOVERY KEY]' $LineCol
             Write-Host "  Drive encrypted but recovery key missing. Starting decryption..." -ForegroundColor $LineCol
             $NeedsDecryption = $true
         } else {
-            $ExplicitKeyID = $RecoveryProtector[0].KeyProtectorId
-            $RecoveryKey = $RecoveryProtector[0].RecoveryPassword
-            $_blPad = " " * [math]::Max(1, $script:Width - $_blMsg.Length - "[COMPLIANT]".Length)
-            Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-            Write-Host $_blMsg -ForegroundColor $DimCol -NoNewline; Write-Host "$_blPad[COMPLIANT]" -ForegroundColor $OkCol
-            Show-RecoveryInfo -Drive $DriveLetter -KeyID $ExplicitKeyID -RecoveryKey $RecoveryKey -RealName $DeviceName
+            Write-BeretStatusLine $_blMsg '[COMPLIANT]' $OkCol
+            Show-BeretKeys -Drive $DriveLetter -DeviceName $DeviceName
+            $HaveKey = $true
         }
+    } else {
+        Write-BeretStatusLine $_blMsg '[NOT ENCRYPTED]' $AccentCol
     }
 
     if ($NeedsDecryption) {
-        try {
-            $AutoUnlockDrives = Get-BitLockerVolume | Where-Object { $_.AutoUnlockEnabled -eq $true }
-            foreach ($Volume in $AutoUnlockDrives) {
-                Write-Host "Disabling Auto-Unlock on $($Volume.MountPoint) to allow OS decryption..." -ForegroundColor $AccentCol
-                Disable-BitLockerAutoUnlock -MountPoint $Volume.MountPoint
-            }
-            Disable-BitLocker -MountPoint $DriveLetter | Out-Null
-            Write-Host "Decryption in progress..." -ForegroundColor $MainCol -NoNewline
-            $Timeout = (Get-Date).AddMinutes(30)
-            do {
-                Start-Sleep -Seconds 10
-                $CurrentBLV = Get-BitLockerVolume -MountPoint $DriveLetter
-                $CurrentStatus = $CurrentBLV.VolumeStatus
-                $Percent = $CurrentBLV.EncryptionPercentage
-                $_decLine = "Decryption in progress...  $Percent%"
-                Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-                Write-Host $_decLine -ForegroundColor $MainCol -NoNewline
-                if ((Get-Date) -gt $Timeout) { Write-Host ""; Write-Warning "Decryption loop timed out."; break }
-            } while ($CurrentStatus -ne 'FullyDecrypted')
-            $_decDone = "Decryption in progress..."
-            $_decPad = " " * [math]::Max(1, $script:Width - $_decDone.Length - "[DONE]".Length)
-            Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-            Write-Host $_decDone -ForegroundColor $DimCol -NoNewline; Write-Host "$_decPad[DONE]" -ForegroundColor $OkCol
-            $ExplicitKeyID = $null
-        }
-        catch {
-            Write-Error -Message "ERROR: Failed to decrypt volume: $($_.Exception.Message)"
-            Exit-KillerScript 1
+        $dec = Invoke-BeretDecrypt -Drive $DriveLetter
+        if (-not $dec.Ok) {
+            Exit-BeretRun 1 $dec.Error
         }
     }
     #endregion
 
     #region 2: Key Generation & Encryption
     # =================================================================================
-    if (-not $ExplicitKeyID) {
-        Write-Host "Enabling BitLocker ($EncryptionMethod)..." -ForegroundColor $InfoCol -NoNewline
-        $enableError = $null
-        try {
-            $BLV_Check = Get-BitLockerVolume -MountPoint $DriveLetter
-            if (-not ($BLV_Check.KeyProtector | Where-Object {$_.KeyProtectorType -eq 'Tpm'})) {
-                Add-BitLockerKeyProtector -MountPoint $DriveLetter -TpmProtector | Out-Null
-            }
-            Add-BitLockerKeyProtector -MountPoint $DriveLetter -RecoveryPasswordProtector -WarningAction SilentlyContinue | Out-Null
-            $NewBLV = Get-BitLockerVolume -MountPoint $DriveLetter
-            $TargetProtector = $NewBLV.KeyProtector | Where-Object {$_.KeyProtectorType -eq 'RecoveryPassword'} | Select-Object -First 1
-            $ExplicitKeyID = $TargetProtector.KeyProtectorId
-            $RecoveryKey = $TargetProtector.RecoveryPassword
-            Write-Host ("`r" + (" " * 100) + "`r") -NoNewline
-            Show-RecoveryInfo -Drive $DriveLetter -KeyID $ExplicitKeyID -RecoveryKey $RecoveryKey -RealName $DeviceName
-            $SysInfo = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-            $IsVM = $SysInfo.Model -match "Virtual|QEMU|VMware"
-            $bdeBase = @('-on', $DriveLetter, '-EncryptionMethod', $BdeMethod)
-            $bdeSkip = @('-SkipHardwareTest')
-            if ($IsVM) {
-                # Full-volume encryption is manage-bde's default, so the used-space switch is simply left out.
-                $Result = Invoke-BeretManageBde -Arguments ($bdeBase + $bdeSkip)
-            } else {
-                $Result = Invoke-BeretManageBde -Arguments ($bdeBase + @('-UsedSpaceOnly') + $bdeSkip)
-                if ($Result.ExitCode -ne 0 -and $Result.Output -match "0x803100a5") {
-                    $Result = Invoke-BeretManageBde -Arguments ($bdeBase + $bdeSkip)
-                }
-            }
-            if ($Result.ExitCode -ne 0) {
-                $enableError = "manage-bde -on exited $($Result.ExitCode): $(($Result.Output -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1))"
-            }
-        }
-        catch {
-            $enableError = $_.Exception.Message
-        }
-        if ($enableError) {
-            Write-Host "[FAILED] $enableError" -ForegroundColor $BorderCol
-            Exit-BeretRun 1 "BitLocker was not enabled ($enableError)."
+    if (-not $HaveKey) {
+        $enable = Invoke-BeretEnable -Drive $DriveLetter -DeviceName $DeviceName -Method $EncryptionMethod -BdeMethod $BdeMethod
+        if (-not $enable.Ok) {
+            Write-Host "[FAILED] $($enable.Error)" -ForegroundColor $BorderCol
+            Exit-BeretRun 1 "BitLocker was not enabled ($($enable.Error))."
         }
     }
     #endregion
 
     #region 3: Hybrid Backup Logic
     # =================================================================================
+    $KeyRows = @(Get-BeretRecoveryProtectors -Drive $DriveLetter)
+    $ExplicitKeyID = $null
+    if ($KeyRows.Count -gt 0) { $ExplicitKeyID = $KeyRows[0].KeyProtectorId }
     if ($ExplicitKeyID) {
-        $SysInfo = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $SysInfo = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
         $IsDomainJoined = $SysInfo.PartOfDomain
         $Dsreg = Get-BeretDsreg
         $IsEntraJoined = $Dsreg -match "AzureAdJoined : YES"
@@ -463,32 +537,17 @@ function Invoke-BeretMain {
 
     #region 4: Final Status
     # =================================================================================
-    Write-Host "Verifying encryption startup..." -ForegroundColor $DimCol -NoNewline
-    $RetryCount = 0
-    do {
-        Start-Sleep -Seconds 3
-        Write-Host "." -ForegroundColor $DimCol -NoNewline
-        $FinalStatus = Get-BitLockerVolume -MountPoint $DriveLetter
-        $RetryCount++
-    } while (($null -eq $FinalStatus.EncryptionMethod -or $FinalStatus.EncryptionMethod -eq "None") -and $RetryCount -lt 15)
-    Write-Host ("`r" + (" " * 60) + "`r") -NoNewline
+    $finalError = $null
+    try { $FinalStatus = Get-BitLockerVolume -MountPoint $DriveLetter -ErrorAction Stop } catch { $finalError = $_.Exception.Message }
+    if ($finalError -or [string]$FinalStatus.EncryptionMethod -ne $EncryptionMethod) {
+        Exit-BeretRun 1 "the final check found $($FinalStatus.EncryptionMethod) on $DriveLetter, expected $EncryptionMethod $finalError"
+    }
     Write-Host "Final Encryption Method: " -ForegroundColor $InfoCol -NoNewline
     Write-Host $FinalStatus.EncryptionMethod -ForegroundColor $MainTextCol
-    # Footer
-    $_sfx   = "█"
-    $_ftr1 = " ╔╗  ╔═╗ ╦═╗ ╔═╗ ╔╦╗ "
-    $_ftr2 = " ╠╩╗ ║╣  ╠╦╝ ║╣   ║  "
-    $_ftr3 = " ╚═╝ ╚═╝ ╩╚═ ╚═╝  ╩  "
-    $_ftrW = [Math]::Max($_ftr1.Length, [Math]::Max($_ftr2.Length, $_ftr3.Length))
-    $_ftr1 = $_ftr1.PadRight($_ftrW); $_ftr2 = $_ftr2.PadRight($_ftrW); $_ftr3 = $_ftr3.PadRight($_ftrW)
-    $_ffillW = $script:Width - $_ftrW - $_sfx.Length
-    $_footer = "  BITLOCKER DEPLOYMENT SEQUENCE COMPLETE"
-    $_ver    = "| v6.0"
-    $_fpad   = " " * ($_ffillW - $_footer.Length - $_ver.Length)
-    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr1 -ForegroundColor $MainCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-    Write-Host "$_footer$_fpad$_ver" -ForegroundColor $MainCol -NoNewline; Write-Host $_ftr2 -ForegroundColor $MainCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host $_ftr3 -ForegroundColor $MainCol -NoNewline; Write-Host $_sfx -ForegroundColor $LineCol
-    Exit-KillerScript 0
+    Write-Host "Recovery key(s) for this machine:" -ForegroundColor $InfoCol
+    Show-BeretKeys -Drive $DriveLetter -DeviceName $DeviceName
+    Show-BeretFooter "  BITLOCKER DEPLOYMENT SEQUENCE COMPLETE"
+    Exit-BeretRun 0 "$ModeLabel BitLocker ($EncryptionMethod) is in place on $DriveLetter."
     #endregion
 }
 
