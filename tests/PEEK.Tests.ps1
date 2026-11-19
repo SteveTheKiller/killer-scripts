@@ -242,3 +242,39 @@ Describe 'PEEK finding 34: an unreadable compatibility report is not a compatibi
         $c.Summary | Should -Be 'None detected'
     }
 }
+
+Describe 'PEEK finding 73: every reboot source that counts is displayed' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
+        Initialize-KillerSafetyNet
+        Enable-KillerTestMode
+        . (Get-KillerScriptPath 'PEEK')
+
+        function Get-FlagText {
+            param($Reboot)
+            (Write-RebootFlags -Reboot $Reboot 6>&1 | ForEach-Object { [string]$_ }) -join ''
+        }
+    }
+    AfterAll { Disable-KillerTestMode }
+
+    It 'detects UpdateExeVolatile as a reboot source' {
+        Mock Test-Path { $false }
+        Mock Get-ItemProperty { [pscustomobject]@{ UpdateExeVolatile = 1 } } -ParameterFilter { $Path -like '*\Microsoft\Updates' }
+        $r = Get-PEEKRebootState
+        $r.UpdateExe | Should -BeTrue
+        $r.Any | Should -BeTrue
+        $r.Sources | Should -Contain 'UpdateExe'
+    }
+
+    It 'shows UpdateExe=YES when it is the only reason a reboot is pending' {
+        $reboot = [pscustomobject]@{ WindowsUpdate = $false; CBS = $false; MoSetup = $false; FileRename = $false; UpdateExe = $true; PendingXml = $false; Any = $true; Sources = @('UpdateExe') }
+        $text = Get-FlagText $reboot
+        $text | Should -Match 'UpdateExe=YES'
+        $text | Should -Match 'WU=no'
+    }
+
+    It 'shows UpdateExe=no when it is clear' {
+        $reboot = [pscustomobject]@{ WindowsUpdate = $false; CBS = $false; MoSetup = $false; FileRename = $false; UpdateExe = $false; PendingXml = $false; Any = $false; Sources = @() }
+        Get-FlagText $reboot | Should -Match 'UpdateExe=no'
+    }
+}

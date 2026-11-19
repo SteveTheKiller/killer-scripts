@@ -1052,6 +1052,7 @@ function Write-RebootFlags {
         @{ Label = 'CBS';        Value = $Reboot.CBS },
         @{ Label = 'MoSetup';    Value = $Reboot.MoSetup },
         @{ Label = 'FileRename'; Value = $Reboot.FileRename },
+        @{ Label = 'UpdateExe';  Value = $Reboot.UpdateExe },
         @{ Label = 'pending.xml';Value = $Reboot.PendingXml }
     )
 
@@ -1061,7 +1062,12 @@ function Write-RebootFlags {
         Write-Host "$($flag.Label)=" -ForegroundColor $DimCol -NoNewline
         if ($flag.Value) { Write-Host "YES" -ForegroundColor $script:WarnFG -NoNewline }
         else { Write-Host "no" -ForegroundColor $script:MutedFG -NoNewline }
-        if ($i -lt ($flags.Count - 1)) { Write-Host "  |  " -ForegroundColor $script:MutedFG -NoNewline }
+        if ($i -eq 2) {
+            # Six flags do not fit one 76 column line, so continue on a second aligned row.
+            Write-Host ""
+            Write-Host (" " * 22) -NoNewline
+        }
+        elseif ($i -lt ($flags.Count - 1)) { Write-Host "  |  " -ForegroundColor $script:MutedFG -NoNewline }
     }
     Write-Host ""
 }
