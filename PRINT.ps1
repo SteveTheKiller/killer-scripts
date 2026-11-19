@@ -13,25 +13,39 @@
     Parameters:
       -Silent     Non-interactive mode, lists printers only.
     Exit Codes:
-      0  - Completed successfully
-      3  - Insufficient privileges
+      0  - Success
+      1  - Failure
+      2  - Not elevated, or a precondition failed (for example no console and no -Silent)
+      3  - Partial success (some changes succeeded, some failed)
 #>
 param(
     [switch]$Silent
 )
 
-$EXIT_SUCCESS = 0
-$EXIT_DENIED  = 3
-
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Warning "Elevation Required: Please run as Administrator."
-    Exit $EXIT_DENIED
+function Exit-KillerScript {
+    param([int]$Code)
+    if ($global:KillerScriptsTestMode) { throw "KILLERSCRIPT_EXIT:$Code" }
+    exit $Code
 }
 
+# --- System boundaries (thin wrappers so tests can replace them) ---
+function Test-PrintElevated {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function Test-PrintInteractive {
+    try { [Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected } catch { $false }
+}
+function Read-PrintKey {
+    # Returns $null when there is no console, so callers treat it as ESC and never spin.
+    try { [Console]::ReadKey($true) } catch { $null }
+}
+function Get-PrintCursorTop { try { [Console]::CursorTop } catch { -1 } }
+function Set-PrintCursor {
+    param([int]$Left, [int]$Top)
+    try { [Console]::SetCursorPosition($Left, $Top) } catch { }
+}
 #region [0] - HELPERS & THEME
 # ============================================================================
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-
 $script:Width   = 85
 $script:Version = "v1.0"
 
@@ -65,7 +79,8 @@ function Read-Input {
     # Like Read-Host but returns $null on ESC (caller treats $null as "back")
     $buf = ""
     while ($true) {
-        $k = [Console]::ReadKey($true)
+        $k = Read-PrintKey
+        if ($null -eq $k)                        { return $null }
         if ($k.Key -eq [ConsoleKey]::Escape)     { Write-Host ""; return $null }
         if ($k.Key -eq [ConsoleKey]::Enter)      { Write-Host ""; return $buf  }
         if ($k.Key -eq [ConsoleKey]::Backspace) {
@@ -81,7 +96,7 @@ function Read-Input {
 }
 
 function Write-Banner {
-    Clear-Host
+    try { Clear-Host } catch { }
     $_pfx  = "█  "
     $_art1 = "╔═╗ ╦═╗ ╦ ╔╗╔ ╔╦╗ "
     $_art2 = "╠═╝ ╠╦╝ ║ ║║║  ║  "
@@ -246,8 +261,8 @@ function Invoke-AddPrinterWizard {
         Write-Host "  " -NoNewline; Write-Host "[ESC]" -NoNewline -ForegroundColor Gray; Write-Host " Back" -ForegroundColor $DimCol
         Write-Host ""
         Write-Host "  Choice: " -NoNewline -ForegroundColor $LineCol
-        $key = [Console]::ReadKey($true)
-        if ($key.Key -eq [ConsoleKey]::Escape) { return }
+        $key = Read-PrintKey
+        if ($null -eq $key -or $key.Key -eq [ConsoleKey]::Escape) { return }
         $addChoice = $key.KeyChar.ToString()
         Write-Host $addChoice
 
@@ -328,11 +343,13 @@ function Invoke-AddPrinterWizard {
                         Rename-Printer -InputObject $added -NewName $fname -ErrorAction SilentlyContinue
                     }
                     Write-Host "      > '$fname' added successfully." -ForegroundColor $OkCol
+                    $script:PrintSuccesses++
                 } catch {
+                    $script:PrintFailures++
                     Write-Host "      [!] Failed: $($_.Exception.Message)" -ForegroundColor Red
                 }
                 Write-Host ""; Write-Host "  Press any key..." -ForegroundColor $DimCol
-                [Console]::ReadKey($true) | Out-Null; return
+                Read-PrintKey | Out-Null; return
             }
 
             default { continue addmenu }
@@ -370,8 +387,8 @@ function Invoke-AddPrinterWizard {
                     Write-Host "  " -NoNewline; Write-Host "[C]" -NoNewline -ForegroundColor Gray; Write-Host " Choose from installed drivers" -ForegroundColor $MainCol
                     Write-Host "  " -NoNewline; Write-Host "[P]" -NoNewline -ForegroundColor Gray; Write-Host " Provide INF file path" -ForegroundColor $MainCol
                     Write-Host "  Choice [A]: " -NoNewline -ForegroundColor $LineCol
-                    $drvKey    = [Console]::ReadKey($true)
-                    if ($drvKey.Key -eq [ConsoleKey]::Escape) { break wizloop }
+                    $drvKey    = Read-PrintKey
+                    if ($null -eq $drvKey -or $drvKey.Key -eq [ConsoleKey]::Escape) { break wizloop }
                     $drvChoice = $drvKey.KeyChar.ToString().ToUpper()
                     Write-Host $(if ($drvChoice -in 'C','P') { $drvChoice } else { "A" })
 
@@ -445,7 +462,8 @@ function Invoke-AddPrinterWizard {
                     Write-Host "  " -NoNewline; Write-Host "[1]" -NoNewline -ForegroundColor Gray; Write-Host " RAW / JetDirect  (port 9100)  - recommended" -ForegroundColor $MainCol
                     Write-Host "  " -NoNewline; Write-Host "[2]" -NoNewline -ForegroundColor Gray; Write-Host " IPP              (port 631)   - fallback" -ForegroundColor $MainCol
                     Write-Host "  Choice [1]: " -NoNewline -ForegroundColor $LineCol
-                    $protoKey = [Console]::ReadKey($true)
+                    $protoKey = Read-PrintKey
+                    if ($null -eq $protoKey) { return }
                     if ($protoKey.Key -eq [ConsoleKey]::Escape) { $wizStep = 1; continue wizloop }
                     $proto   = $protoKey.KeyChar.ToString()
                     $useIPP  = ($proto -eq '2')
@@ -477,12 +495,14 @@ function Invoke-AddPrinterWizard {
                         Write-Host "      > Adding printer '$fname'..." -ForegroundColor $DimCol
                         Add-Printer -Name $fname -DriverName $driverName -PortName $portName -ErrorAction Stop
                         Write-Host "      > '$fname' installed successfully." -ForegroundColor $OkCol
+                        $script:PrintSuccesses++
                     } catch {
+                        $script:PrintFailures++
                         Write-Host "      [!] Failed: $($_.Exception.Message)" -ForegroundColor Red
                     }
 
                     Write-Host ""; Write-Host "  Press any key to continue..." -ForegroundColor $DimCol
-                    [Console]::ReadKey($true) | Out-Null
+                    Read-PrintKey | Out-Null
                     return
                 }
             }
@@ -511,8 +531,8 @@ function Invoke-DeletePrinter {
     Write-Host ""
     Write-Host "  Remove '$($target.Name)'? " -NoNewline -ForegroundColor $WarnCol
     Write-Host "[Y/N]: " -NoNewline -ForegroundColor $DimCol
-    $confirmKey = [Console]::ReadKey($true)
-    if ($confirmKey.Key -eq [ConsoleKey]::Escape) { return }
+    $confirmKey = Read-PrintKey
+    if ($null -eq $confirmKey -or $confirmKey.Key -eq [ConsoleKey]::Escape) { return }
     $confirm = $confirmKey.KeyChar.ToString().ToUpper()
     Write-Host $confirm
 
@@ -520,7 +540,9 @@ function Invoke-DeletePrinter {
         try {
             Remove-Printer -Name $target.Name -ErrorAction Stop
             Write-Host "  '$($target.Name)' removed." -ForegroundColor $OkCol
+            $script:PrintSuccesses++
         } catch {
+            $script:PrintFailures++
             Write-Host "  [!] $($_.Exception.Message)" -ForegroundColor Red
         }
         Start-Sleep -Seconds 1
@@ -528,53 +550,106 @@ function Invoke-DeletePrinter {
 }
 #endregion
 
-#region [4] - MAIN LOOP
-if ($Silent) {
-    Write-Banner
-    Get-Printer | Sort-Object Name | Format-Table Name, DriverName, PortName -AutoSize
-    exit $EXIT_SUCCESS
-}
-
-$printers  = @()
-$running   = $true
-$e         = [char]27
-while ($running) {
-    Write-Banner
-    Show-PrinterList -PrinterRef ([ref]$printers)
-    Write-Host ""
-    $script:MenuRow = [Console]::CursorTop
-    Write-HLine
-    Write-Host "  " -NoNewline
-    Write-Host "[A]" -NoNewline -ForegroundColor Gray;  Write-Host " Add   "  -NoNewline -ForegroundColor $MainCol
-    Write-Host "[D]" -NoNewline -ForegroundColor Gray;  Write-Host " Delete   " -NoNewline -ForegroundColor $MainCol
-    Write-Host "[Q]" -NoNewline -ForegroundColor Gray;  Write-Host " Quit"    -ForegroundColor $MainCol
-    Write-Host "  Choice: " -NoNewline -ForegroundColor $LineCol
-    $key    = [Console]::ReadKey($true)
-    $choice = $key.KeyChar.ToString().ToUpper()
-    Write-Host $choice
-
-    if ($key.Key -eq [ConsoleKey]::Escape) { $running = $false; continue }
-
-    switch ($choice) {
-        'A' { Invoke-AddPrinterWizard }
-        'D' { Invoke-DeletePrinter -Printers $printers }
-        'Q' { $running = $false }
-    }
-}
-#endregion
-
-#region [5] - FOOTER
+#region [4] - MAIN
 # ============================================================================
-[Console]::SetCursorPosition(0, $script:MenuRow)
-Write-Host "${e}[0J" -NoNewline  # clear from cursor to end of screen
-$_sfx    = "█"
-$_ftrW   = $script:ArtW + 1
-$_ffillW = $script:Width - $_ftrW - $_sfx.Length
-$_footer = "  PRINT SEQUENCE COMPLETE"
-$_fpad   = " " * ($_ffillW - $_footer.Length - $script:Ver.Length)
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $($script:Art1)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
-Write-Host "$_footer$_fpad$($script:Ver)" -ForegroundColor $MainCol  -NoNewline; Write-Host " $($script:Art2)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
-Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $($script:Art3)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
+function Write-PrintFooter {
+    $e = [char]27
+    $top = Get-PrintCursorTop
+    if ($top -ge 0 -and $script:MenuRow -ge 0) {
+        Set-PrintCursor -Left 0 -Top $script:MenuRow
+        Write-Host "${e}[0J" -NoNewline  # clear from cursor to end of screen
+    }
+    $_sfx    = "█"
+    $_ftrW   = $script:ArtW + 1
+    $_ffillW = $script:Width - $_ftrW - $_sfx.Length
+    $_footer = "  PRINT SEQUENCE COMPLETE"
+    $_fpad   = " " * [Math]::Max(0, ($_ffillW - $_footer.Length - $script:Ver.Length))
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $($script:Art1)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
+    Write-Host "$_footer$_fpad$($script:Ver)" -ForegroundColor $MainCol  -NoNewline; Write-Host " $($script:Art2)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
+    Write-Host ("-" * $_ffillW) -ForegroundColor $LineCol -NoNewline; Write-Host " $($script:Art3)" -ForegroundColor $ArtCol -NoNewline; Write-Host $_sfx -ForegroundColor $BorderCol
+}
+
+function Invoke-PrintMain {
+    param([switch]$Silent)
+    $script:PrintFailures  = 0
+    $script:PrintSuccesses = 0
+    $script:MenuRow        = -1
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+    if (-not (Test-PrintElevated)) {
+        Write-Warning "Elevation Required: Please run as Administrator."
+        Write-Output "[FAIL] PRINT not elevated, nothing was changed (exit 2)"
+        Exit-KillerScript 2
+        return
+    }
+
+    if ($Silent) {
+        Write-Banner
+        try {
+            $list = @(Get-Printer -ErrorAction Stop | Sort-Object Name)
+        } catch {
+            Write-Output "[FAIL] PRINT could not list printers: $($_.Exception.Message) (exit 1)"
+            Exit-KillerScript 1
+            return
+        }
+        $list | Format-Table Name, DriverName, PortName -AutoSize | Out-String -Width 200 | Write-Host
+        Write-Output "[PASS] PRINT listed $($list.Count) printer(s) (exit 0)"
+        Exit-KillerScript 0
+        return
+    }
+
+    if (-not (Test-PrintInteractive)) {
+        Write-Output "[FAIL] PRINT needs an interactive console. Re-run with -Silent to list printers. Nothing was changed (exit 2)"
+        Exit-KillerScript 2
+        return
+    }
+
+    $printers  = @()
+    $running   = $true
+    while ($running) {
+        Write-Banner
+        Show-PrinterList -PrinterRef ([ref]$printers)
+        Write-Host ""
+        $script:MenuRow = Get-PrintCursorTop
+        Write-HLine
+        Write-Host "  " -NoNewline
+        Write-Host "[A]" -NoNewline -ForegroundColor Gray;  Write-Host " Add   "  -NoNewline -ForegroundColor $MainCol
+        Write-Host "[D]" -NoNewline -ForegroundColor Gray;  Write-Host " Delete   " -NoNewline -ForegroundColor $MainCol
+        Write-Host "[Q]" -NoNewline -ForegroundColor Gray;  Write-Host " Quit"    -ForegroundColor $MainCol
+        Write-Host "  Choice: " -NoNewline -ForegroundColor $LineCol
+        $key = Read-PrintKey
+        if ($null -eq $key) {
+            Write-Output "[FAIL] PRINT lost its console input and stopped (exit 1)"
+            Exit-KillerScript 1
+            return
+        }
+        $choice = $key.KeyChar.ToString().ToUpper()
+        Write-Host $choice
+
+        if ($key.Key -eq [ConsoleKey]::Escape) { $running = $false; continue }
+
+        switch ($choice) {
+            'A' { Invoke-AddPrinterWizard }
+            'D' { Invoke-DeletePrinter -Printers $printers }
+            'Q' { $running = $false }
+        }
+    }
+
+    Write-PrintFooter
+
+    if ($script:PrintFailures -gt 0 -and $script:PrintSuccesses -gt 0) {
+        Write-Output "[WARN] PRINT partial: $($script:PrintSuccesses) change(s) succeeded, $($script:PrintFailures) failed (exit 3)"
+        Exit-KillerScript 3
+        return
+    }
+    if ($script:PrintFailures -gt 0) {
+        Write-Output "[FAIL] PRINT: $($script:PrintFailures) change(s) failed, none succeeded (exit 1)"
+        Exit-KillerScript 1
+        return
+    }
+    Write-Output "[PASS] PRINT complete: $($script:PrintSuccesses) change(s) made (exit 0)"
+    Exit-KillerScript 0
+}
 #endregion
 
-exit $EXIT_SUCCESS
+if (-not $global:KillerScriptsTestMode) { Invoke-PrintMain -Silent:$Silent }
