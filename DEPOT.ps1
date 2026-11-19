@@ -135,23 +135,22 @@ function Test-AppInstalled {
         Where-Object { $_.DisplayName -match $Pattern }
     return ($null -ne $found)
 }
-# Helper: run an installer with ESC-to-cancel and timeout, return exit code
+# Helper: run an installer with ESC-to-cancel and a timeout. Returns the child's own exit code,
+# $null when the technician cancelled with ESC, -1 on timeout and -2 when the exit code could not be read.
+# The code comes from the process object we waited on, never from $LASTEXITCODE, which a
+# Start-Process launch does not set.
 function Start-Installer {
     param(
         [string]$FilePath,
         [string]$ArgumentList,
-        [int]$TimeoutMinutes = 20
+        [double]$TimeoutMinutes = 20
     )
-    # Always wrap in cmd /c - this gives us a single reliable process handle.
-    # Direct Start-Process -PassThru hangs on WaitForExit/HasExited when the
-    # launched EXE spawns children that inherit the parent handle (ODT, Acrobat, etc.)
     $parentDir = Split-Path $FilePath -Parent -ErrorAction SilentlyContinue
-    $workDir   = if ($parentDir -and (Test-Path $parentDir)) { $parentDir } else { "C:\Windows\Temp" }
-    if ($FilePath -match "msiexec") {
-        $proc = Start-Process "cmd.exe" -ArgumentList "/c msiexec $ArgumentList" -PassThru -WindowStyle Hidden -WorkingDirectory $workDir
-    } else {
-        $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -WindowStyle Hidden -WorkingDirectory $workDir
-    }
+    $workDir   = if ($parentDir -and (Test-Path $parentDir)) { $parentDir } else { $script:DepotTemp }
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -WindowStyle Hidden -WorkingDirectory $workDir
+    if (-not $proc) { return -2 }
+    # Reading Handle keeps the process handle open so ExitCode is still readable after exit.
+    try { $null = $proc.Handle } catch { }
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     $start    = Get-Date
     $spinner  = @('|','/','-','\')
@@ -178,13 +177,15 @@ function Start-Installer {
         Write-Host "`r      $spinChar $([math]::Floor($elapsed/60))m$($elapsed % 60)s" -NoNewline -ForegroundColor DarkGray
     }
     Write-Host "`r                    `r" -NoNewline
-    return $proc.ExitCode
+    if ($null -eq $proc.ExitCode) { return -2 }
+    return [int]$proc.ExitCode
 }
 function Show-Result {
     param($ExitCode)
     if ($null -eq $ExitCode)                          { Write-StatusTag "[SKIPPED]" "Yellow" }
     elseif ($ExitCode -in 0, 3010)                    { Write-StatusTag "[DONE]" "Green" }
     elseif ($ExitCode -in 1638, 1641, -1978335189)    { Write-StatusTag "[ALREADY INSTALLED]" "Cyan" }
+    elseif ($ExitCode -eq -2)                         { Write-StatusTag "[FAILED - exit code unavailable]" "Red" }
     else                                              { Write-StatusTag "[FAILED - exit $ExitCode]" "Red" }
 }
 
@@ -586,8 +587,8 @@ function Install-DepotOffice {
                     "C:\ProgramData\Microsoft\ClickToRun"
                 ) | ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
                 Write-Installing
-                & "$setup" /configure "$ODTDir\config.xml"
-                Show-Result $LASTEXITCODE
+                $ExitCode = Start-Installer -FilePath $setup -ArgumentList "/configure `"$ODTDir\config.xml`"" -TimeoutMinutes 90
+                Show-Result $ExitCode
             }
             # ODTDir may still be locked by OfficeClickToRun - delete async so we don't block
             Start-Process "cmd.exe" -ArgumentList "/c timeout /t 120 /nobreak >nul && rd /s /q `"$ODTDir`" && del /f /q `"$ODTExe`"" -WindowStyle Hidden
@@ -608,14 +609,8 @@ function Install-DepotOneDrive {
         if (Get-Installer -Url "https://go.microsoft.com/fwlink/?linkid=844652" -Dest $dest) {
             Write-Installing
             Write-Installing
-            Start-Process -FilePath $dest -ArgumentList "/allusers /silent" -WindowStyle Hidden
-            # OneDrive spawns a child and exits - wait for the real setup process to finish
-            Start-Sleep -Seconds 3
-            $deadline = (Get-Date).AddMinutes(5)
-            while ((Get-Process -Name "OneDriveSetup" -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
-                Start-Sleep -Seconds 2
-            }
-            Write-StatusTag "[DONE]" "Green"
+            $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/allusers /silent"
+            Show-Result $ExitCode
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
@@ -633,8 +628,8 @@ function Install-DepotTeams {
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
         if (Get-Installer -Url "https://go.microsoft.com/fwlink/?linkid=2196106" -Dest $dest) {
             Write-Installing
-            Start-Process -FilePath $dest -ArgumentList "/silent" -Wait -NoNewWindow
-            Show-Result $LASTEXITCODE
+            $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/silent"
+            Show-Result $ExitCode
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
@@ -663,8 +658,8 @@ function Install-DepotChrome {
         }
         if ($ChromeDL) {
             Write-Installing
-            Start-Process "msiexec.exe" -ArgumentList "/i `"$dest`" /qn /norestart ALLUSERS=1" -Wait -NoNewWindow
-            Show-Result $LASTEXITCODE
+            $ExitCode = Start-Installer "msiexec.exe" -ArgumentList "/i `"$dest`" /qn /norestart ALLUSERS=1"
+            Show-Result $ExitCode
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
@@ -689,8 +684,8 @@ function Install-DepotAcrobat {
         }
         if ($downloaded) {
             Write-Installing
-            Start-Process -FilePath $dest -ArgumentList "/sAll /rs /msi EULA_ACCEPT=YES /qn REBOOT=ReallySuppress" -Wait -NoNewWindow
-            Show-Result $LASTEXITCODE
+            $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/sAll /rs /msi EULA_ACCEPT=YES /qn REBOOT=ReallySuppress"
+            Show-Result $ExitCode
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
@@ -707,8 +702,8 @@ function Install-DepotZoom {
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
         if (Get-Installer -Url "https://zoom.us/client/latest/ZoomInstallerFull.msi?archType=x64" -Dest $dest) {
             Write-Installing
-            Start-Process "msiexec.exe" -ArgumentList "/i `"$dest`" /qn /norestart ALLUSERS=1 REBOOT=ReallySuppress" -Wait -NoNewWindow
-            Show-Result $LASTEXITCODE
+            $ExitCode = Start-Installer "msiexec.exe" -ArgumentList "/i `"$dest`" /qn /norestart ALLUSERS=1 REBOOT=ReallySuppress"
+            Show-Result $ExitCode
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }
@@ -725,8 +720,8 @@ function Install-Depot7Zip {
         Write-Host " downloading..." -NoNewline -ForegroundColor DarkGray
         if (Get-Installer -Url "https://www.7-zip.org/a/7z2407-x64.exe" -Dest $dest) {
             Write-Installing
-            Start-Process -FilePath $dest -ArgumentList "/S" -Wait -NoNewWindow
-            Show-Result $LASTEXITCODE
+            $ExitCode = Start-Installer -FilePath $dest -ArgumentList "/S"
+            Show-Result $ExitCode
         } else { Write-StatusTag "[FAILED - download]" "Red" }
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
     }

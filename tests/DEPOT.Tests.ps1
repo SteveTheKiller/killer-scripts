@@ -154,3 +154,84 @@ Describe 'Finding 12: admin purge needs a verified survivor' {
         Should -Invoke Remove-LocalUser -Times 0 -Exactly
     }
 }
+
+Describe 'Installers' {
+    BeforeAll {
+        function New-FakeProc {
+            param($ExitCode = 0, [int]$ProcessId = 4242, [bool]$Exits = $true)
+            $p = [pscustomobject]@{ Id = $ProcessId; ExitCode = $ExitCode; Handle = [IntPtr]::Zero; HasExited = $Exits }
+            $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $this.HasExited } -Force
+            $p
+        }
+    }
+
+    BeforeEach {
+        Reset-DepotState
+        $script:SavedTemp = $script:DepotTemp
+        $script:DepotTemp = $TestDrive
+        Mock Start-Sleep { }
+        Mock Get-Process { }
+        Mock Get-Service { }
+        Mock Get-ItemProperty { }
+        # A filtered mock outranks the safety net's filtered Remove-Item guard, so this one is filtered too.
+        Mock Remove-Item { } -ParameterFilter { $true }
+        Mock Write-Host { }
+        Mock Write-StatusTag { }
+        Mock Get-DepotWebText { throw 'no network in tests' }
+        Mock New-Object { throw 'no network in tests' } -ParameterFilter { $TypeName -match 'WebClient' }
+        # Nothing is installed unless a test says so. TestDrive paths still reach the real Test-Path.
+        Mock Test-Path { $false } -ParameterFilter { "$Path" -notlike "$TestDrive*" }
+        Mock Get-Installer { $true }
+        Mock Start-Process { New-FakeProc -ExitCode 0 }
+        $global:LASTEXITCODE = 73
+    }
+
+    AfterEach {
+        $script:DepotTemp = $script:SavedTemp
+        $global:LASTEXITCODE = 0
+    }
+
+    Context 'Finding 35: the exit code comes from the waited process, not a stale LASTEXITCODE' {
+        It '<Fn> reports the child exit code' -ForEach @(
+            @{ Fn = 'Install-DepotTeams' },
+            @{ Fn = 'Install-DepotChrome' },
+            @{ Fn = 'Install-DepotAcrobat' },
+            @{ Fn = 'Install-DepotZoom' },
+            @{ Fn = 'Install-Depot7Zip' }
+        ) {
+            Mock Start-Process { New-FakeProc -ExitCode 17 }
+            & $Fn
+            Should -Invoke Write-StatusTag -Times 1 -Exactly -ParameterFilter { $Text -eq '[FAILED - exit 17]' }
+        }
+
+        It '<Fn> reports DONE for exit 0 even when LASTEXITCODE is stale and nonzero' -ForEach @(
+            @{ Fn = 'Install-DepotTeams' },
+            @{ Fn = 'Install-DepotChrome' },
+            @{ Fn = 'Install-DepotAcrobat' },
+            @{ Fn = 'Install-DepotZoom' },
+            @{ Fn = 'Install-Depot7Zip' }
+        ) {
+            Mock Start-Process { New-FakeProc -ExitCode 0 }
+            & $Fn
+            Should -Invoke Write-StatusTag -Times 1 -Exactly -ParameterFilter { $Text -eq '[DONE]' }
+        }
+
+        It "returns -2, not a cancel, when the child exit code cannot be read" {
+            Mock Start-Process { New-FakeProc -ExitCode $null }
+            (Start-Installer -FilePath (Join-Path $TestDrive "x.exe") -ArgumentList "/S") | Should -Be -2
+        }
+
+        It 'runs the Office setup through the waiting helper and reports its exit code' {
+            Mock Get-Installer { $true }
+            Mock Start-Process {
+                if ("$FilePath" -match 'ODT\.exe$') {
+                    New-Item -ItemType Directory -Path (Join-Path $TestDrive 'ODT') -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $TestDrive 'ODT\setup.exe') -Value 'stub'
+                    New-FakeProc -ExitCode 0
+                } else { New-FakeProc -ExitCode 17 }
+            }
+            Install-DepotOffice
+            Should -Invoke Write-StatusTag -Times 1 -Exactly -ParameterFilter { $Text -eq '[FAILED - exit 17]' }
+        }
+    }
+}
