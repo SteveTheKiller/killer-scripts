@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Microsoft Application Cleanse & Eradication (MACE) v1.1
-    Developed by SteveTheKiller | Updated: 2026-03-06
+    Microsoft Application Cleanse & Eradication (MACE) v2.0
+    Developed by SteveTheKiller | Updated: 2026-11-18
 .DESCRIPTION
     Completely removes OneDrive, New Outlook, Office/M365, Microsoft
     Project, and Microsoft Teams from a Windows endpoint. Clears all
@@ -9,6 +9,16 @@
     temp folders. Repairs OneDrive shell folder redirects and path
     pollution. Supports an interactive per-user or system-wide scope
     selection with ESC-to-abort.
+
+    Scope is never assumed. Set $MaceScope = 'AllUsers' (or a profile folder
+    name such as 'jsmith') before running unattended; without it a
+    non-interactive run stops with exit 2 and changes nothing. A single
+    profile only loses its own processes, user-scope apps and files; Office,
+    machine-wide Teams, system folders and HKLM keys need AllUsers. The
+    OneDrive sync folder is never deleted.
+
+    Exit codes: 0 success, 1 failure, 2 not elevated or no scope chosen,
+    3 partial success.
 #>
 
 #region 0: HELPERS
@@ -226,7 +236,7 @@ function Invoke-MaceRun {
     $DimCol    = "DarkGray"
     $OkCol     = "Green"
     $InfoCol   = "Cyan"
-    $_ver    = "| v1.2"
+    $_ver    = "| v2.0"
 
     # Header Art & Logic
     $_pfx  = "█  "
