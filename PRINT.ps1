@@ -143,18 +143,63 @@ function Show-PrinterList {
 
 #region [1] - NETWORK SCAN & DETECTION
 # ============================================================================
-function Get-LocalSubnet {
-    $adapter = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.PrefixOrigin -ne 'WellKnown' -and
-                       $_.IPAddress -notlike '169.*'   -and
-                       $_.IPAddress -ne '127.0.0.1' } |
-        Sort-Object PrefixLength -Descending |
-        Select-Object -First 1
-    if (-not $adapter) { return $null }
-    $parts = $adapter.IPAddress -split '\.'
-    return "$($parts[0]).$($parts[1]).$($parts[2])"
+function ConvertTo-PrintUInt32 {
+    param([string]$IP)
+    $o = $IP.Split('.')
+    [long]([long]$o[0] * 16777216 + [long]$o[1] * 65536 + [long]$o[2] * 256 + [long]$o[3])
+}
+function ConvertFrom-PrintUInt32 {
+    param([long]$N)
+    "{0}.{1}.{2}.{3}" -f (($N -shr 24) -band 255), (($N -shr 16) -band 255), (($N -shr 8) -band 255), ($N -band 255)
 }
 
+function Get-PrintScanRange {
+    # Host addresses of the network that IPAddress/PrefixLength belongs to, excluding the network and
+    # broadcast addresses. Networks larger than a /22 are bounded to the /24 around the host.
+    # Returns $null when the input is invalid or the network has no scannable hosts (/31, /32).
+    param([string]$IPAddress, [int]$PrefixLength)
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($IPAddress, [ref]$parsed)) { return $null }
+    if ($parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { return $null }
+    if ($PrefixLength -lt 0 -or $PrefixLength -gt 30) { return $null }
+    $note = $null
+    $prefix = $PrefixLength
+    if ($prefix -lt 22) {
+        $note = "/$PrefixLength is too large to scan, limiting to the /24 around $IPAddress"
+        $prefix = 24
+    }
+    $ip      = ConvertTo-PrintUInt32 $IPAddress
+    $mask    = (4294967295 -shl (32 - $prefix)) -band 4294967295
+    $network = $ip -band $mask
+    $bcast   = $network + (4294967295 -bxor $mask)
+    $addrs   = New-Object System.Collections.Generic.List[string]
+    for ($n = $network + 1; $n -lt $bcast; $n++) { $addrs.Add((ConvertFrom-PrintUInt32 $n)) }
+    [pscustomobject]@{
+        Label     = "$(ConvertFrom-PrintUInt32 $network)/$prefix"
+        Addresses = $addrs.ToArray()
+        Note      = $note
+    }
+}
+
+function Get-PrintScanTarget {
+    # Scan range for the interface that owns the best IPv4 default route (lowest route + interface metric).
+    # Returns $null when there is no default route or no usable address on it.
+    $routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+    if ($routes.Count -eq 0) { return $null }
+    $ifMetric = @{}
+    foreach ($i in @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue)) { $ifMetric[[int]$i.InterfaceIndex] = [int]$i.InterfaceMetric }
+    $ordered = $routes | Sort-Object { [int]$_.RouteMetric + [int]$ifMetric[[int]$_.InterfaceIndex] }
+    $all = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+    foreach ($r in $ordered) {
+        $addr = $all | Where-Object { $_.InterfaceIndex -eq $r.InterfaceIndex -and
+                                      $_.IPAddress -notlike '169.254.*' -and
+                                      $_.IPAddress -notlike '127.*' } | Select-Object -First 1
+        if (-not $addr) { continue }
+        $range = Get-PrintScanRange -IPAddress $addr.IPAddress -PrefixLength ([int]$addr.PrefixLength)
+        if ($range) { return $range }
+    }
+    return $null
+}
 function Get-PrinterModel {
     param([string]$IP)
     try {
@@ -170,21 +215,21 @@ function Get-PrinterModel {
 }
 
 function Invoke-PrinterScan {
-    param([string]$Subnet)
+    param([string[]]$Addresses, [string]$Label)
     $e       = [char]27
     $spinner = @('|','/','-','\')
     $tick    = 0
     $ports   = @(9100, 631)
     $timeout = 600
 
-    Write-Host -NoNewline "      > Scanning $Subnet.0/24..." -ForegroundColor $DimCol
+    Write-Host -NoNewline "      > Scanning $Label..." -ForegroundColor $DimCol
 
     $found = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
     $pool  = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 60)
     $pool.Open()
 
-    $jobs = 1..254 | ForEach-Object {
-        $ip = "$Subnet.$_"
+    $jobs = $Addresses | ForEach-Object {
+        $ip = $_
         $ps = [System.Management.Automation.PowerShell]::Create()
         $ps.RunspacePool = $pool
         $ps.AddScript({
@@ -203,7 +248,7 @@ function Invoke-PrinterScan {
     }
 
     while ($jobs | Where-Object { -not $_.Handle.IsCompleted }) {
-        Write-Host -NoNewline "${e}[2K`r      > Scanning $Subnet.0/24... $($spinner[$tick % 4])  ($($found.Count) found)" -ForegroundColor $DimCol
+        Write-Host -NoNewline "${e}[2K`r      > Scanning $Label... $($spinner[$tick % 4])  ($($found.Count) found)" -ForegroundColor $DimCol
         $tick++; Start-Sleep -Milliseconds 150
     }
     foreach ($j in $jobs) { $j.PS.Dispose() }
@@ -281,13 +326,14 @@ function Invoke-AddPrinterWizard {
 
         switch ($addChoice) {
             '1' {
-                $subnet = Get-LocalSubnet
-                if (-not $subnet) {
-                    Write-Host "`n  [!] Could not determine local subnet." -ForegroundColor Red
+                $target = Get-PrintScanTarget
+                if (-not $target) {
+                    Write-Host "`n  [!] Could not determine the local network from the default route. Enter the IP manually." -ForegroundColor Red
                     Start-Sleep -Seconds 2; continue addmenu
                 }
                 Write-WizardBanner "Network Scan"
-                $ips = @(Invoke-PrinterScan -Subnet $subnet)
+                if ($target.Note) { Write-Host "      > $($target.Note)" -ForegroundColor $WarnCol }
+                $ips = @(Invoke-PrinterScan -Addresses $target.Addresses -Label $target.Label)
                 if ($ips.Count -eq 0) {
                     Write-Host "  [!] No printers found. Try entering the IP manually." -ForegroundColor $WarnCol
                     Start-Sleep -Seconds 2; continue addmenu

@@ -166,4 +166,61 @@ Describe 'PRINT' {
             Should -Invoke Add-Printer -Times 1 -Exactly -ParameterFilter { $DriverName -eq 'Zeta Z1' }
         }
     }
+
+    Context 'finding 21: scan range' {
+        It 'limits a /25 to its own 126 hosts' {
+            $r = Get-PrintScanRange -IPAddress '192.168.1.130' -PrefixLength 25
+            $r.Addresses.Count | Should -Be 126
+            $r.Addresses[0]    | Should -Be '192.168.1.129'
+            $r.Addresses[-1]   | Should -Be '192.168.1.254'
+            $r.Addresses | Should -Not -Contain '192.168.1.5'
+        }
+        It 'covers all 510 hosts of a /23' {
+            $r = Get-PrintScanRange -IPAddress '10.0.5.9' -PrefixLength 23
+            $r.Addresses.Count | Should -Be 510
+            $r.Addresses[0]    | Should -Be '10.0.4.1'
+            $r.Addresses[-1]   | Should -Be '10.0.5.254'
+        }
+        It 'bounds a huge network to the /24 around the host' {
+            $r = Get-PrintScanRange -IPAddress '10.20.30.40' -PrefixLength 16
+            $r.Addresses.Count | Should -Be 254
+            $r.Addresses[0]    | Should -Be '10.20.30.1'
+            $r.Note            | Should -Match '/24'
+        }
+        It 'refuses a /31 and /32, which have nothing to scan' {
+            Get-PrintScanRange -IPAddress '10.0.0.1' -PrefixLength 32 | Should -BeNullOrEmpty
+            Get-PrintScanRange -IPAddress '10.0.0.1' -PrefixLength 31 | Should -BeNullOrEmpty
+        }
+        It 'uses the default-route interface, not the address with the longest prefix' {
+            Mock Get-NetRoute {
+                @(
+                    [pscustomobject]@{ InterfaceIndex = 5; RouteMetric = 0;  DestinationPrefix = '0.0.0.0/0' },
+                    [pscustomobject]@{ InterfaceIndex = 9; RouteMetric = 25; DestinationPrefix = '0.0.0.0/0' }
+                )
+            }
+            Mock Get-NetIPInterface { @([pscustomobject]@{ InterfaceIndex = 5; InterfaceMetric = 10 }, [pscustomobject]@{ InterfaceIndex = 9; InterfaceMetric = 10 }) }
+            Mock Get-NetIPAddress {
+                @(
+                    [pscustomobject]@{ InterfaceIndex = 9; IPAddress = '172.16.0.7';  PrefixLength = 30; PrefixOrigin = 'Manual' },
+                    [pscustomobject]@{ InterfaceIndex = 5; IPAddress = '192.168.4.20'; PrefixLength = 25; PrefixOrigin = 'Dhcp' }
+                )
+            }
+            $t = Get-PrintScanTarget
+            $t.Addresses[0]  | Should -Be '192.168.4.1'
+            $t.Addresses[-1] | Should -Be '192.168.4.126'
+        }
+        It 'returns nothing when there is no default route' {
+            Get-PrintScanTarget | Should -BeNullOrEmpty
+        }
+        It 'hands the scan only the validated range from the wizard' {
+            Mock Get-NetRoute { @([pscustomobject]@{ InterfaceIndex = 5; RouteMetric = 0; DestinationPrefix = '0.0.0.0/0' }) }
+            Mock Get-NetIPInterface { @([pscustomobject]@{ InterfaceIndex = 5; InterfaceMetric = 10 }) }
+            Mock Get-NetIPAddress { @([pscustomobject]@{ InterfaceIndex = 5; IPAddress = '192.168.1.130'; PrefixLength = 25; PrefixOrigin = 'Dhcp' }) }
+            $script:Keys.Enqueue((New-Key '1'))
+            Invoke-AddPrinterWizard
+            Should -Invoke Invoke-PrinterScan -Times 1 -Exactly -ParameterFilter {
+                $Addresses.Count -eq 126 -and ($Addresses -notcontains '192.168.1.5') -and ($Addresses -contains '192.168.1.254')
+            }
+        }
+    }
 }
