@@ -87,6 +87,7 @@ BeforeEach {
     $script:BdeDefault = [pscustomobject]@{ ExitCode = 0; Output = 'BitLocker Drive Encryption: Configuration Tool' }
     $script:EncryptNeverStarts = $false
     $script:EncryptMethodOverride = $null
+    $script:Events = New-Object System.Collections.ArrayList
 
     # The fake clock moves only when the script sleeps, and a runaway loop fails the test fast.
     Mock Start-Sleep {
@@ -111,6 +112,17 @@ BeforeEach {
         $v = $script:Vols[[string]@($MountPoint)[0]]
         $v.VolumeStatus = 'DecryptionInProgress'; $v.EncryptionPercentage = 100
         $script:DecryptPolls = 0
+        [void]$script:Events.Add('DECRYPT')
+    }
+    Mock Disable-BitLockerAutoUnlock {
+        $m = [string]@($MountPoint)[0]
+        [void]$script:Events.Add("AU-OFF $m")
+        $script:Vols[$m].AutoUnlockEnabled = $false
+    }
+    Mock Enable-BitLockerAutoUnlock {
+        $m = [string]@($MountPoint)[0]
+        [void]$script:Events.Add("AU-ON $m")
+        $script:Vols[$m].AutoUnlockEnabled = $true
     }
     Mock Add-BitLockerKeyProtector {
         $v = $script:Vols[[string]@($MountPoint)[0]]
@@ -125,6 +137,7 @@ BeforeEach {
     Mock Invoke-BeretManageBde {
         [void]$script:BdeCalls.Add(($Arguments -join ' '))
         Write-Host "BDE-CALL: $($Arguments -join ' ')"
+        [void]$script:Events.Add('BDE-ON')
         $r = if ($script:BdeResults.Count -gt 0) { $script:BdeResults.Dequeue() } else { $script:BdeDefault }
         if ($r.ExitCode -eq 0 -and $Arguments -contains '-on' -and -not $script:EncryptNeverStarts) {
             $names = @{ 'aes128' = 'Aes128'; 'aes256' = 'Aes256'; 'xts_aes128' = 'XtsAes128'; 'xts_aes256' = 'XtsAes256' }
@@ -352,6 +365,103 @@ Describe 'Finding 06 and 07: waits are bounded and a timeout is a failure' {
         Invoke-BeretRun
         $script:Code | Should -Be 1
         $script:BdeCalls.Count | Should -Be 0
+    }
+}
+
+Describe 'Finding 06 and D4: a missing recovery key alone is fixed in place' {
+    BeforeEach {
+        $script:Vols['C:'] = New-BeretVolume 'C:' 'FullyEncrypted' 'XtsAes128' @((New-BeretProtector 'Tpm'))
+    }
+
+    It 'adds the recovery protector, reads it back and shows it, without decrypting or calling manage-bde' {
+        Invoke-BeretRun
+        Should -Invoke Disable-BitLocker -Times 0 -Exactly
+        $script:BdeCalls.Count | Should -Be 0
+        $rec = @($script:Vols['C:'].KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+        $rec.Count | Should -Be 1
+        [regex]::Matches($script:Text, [regex]::Escape($rec[0].RecoveryPassword)).Count | Should -BeGreaterOrEqual 2
+        $script:Text | Should -Match 'in place'
+    }
+
+    It 'falls back to the full decrypt and re-encrypt cycle when the read-back is not a real key' {
+        $script:AddCalls = 0
+        Mock Add-BitLockerKeyProtector {
+            $script:AddCalls++
+            $v = $script:Vols['C:']
+            if ($TpmProtector) { $v.KeyProtector = @($v.KeyProtector) + (New-BeretProtector 'Tpm') }
+            elseif ($script:AddCalls -eq 1) { $v.KeyProtector = @($v.KeyProtector) + (New-BeretProtector 'RecoveryPassword' -Password '') }
+            else { $v.KeyProtector = @($v.KeyProtector) + (New-BeretProtector 'RecoveryPassword' -Password '123456-123456-123456-123456-123456-123456-123456-123456') }
+            $v
+        }
+        Invoke-BeretRun
+        Should -Invoke Disable-BitLocker -Times 1 -Exactly
+        $script:Vols['C:'].EncryptionMethod | Should -Be 'XtsAes128'
+        @($script:Vols['C:'].KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' -and $_.RecoveryPassword }).Count | Should -Be 1
+    }
+
+    It 'falls back to the full cycle when adding the protector throws' {
+        $script:AddCalls = 0
+        Mock Add-BitLockerKeyProtector {
+            $script:AddCalls++
+            $v = $script:Vols['C:']
+            if ($RecoveryPasswordProtector -and $script:AddCalls -eq 1) { throw 'The BitLocker service is busy' }
+            if ($TpmProtector) { $v.KeyProtector = @($v.KeyProtector) + (New-BeretProtector 'Tpm') }
+            else { $v.KeyProtector = @($v.KeyProtector) + (New-BeretProtector 'RecoveryPassword' -Password '123456-123456-123456-123456-123456-123456-123456-123456') }
+            $v
+        }
+        Invoke-BeretRun
+        Should -Invoke Disable-BitLocker -Times 1 -Exactly
+    }
+}
+
+Describe 'Finding 06 and D4: data volume auto-unlock is restored and verified' {
+    BeforeEach {
+        $script:Key = '111111-222222-333333-444444-555555-666666-777777-888888'
+        $script:Vols['C:'] = New-BeretVolume 'C:' 'FullyEncrypted' 'Aes128' @((New-BeretProtector 'Tpm'), (New-BeretProtector 'RecoveryPassword' -Password $script:Key))
+        $script:Vols['D:'] = New-BeretVolume 'D:' 'FullyEncrypted' 'XtsAes128' @((New-BeretProtector 'ExternalKey')) $true
+    }
+
+    It 'turns auto-unlock off before decrypting and back on after encryption has started' {
+        Invoke-BeretRun
+        $ev = $script:Events -join ','
+        $ev | Should -Match 'AU-OFF D:,DECRYPT,BDE-ON,AU-ON D:'
+        $script:Vols['D:'].AutoUnlockEnabled | Should -BeTrue
+    }
+
+    It 'exits 3 and names the volume when auto-unlock cannot be restored' {
+        Mock Enable-BitLockerAutoUnlock { throw 'The volume is locked' }
+        Invoke-BeretRun
+        $script:Code | Should -Be 3
+        $script:Text | Should -Match 'BERET RESULT: exit code 3'
+        $script:Text | Should -Match 'D:'
+        $script:Text | Should -Match 'Auto-Unlock'
+    }
+
+    It 'does not trust the cmdlet: exits 3 when the read-back still shows auto-unlock off' {
+        Mock Enable-BitLockerAutoUnlock { }
+        Invoke-BeretRun
+        $script:Code | Should -Be 3
+    }
+
+    It 'restores auto-unlock when the decrypt times out, and still exits 1' {
+        $script:DecryptPollsNeeded = [int]::MaxValue
+        Invoke-BeretRun
+        $script:Code | Should -Be 1
+        ($script:Events -join ',') | Should -Match 'AU-ON D:'
+    }
+
+    It 'exits 1 without decrypting anything when auto-unlock cannot be turned off' {
+        Mock Disable-BitLockerAutoUnlock { throw 'Access denied' }
+        Invoke-BeretRun
+        $script:Code | Should -Be 1
+        Should -Invoke Disable-BitLocker -Times 0 -Exactly
+    }
+
+    It 'leaves auto-unlock alone when no decryption is needed' {
+        $script:Vols['C:'] = New-BeretVolume 'C:' 'FullyEncrypted' 'XtsAes128' @((New-BeretProtector 'Tpm'), (New-BeretProtector 'RecoveryPassword' -Password $script:Key))
+        Invoke-BeretRun
+        Should -Invoke Disable-BitLockerAutoUnlock -Times 0 -Exactly
+        Should -Invoke Enable-BitLockerAutoUnlock -Times 0 -Exactly
     }
 }
 }

@@ -269,17 +269,77 @@ function Show-BeretKeys {
     }
 }
 
+function Add-BeretResult {
+    # Records one outcome. Anything that is not Done or Skipped makes the run partial (exit 3).
+    param([string]$Step, [ValidateSet('Done', 'Skipped', 'Failed')][string]$Status, [string]$Detail = '')
+    $script:BeretResults = @($script:BeretResults) + [pscustomobject]@{ Step = $Step; Status = $Status; Detail = $Detail }
+}
+
+function Disable-BeretAutoUnlock {
+    # Data volumes that auto-unlock block an OS decrypt. Turn them off and remember which ones.
+    # Never exits. On any failure it puts back what it already turned off.
+    param([string]$OsDrive)
+    $turnedOff = @()
+    $err = $null
+    try {
+        $targets = @(Get-BitLockerVolume | Where-Object { $_.AutoUnlockEnabled -eq $true -and [string]$_.MountPoint -ne $OsDrive })
+        foreach ($v in $targets) {
+            Write-Host "Disabling Auto-Unlock on $($v.MountPoint) to allow OS decryption..." -ForegroundColor $AccentCol
+            Disable-BitLockerAutoUnlock -MountPoint $v.MountPoint -ErrorAction Stop | Out-Null
+            $turnedOff += [string]$v.MountPoint
+        }
+    } catch { $err = "could not turn off Auto-Unlock: $($_.Exception.Message)" }
+    if ($err) {
+        [void](Restore-BeretAutoUnlock -Mounts $turnedOff)
+        return [pscustomobject]@{ Ok = $false; Mounts = @(); Error = $err }
+    }
+    [pscustomobject]@{ Ok = $true; Mounts = $turnedOff; Error = $null }
+}
+
+function Restore-BeretAutoUnlock {
+    # Turns Auto-Unlock back on for each volume and proves it by reading the volume again.
+    # Returns the mount points it could not restore, as plain text lines.
+    param([string[]]$Mounts)
+    $problems = @()
+    foreach ($m in @($Mounts)) {
+        $why = $null
+        try {
+            Enable-BitLockerAutoUnlock -MountPoint $m -ErrorAction Stop | Out-Null
+            $chk = Get-BitLockerVolume -MountPoint $m -ErrorAction Stop
+            if ($chk.AutoUnlockEnabled -ne $true) { $why = 'it still reads as off after Enable-BitLockerAutoUnlock' }
+        } catch { $why = $_.Exception.Message }
+        if ($why) {
+            Write-BeretStatusLine "Restoring Auto-Unlock on $m..." '[FAILED]' $BorderCol
+            Write-Host "  $why" -ForegroundColor $AccentCol
+            $problems += "Auto-Unlock on $m was not restored ($why)"
+        } else {
+            Write-BeretStatusLine "Restoring Auto-Unlock on $m..." '[VERIFIED]' $OkCol
+        }
+    }
+    return $problems
+}
+
+function Add-BeretRecoveryInPlace {
+    # Adds a recovery password protector to an encrypted volume and reads it back. Never exits.
+    param([string]$Drive)
+    try {
+        Add-BitLockerKeyProtector -MountPoint $Drive -RecoveryPasswordProtector -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
+        $rec = @(Get-BeretRecoveryProtectors -Drive $Drive)
+        if ($rec.Count -eq 0 -or [string]$rec[0].RecoveryPassword -notmatch '^(\d{6}-){7}\d{6}$') {
+            return [pscustomobject]@{ Ok = $false; Error = 'the new recovery password could not be read back' }
+        }
+        return [pscustomobject]@{ Ok = $true; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message }
+    }
+}
+
 function Invoke-BeretDecrypt {
     # Turns BitLocker off and waits, with a deadline, until the volume is fully decrypted.
     # Never exits. Returns Ok and a plain Error text.
     param([string]$Drive, [int]$TimeoutMinutes = 30)
     $err = $null
     try {
-        $AutoUnlockDrives = @(Get-BitLockerVolume | Where-Object { $_.AutoUnlockEnabled -eq $true })
-        foreach ($Volume in $AutoUnlockDrives) {
-            Write-Host "Disabling Auto-Unlock on $($Volume.MountPoint) to allow OS decryption..." -ForegroundColor $AccentCol
-            Disable-BitLockerAutoUnlock -MountPoint $Volume.MountPoint | Out-Null
-        }
         Disable-BitLocker -MountPoint $Drive -ErrorAction Stop | Out-Null
         Write-Host "Decryption in progress..." -ForegroundColor $MainCol
         $deadline = (Get-BeretNow).AddMinutes($TimeoutMinutes)
@@ -361,6 +421,7 @@ function Invoke-BeretEnable {
     [pscustomobject]@{ Ok = $true; Error = $null }
 }
 function Invoke-BeretMain {
+    $script:BeretResults = @()
     Show-BeretBanner
     if (-not (Test-BeretElevated)) {
         Exit-BeretRun 2 "not elevated. Run as Administrator or SYSTEM. Nothing was changed."
@@ -469,8 +530,17 @@ function Invoke-BeretMain {
             $NeedsDecryption = $true
         } elseif ($RecoveryProtector.Count -eq 0) {
             Write-BeretStatusLine $_blMsg '[NO RECOVERY KEY]' $LineCol
-            Write-Host "  Drive encrypted but recovery key missing. Starting decryption..." -ForegroundColor $LineCol
-            $NeedsDecryption = $true
+            Write-Host "  Cipher is right but there is no recovery key. Adding one in place..." -ForegroundColor $LineCol
+            $inPlace = Add-BeretRecoveryInPlace -Drive $DriveLetter
+            if ($inPlace.Ok) {
+                Write-BeretStatusLine "Recovery key added in place" '[VERIFIED]' $OkCol
+                Add-BeretResult 'RecoveryKey' 'Done' 'added in place and read back'
+                Show-BeretKeys -Drive $DriveLetter -DeviceName $DeviceName
+                $HaveKey = $true
+            } else {
+                Write-Host "  In-place add failed ($($inPlace.Error)). Falling back to the full decrypt and re-encrypt cycle..." -ForegroundColor $LineCol
+                $NeedsDecryption = $true
+            }
         } else {
             Write-BeretStatusLine $_blMsg '[COMPLIANT]' $OkCol
             Show-BeretKeys -Drive $DriveLetter -DeviceName $DeviceName
@@ -480,10 +550,17 @@ function Invoke-BeretMain {
         Write-BeretStatusLine $_blMsg '[NOT ENCRYPTED]' $AccentCol
     }
 
+    $AutoUnlockMounts = @()
     if ($NeedsDecryption) {
+        $au = Disable-BeretAutoUnlock -OsDrive $DriveLetter
+        if (-not $au.Ok) { Exit-BeretRun 1 "$($au.Error). Nothing was decrypted." }
+        $AutoUnlockMounts = @($au.Mounts)
         $dec = Invoke-BeretDecrypt -Drive $DriveLetter
         if (-not $dec.Ok) {
-            Exit-BeretRun 1 $dec.Error
+            $lost = @(Restore-BeretAutoUnlock -Mounts $AutoUnlockMounts)
+            $extra = ''
+            if ($lost.Count -gt 0) { $extra = ' ' + ($lost -join '; ') + '.' }
+            Exit-BeretRun 1 "$($dec.Error)$extra"
         }
     }
     #endregion
@@ -494,7 +571,13 @@ function Invoke-BeretMain {
         $enable = Invoke-BeretEnable -Drive $DriveLetter -DeviceName $DeviceName -Method $EncryptionMethod -BdeMethod $BdeMethod
         if (-not $enable.Ok) {
             Write-Host "[FAILED] $($enable.Error)" -ForegroundColor $BorderCol
-            Exit-BeretRun 1 "BitLocker was not enabled ($($enable.Error))."
+            $lost = @(Restore-BeretAutoUnlock -Mounts $AutoUnlockMounts)
+            $extra = ''
+            if ($lost.Count -gt 0) { $extra = ' ' + ($lost -join '; ') + '.' }
+            Exit-BeretRun 1 "BitLocker was not enabled ($($enable.Error)).$extra"
+        }
+        foreach ($problem in @(Restore-BeretAutoUnlock -Mounts $AutoUnlockMounts)) {
+            Add-BeretResult 'AutoUnlock' 'Failed' $problem
         }
     }
     #endregion
@@ -546,6 +629,11 @@ function Invoke-BeretMain {
     Write-Host $FinalStatus.EncryptionMethod -ForegroundColor $MainTextCol
     Write-Host "Recovery key(s) for this machine:" -ForegroundColor $InfoCol
     Show-BeretKeys -Drive $DriveLetter -DeviceName $DeviceName
+    $problems = @($script:BeretResults | Where-Object { $_.Status -eq 'Failed' })
+    if ($problems.Count -gt 0) {
+        Show-BeretFooter "  BITLOCKER SEQUENCE FINISHED WITH PROBLEMS"
+        Exit-BeretRun 3 "$ModeLabel BitLocker ($EncryptionMethod) is in place on $DriveLetter, but: $(($problems | ForEach-Object { $_.Detail }) -join '; ')."
+    }
     Show-BeretFooter "  BITLOCKER DEPLOYMENT SEQUENCE COMPLETE"
     Exit-BeretRun 0 "$ModeLabel BitLocker ($EncryptionMethod) is in place on $DriveLetter."
     #endregion
