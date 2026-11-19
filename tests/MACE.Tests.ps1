@@ -125,4 +125,18 @@ Describe 'MACE' {
         }
     }
 
+    Context 'Finding 38: OneDrive sync root' {
+        It '38: never removes the OneDrive sync root or an org OneDrive folder, but still removes the client files' {
+            $global:MaceScope = 'AllUsers'
+            $r = Invoke-MaceCapture
+            $r.Code | Should -Be 0
+            foreach ($d in $AliceDir, $BobDir) {
+                $script:Removed | Should -Not -Contain (Join-Path $d 'OneDrive')
+                $script:Removed | Should -Not -Contain (Join-Path $d 'OneDrive - Contoso')
+                $script:Removed | Should -Contain (Join-Path $d 'AppData\Local\Microsoft\OneDrive')
+            }
+            Test-Path -LiteralPath (Join-Path $AliceDir 'OneDrive\unsynced.txt') | Should -BeTrue
+        }
+    }
+
 }

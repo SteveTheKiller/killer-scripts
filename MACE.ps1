@@ -496,7 +496,6 @@ function Invoke-MaceRun {
     # Client and cache folders only. The OneDrive sync root (<profile>\OneDrive and any
     # "OneDrive - <org>" folder) holds user files that may exist nowhere else, so it is never removed.
     $RelUserPaths = @(
-        "OneDrive",
         "AppData\Local\Microsoft\OneDrive",
         "AppData\Local\Microsoft\Olk",
         "AppData\Local\Packages\Microsoft.OutlookForWindows_8wekyb3d8bbwe",
@@ -518,7 +517,10 @@ function Invoke-MaceRun {
     foreach ($profilePath in $TargetProfiles) {
         foreach ($rel in $RelUserPaths) {
             $full = Join-Path $profilePath $rel
-            if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $full) { Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        foreach ($keep in @(Get-ChildItem -LiteralPath $profilePath -Directory -Filter "OneDrive*" -ErrorAction SilentlyContinue)) {
+            Write-Host "      Left in place (may hold unsynced user files): $($keep.FullName)" -ForegroundColor $DimCol
         }
     }
     Write-StepUpdate -Success
