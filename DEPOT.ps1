@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Deployment & Endpoint Provisioning Operations Tool (D.E.P.O.T.) v1.2
-    Developed by SteveTheKiller | Updated: 2026-03-13
+    Deployment & Endpoint Provisioning Operations Tool (D.E.P.O.T.) v2.0
+    Developed by SteveTheKiller | Updated: 2026-11-18
 .DESCRIPTION
     Full new-machine provisioning tool that silently deploys M365,
     Teams, OneDrive, Chrome, Acrobat Reader, Zoom, and 7-Zip with
@@ -1196,7 +1196,7 @@ function Complete-Depot {
     $_ftrW   = $script:ArtW + 1
     $_ffillW = [Math]::Max(0, $script:Width - $_ftrW - $_sfx.Length)
     $_footer = if ($Failures.Count -gt 0) { "  ENDPOINT PROVISIONING SEQUENCE FINISHED WITH FAILURES" } else { "  ENDPOINT PROVISIONING SEQUENCE COMPLETE" }
-    $_ver    = "| v1.2"
+    $_ver    = "| v2.0"
     $_fpad   = " " * [Math]::Max(0, $_ffillW - $_footer.Length - $_ver.Length)
     Write-Host ("-" * $_ffillW) -ForegroundColor $script:LineCol -NoNewline; Write-Host " $($script:Art1)" -ForegroundColor $script:AccentCol -NoNewline; Write-Host $_sfx -ForegroundColor $script:LineCol
     Write-Host "$_footer$_fpad$_ver" -ForegroundColor $script:MainCol -NoNewline; Write-Host " $($script:Art2)" -ForegroundColor $script:AccentCol -NoNewline; Write-Host $_sfx -ForegroundColor $script:LineCol
