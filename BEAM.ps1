@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Bulk Endpoint App Mover (BEAM) v1.00
-    Created by Steve the Killer | Updated: 2026-07-09
+    Bulk Endpoint App Mover (BEAM) v2.00
+    Created by Steve the Killer | Updated: 2026-11-18
 .DESCRIPTION
     Packages any local or hosted .exe / .msi as an Intune Win32 app and deploys it to
     one or more Entra-joined devices as SYSTEM. No LAN, no stored credentials. For
@@ -14,10 +14,19 @@
     Admin email each run. First use in a new tenant needs one-time admin consent to the
     Graph permissions, or Graph returns Forbidden.
 
-    Each run has a unique run ID. The install runs your package, stamps the ID into a
-    marker, and detection matches that ID, so each run installs once per machine and does
-    NOT loop. Re-running installs again. Detection is marker-based and does not inspect
-    the app itself, so it works for any installer.
+    Each run has a unique run ID. The install runs your package and stamps the ID into a
+    marker only when the installer exits 0 or a reboot-required 3010/1641, so detection
+    matches only a successful install. Any other installer exit code is passed through to
+    Intune and leaves no marker. Each app has its own marker. Re-running installs again.
+    Detection is marker-based and does not inspect the app itself, so it works for any
+    installer.
+
+    Each run creates its own Entra group (BEAM-<app>-<run ID>), so members left over from an
+    earlier run are never assigned the app. A target is reported as queued only when its
+    device matched exactly one Intune/Entra record, was verified in the group, and the
+    assignment succeeded. The package tool is pinned to a release and its Microsoft signature
+    is verified before it runs. The installer's source URL, SHA256 and signer are shown
+    before packaging, and a link scraped from a web page needs an explicit yes.
 
     Exit codes: 0 success, 1 failure, 2 a precondition failed (missing input or no console),
     3 partial success. The last line of output states the result and agrees with the code.
@@ -30,7 +39,7 @@ $ProgressPreference        = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 
 $script:Width = 85
-$_ver         = "1.00"
+$_ver         = "2.00"
 $_fver        = "| v$_ver"
 
 function Exit-KillerScript {
