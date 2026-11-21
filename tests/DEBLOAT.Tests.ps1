@@ -308,4 +308,19 @@ Describe 'DEBLOAT' {
             Get-Exit | Should -Be 0
         }
     }
+
+    Context 'issue 1: telemetry policy level' {
+        It 'sets both DataCollection AllowTelemetry values to 0, never 1' {
+            Get-Exit | Should -Be 0
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
+                "$Path" -eq 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -and $Name -eq 'AllowTelemetry' -and $Value -eq 0
+            }
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
+                "$Path" -eq 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' -and $Name -eq 'AllowTelemetry' -and $Value -eq 0
+            }
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly -ParameterFilter {
+                $Name -eq 'AllowTelemetry' -and $Value -ne 0
+            }
+        }
+    }
 }

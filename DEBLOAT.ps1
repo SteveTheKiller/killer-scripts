@@ -468,7 +468,7 @@ function Invoke-DebloatMain {
     # Telemetry level caps
     $dcPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
     if (!(Test-Path $dcPath)) { New-Item -Path $dcPath -Force | Out-Null }
-    Set-ItemProperty -Path $dcPath -Name "AllowTelemetry"                 -Value 1
+    Set-ItemProperty -Path $dcPath -Name "AllowTelemetry"                 -Value 0
     Set-ItemProperty -Path $dcPath -Name "DoNotShowFeedbackNotifications" -Value 1
     $dcPath2 = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
     if (!(Test-Path $dcPath2)) { New-Item -Path $dcPath2 -Force | Out-Null }
